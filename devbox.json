@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.13.7/.schema/devbox.schema.json",
   "packages": [
-    "jdk@21",
-    "maven@3.9.8",
+    "jdk@25",
+    "maven@3.9.12",
     "google-cloud-sdk@latest"
   ],
   "shell": {
