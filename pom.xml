@@ -48,6 +48,26 @@
                 <updatePolicy>never</updatePolicy>
             </snapshots>
         </repository>
+        <repository>
+            <id>artifact-registry-snapshots</id>
+            <url>artifactregistry://europe-west1-maven.pkg.dev/popsink-common-438615/maven-snapshots</url>
+            <releases>
+                <enabled>false</enabled>
+            </releases>
+            <snapshots>
+                <enabled>true</enabled>
+            </snapshots>
+        </repository>
+        <repository>
+            <id>artifact-registry-releases</id>
+            <url>artifactregistry://europe-west1-maven.pkg.dev/popsink-common-438615/maven-releases</url>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
+        </repository>
     </repositories>
 
     <dependencyManagement>
@@ -60,7 +80,57 @@
         </dependencies>
     </dependencyManagement>
 
+    <distributionManagement>
+        <repository>
+            <id>artifact-registry-releases</id>
+            <url>artifactregistry://europe-west1-maven.pkg.dev/popsink-common-438615/maven-releases</url>
+        </repository>
+        <snapshotRepository>
+            <id>artifact-registry-snapshots</id>
+            <url>artifactregistry://europe-west1-maven.pkg.dev/popsink-common-438615/maven-snapshots</url>
+        </snapshotRepository>
+    </distributionManagement>
+
+    <profiles>
+        <profile>
+            <id>gcloud</id>
+            <build>
+                <plugins>
+                    <!-- Deploy to GCP Artifact Registry via the artifactregistry wagon -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-deploy-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>deploy-to-gar</id>
+                                <phase>deploy</phase>
+                                <goals>
+                                    <goal>deploy</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+
     <build>
+        <plugins>
+            <!-- Disable the central-publishing-maven-plugin lifecycle extension inherited from
+                 debezium-build-parent. With extensions=true it intercepts afterProjectsRead()
+                 and removes all maven-deploy-plugin:deploy executions from the build plan,
+                 preventing deployment to any repository. This project deploys to GCP Artifact
+                 Registry only and never publishes to Sonatype Central. -->
+            <plugin>
+                <groupId>org.sonatype.central</groupId>
+                <artifactId>central-publishing-maven-plugin</artifactId>
+                <extensions>false</extensions>
+                <configuration>
+                    <skipPublishing>true</skipPublishing>
+                </configuration>
+            </plugin>
+        </plugins>
         <resources>
             <!-- Apply the properties set in the POM to the resource files -->
             <resource>
