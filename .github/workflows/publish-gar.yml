@@ -50,14 +50,25 @@ jobs:
 
       - name: Install debezium core
         run: |
-          ./ibmi/mvnw clean install -f core/pom.xml \
+          ./ibmi/mvnw clean install \
+            -f core/pom.xml \
             -pl debezium-bom,debezium-core,debezium-embedded,debezium-storage,debezium-assembly-descriptors \
-            -am -DskipTests -DskipITs \
-            -Dformat.formatter.goal=validate -Dformat.imports.goal=check \
-            -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
+            -am \
+            -DskipTests \
+            -DskipITs \
+            -Dformat.formatter.goal=validate \
+            -Dformat.imports.goal=check \
+            -Dhttp.keepAlive=false \
+            -Dmaven.wagon.http.pool=false \
+            -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
 
       - name: Deploy to GCP Artifact Registry
         run: |
-          ./ibmi/mvnw deploy -f ibmi/pom.xml -Pgcloud \
-            -DskipTests -DskipITs \
-            -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
+          ./ibmi/mvnw deploy \
+            -f ibmi/pom.xml \
+            -Pgcloud \
+            -DskipTests \
+            -DskipITs \
+            -Dhttp.keepAlive=false \
+            -Dmaven.wagon.http.pool=false \
+            -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
