@@ -44,18 +44,11 @@ jobs:
 
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
-      - name: Set version in pom.xml files
-        run: |
-          ./ibmi/mvnw versions:set \
-            -f ibmi/pom.xml \
-            -DnewVersion=${{ steps.version.outputs.version }} \
-            -DgenerateBackupPoms=false
-
       - name: Checkout debezium core
         uses: actions/checkout@v4
         with:
           repository: debezium/debezium
-          ref: ${{ github.ref_name }}
+          ref: ${{ github.base_ref || github.ref_name }}
           path: core
 
       - name: Set up JDK 25
@@ -89,6 +82,14 @@ jobs:
             -Dhttp.keepAlive=false \
             -Dmaven.wagon.http.pool=false \
             -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
+
+      - name: Set version in pom.xml files
+        run: |
+          ./ibmi/mvnw versions:set \
+            -f ibmi/pom.xml \
+            -DnewVersion=${{ steps.version.outputs.version }} \
+            -DgenerateBackupPoms=false \
+            -DprocessAllModules=true
 
       - name: Deploy release to GCP Artifact Registry
         run: |
