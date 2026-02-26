@@ -28,7 +28,7 @@
 
     <properties>
         <!-- Debezium parent -->
-        <version.debezium>${project.version}</version.debezium>
+        <version.debezium>3.5.0-SNAPSHOT</version.debezium>
 
         <!-- Dependencies -->
         <version.jt400>21.0.4</version.jt400>
@@ -48,10 +48,41 @@
                 <updatePolicy>never</updatePolicy>
             </snapshots>
         </repository>
+        <repository>
+            <id>artifact-registry-snapshots</id>
+            <url>artifactregistry://europe-west1-maven.pkg.dev/popsink-common-438615/maven-snapshots</url>
+            <releases>
+                <enabled>false</enabled>
+            </releases>
+            <snapshots>
+                <enabled>true</enabled>
+            </snapshots>
+        </repository>
+        <repository>
+            <id>artifact-registry-releases</id>
+            <url>artifactregistry://europe-west1-maven.pkg.dev/popsink-common-438615/maven-releases</url>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
+        </repository>
     </repositories>
 
     <dependencyManagement>
         <dependencies>
+            <!-- Override the debezium-bom import from debezium-parent. That POM uses
+                 ${project.version} for this import, which resolves to our project's version
+                 rather than the upstream debezium version (3.4.2-SNAPSHOT).
+                 Explicitly pinning it here to ${version.debezium} fixes the resolution. -->
+            <dependency>
+                <groupId>io.debezium</groupId>
+                <artifactId>debezium-bom</artifactId>
+                <version>${version.debezium}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
             <dependency>
                 <groupId>net.sf.jt400</groupId>
                 <artifactId>jt400</artifactId>
@@ -60,7 +91,108 @@
         </dependencies>
     </dependencyManagement>
 
+    <distributionManagement>
+        <repository>
+            <id>artifact-registry-releases</id>
+            <url>artifactregistry://europe-west1-maven.pkg.dev/popsink-common-438615/maven-releases</url>
+        </repository>
+        <snapshotRepository>
+            <id>artifact-registry-snapshots</id>
+            <url>artifactregistry://europe-west1-maven.pkg.dev/popsink-common-438615/maven-snapshots</url>
+        </snapshotRepository>
+    </distributionManagement>
+
+    <profiles>
+        <profile>
+            <id>gcloud</id>
+            <build>
+                <plugins>
+                    <!-- Deploy to GCP Artifact Registry via the artifactregistry wagon.
+                         default-deploy is bound to phase "none" to prevent it from running
+                         alongside deploy-to-gar and causing a duplicate upload error. -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-deploy-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>default-deploy</id>
+                                <phase>none</phase>
+                            </execution>
+                            <execution>
+                                <id>deploy-to-gar</id>
+                                <phase>deploy</phase>
+                                <goals>
+                                    <goal>deploy</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+
     <build>
+        <pluginManagement>
+            <plugins>
+                <!-- Override formatter-maven-plugin inherited from debezium-parent pluginManagement.
+                     It uses ${project.version} for the debezium-ide-configs dependency, which would
+                     resolve to our project version instead of the upstream
+                     debezium version (3.4.2-SNAPSHOT). Pinning to ${version.debezium} fixes it. -->
+                <plugin>
+                    <groupId>net.revelc.code.formatter</groupId>
+                    <artifactId>formatter-maven-plugin</artifactId>
+                    <dependencies>
+                        <dependency>
+                            <groupId>io.debezium</groupId>
+                            <artifactId>debezium-ide-configs</artifactId>
+                            <version>${version.debezium}</version>
+                        </dependency>
+                    </dependencies>
+                </plugin>
+                <plugin>
+                    <groupId>org.revapi</groupId>
+                    <artifactId>revapi-maven-plugin</artifactId>
+                    <dependencies>
+                        <dependency>
+                            <groupId>io.debezium</groupId>
+                            <artifactId>debezium-revapi</artifactId>
+                            <version>${version.debezium}</version>
+                        </dependency>
+                    </dependencies>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+        <plugins>
+            <!-- Disable the check-style execution from the qa profile inherited from debezium-parent.
+                 That profile configures maven-checkstyle-plugin with debezium-checkstyle:${project.version},
+                 which resolves to our project version — a non-existent artifact.
+                 Binding the execution to phase "none" in the child's main build prevents it from running
+                 and prevents Maven from needing to load the plugin's extra dependencies. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-checkstyle-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>check-style</id>
+                        <phase>none</phase>
+                    </execution>
+                </executions>
+            </plugin>
+            <!-- Disable the central-publishing-maven-plugin lifecycle extension inherited from
+                 debezium-build-parent. With extensions=true it intercepts afterProjectsRead()
+                 and removes all maven-deploy-plugin:deploy executions from the build plan,
+                 preventing deployment to any repository. This project deploys to GCP Artifact
+                 Registry only and never publishes to Sonatype Central. -->
+            <plugin>
+                <groupId>org.sonatype.central</groupId>
+                <artifactId>central-publishing-maven-plugin</artifactId>
+                <extensions>false</extensions>
+                <configuration>
+                    <skipPublishing>true</skipPublishing>
+                </configuration>
+            </plugin>
+        </plugins>
         <resources>
             <!-- Apply the properties set in the POM to the resource files -->
             <resource>
