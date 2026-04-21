@@ -1,0 +1,66 @@
+name: Build (PR Validation)
+
+on:
+  pull_request:
+    paths-ignore:
+      - '*.md'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout connector
+        uses: actions/checkout@v4
+        with:
+          path: ibmi
+
+      - name: Compute debezium branch
+        id: debezium
+        run: |
+          DEBEZIUM_VERSION=$(sed -n 's/.*<version\.debezium>\(.*\)<\/version\.debezium>.*/\1/p' ibmi/pom.xml | head -1 | sed 's/-SNAPSHOT//')
+          echo "branch=$(echo "${DEBEZIUM_VERSION}" | cut -d. -f1,2)" >> $GITHUB_OUTPUT
+
+      - name: Checkout debezium core
+        uses: actions/checkout@v4
+        with:
+          repository: debezium/debezium
+          ref: ${{ steps.debezium.outputs.branch }}
+          path: core
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Install debezium core
+        run: |
+          ./ibmi/mvnw clean install \
+            -f core/pom.xml \
+            -pl debezium-bom,debezium-core,debezium-embedded,debezium-storage,debezium-assembly-descriptors \
+            -am \
+            -DskipTests \
+            -DskipITs \
+            -Dformat.formatter.goal=validate \
+            -Dformat.imports.goal=check \
+            -Dhttp.keepAlive=false \
+            -Dmaven.wagon.http.pool=false \
+            -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
+
+      - name: Build connector
+        run: |
+          ./ibmi/mvnw package \
+            -f ibmi/pom.xml \
+            -DskipTests \
+            -DskipITs \
+            -Dhttp.keepAlive=false \
+            -Dmaven.wagon.http.pool=false \
+            -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
