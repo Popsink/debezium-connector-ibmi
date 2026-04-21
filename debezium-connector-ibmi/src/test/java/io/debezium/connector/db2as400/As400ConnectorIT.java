@@ -147,7 +147,7 @@ public class As400ConnectorIT extends AbstractAsyncEngineConnectorTest {
         records.print();
 
         // tombstone (null value after delete for log compaction)
-        records = consumeRecordsByTopic(1,false);
+        records = consumeRecordsByTopic(1, false);
         records.print();
 
         // --- Autocommit operation after transaction — should dispatch immediately ---
