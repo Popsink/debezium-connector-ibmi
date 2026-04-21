@@ -3,7 +3,7 @@
     <parent>
         <groupId>io.debezium</groupId>
         <artifactId>debezium-parent</artifactId>
-        <version>3.5.0.Final</version>
+        <version>3.5.1-SNAPSHOT</version>
     </parent>
 
     <modelVersion>4.0.0</modelVersion>
@@ -28,7 +28,7 @@
 
     <properties>
         <!-- Debezium parent -->
-        <version.debezium>3.5.0.Final</version.debezium>
+        <version.debezium>3.5.1-SNAPSHOT</version.debezium>
 
         <!-- Dependencies -->
         <version.jt400>21.0.4</version.jt400>
