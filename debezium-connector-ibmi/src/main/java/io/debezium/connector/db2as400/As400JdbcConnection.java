@@ -136,7 +136,8 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
             }
 
             final String tableSchema = schemaName;
-            getSystemName(tableSchema, tableName).map(x -> r.add(new FileFilter(tableSchema, x)));
+            //AS400 does not handle double-quote escaping, so remove them before building FileFilter object
+            getSystemName(tableSchema, tableName.replaceAll("\"", "")).map(x -> r.add(new FileFilter(tableSchema, x)));
         }
         return r;
     }

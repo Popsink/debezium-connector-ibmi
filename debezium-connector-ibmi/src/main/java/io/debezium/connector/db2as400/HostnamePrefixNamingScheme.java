@@ -17,6 +17,7 @@ import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.schema.AbstractTopicNamingStrategy;
 import io.debezium.schema.SchemaTopicNamingStrategy;
+import io.debezium.spi.common.ReplacementFunction;
 import io.debezium.spi.schema.DataCollectionId;
 import io.debezium.util.BoundedConcurrentHashMap;
 import io.debezium.util.Collect;
@@ -69,6 +70,8 @@ public class HostnamePrefixNamingScheme extends AbstractTopicNamingStrategy<Data
         transaction = config.getString(TOPIC_TRANSACTION);
         prefix = config.getString(CommonConnectorConfig.TOPIC_PREFIX);
         assert prefix != null;
+        // base configure() sets this; replicate it in case ibmi uses special characters not accepted by Kafka
+        replacement = ReplacementFunction.UNDERSCORE_REPLACEMENT;
     }
 
     @Override

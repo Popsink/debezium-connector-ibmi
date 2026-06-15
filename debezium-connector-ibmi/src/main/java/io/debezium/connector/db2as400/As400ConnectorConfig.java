@@ -6,7 +6,10 @@
 package io.debezium.connector.db2as400;
 
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.Optional;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigDef.Importance;
@@ -136,13 +139,51 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                     "functionality.  Options are none, both, leading, trailing.");
 
     public As400ConnectorConfig(Configuration config) {
-        super(config, new SystemTablesPredicate(),
+        // Debezium treats table.include.list as regex (filters + the base snapshot's re-filter via
+        // tableIncludeList()), so names with metacharacters like $ are normalized. The journal path
+        // reads the raw list via getRawTableIncludeList() instead.
+        super(normalizeTableIncludeList(config), new SystemTablesPredicate(),
                 tableToString, 1, ColumnFilterMode.SCHEMA, false);
         this.config = config;
         this.snapshotMode = SnapshotMode.parse(config.getString(SNAPSHOT_MODE), SNAPSHOT_MODE.defaultValueAsString());
-        this.tableFilters = new As400NormalRelationalTableFilters(config, new SystemTablesPredicate(), tableToString);
+        this.tableFilters = new As400NormalRelationalTableFilters(normalizeTableIncludeList(config), new SystemTablesPredicate(), tableToString);
         this.charSequenceTrimMode = CharSequenceTrimMode.parse(config.getString(TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE),
                 TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE.defaultValueAsString());
+    }
+
+    /** The raw {@code table.include.list} as supplied (e.g. {@code PYP31."$SCHAR"}), for the journal path. */
+    public String getRawTableIncludeList() {
+        return config.getString(TABLE_INCLUDE_LIST);
+    }
+
+    /** Escapes AS400 table names with regex metacharacters so they match as literals. */
+    private static Configuration normalizeTableIncludeList(Configuration config) {
+        String includeList = config.getString(TABLE_INCLUDE_LIST);
+        if (includeList == null || includeList.isBlank()) {
+            return config;
+        }
+        String normalized = Arrays.stream(includeList.split(","))
+                .map(String::trim)
+                .map(As400ConnectorConfig::normalizeTablePattern)
+                .collect(Collectors.joining(","));
+        return config.edit().with(TABLE_INCLUDE_LIST, normalized).build();
+    }
+
+    private static String normalizeTablePattern(String pattern) {
+        int dotIdx = pattern.lastIndexOf('.');
+        if (dotIdx < 0) {
+            return pattern;
+        }
+        String schema = pattern.substring(0, dotIdx);
+        String table = pattern.substring(dotIdx + 1);
+        // A quoted name is an explicit literal identifier; an unquoted name with $ would break as regex.
+        if (table.startsWith("\"") && table.endsWith("\"") && table.length() > 2) {
+            table = table.substring(1, table.length() - 1);
+        }
+        else if (!table.contains("$")) {
+            return pattern;
+        }
+        return schema + "\\." + Pattern.quote(table);
     }
 
     // used by the snapshot to limit the additional tables for a change in configuration
@@ -150,7 +191,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
         this(config);
         this.incrementalTables = incrementalTableFilters;
         this.tableFilters = new As400AdditionalRelationalTableFilters(
-                config, new SystemTablesPredicate(), tableToString, incrementalTableFilters);
+                normalizeTableIncludeList(config), new SystemTablesPredicate(), tableToString, incrementalTableFilters);
     }
 
     public SnapshotMode getSnapshotMode() {
