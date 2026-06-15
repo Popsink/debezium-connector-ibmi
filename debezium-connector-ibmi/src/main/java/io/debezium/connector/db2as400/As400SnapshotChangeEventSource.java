@@ -190,7 +190,12 @@ public class As400SnapshotChangeEventSource
     protected Optional<String> getSnapshotSelect(
                                                  RelationalSnapshotContext<As400Partition, As400OffsetContext> snapshotContext, TableId tableId,
                                                  List<String> columns) {
-        String fullTableName = String.format("%s.%s", tableId.schema(), tableId.table());
+        String table = tableId.table();
+        // quote names that aren't plain SQL identifiers (e.g. $SCHAR)
+        if (!table.matches("[A-Za-z_][A-Za-z0-9_]*")) {
+            table = "\"" + table + "\"";
+        }
+        String fullTableName = String.format("%s.%s", tableId.schema(), table);
         return snapshotterService.getSnapshotQuery().snapshotQuery(fullTableName, columns);
     }
 
