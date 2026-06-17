@@ -136,7 +136,7 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
             }
 
             final String tableSchema = schemaName;
-            //AS400 does not handle double-quote escaping, so remove them before building FileFilter object
+            // AS400 does not handle double-quote escaping, so remove them before building FileFilter object
             getSystemName(tableSchema, tableName.replaceAll("\"", "")).map(x -> r.add(new FileFilter(tableSchema, x)));
         }
         return r;
@@ -389,4 +389,15 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
         return queryAndMap("values ( CURRENT TIMESTAMP )",
                 rs -> rs.next() ? Optional.of(rs.getTimestamp(1).toInstant()) : Optional.empty());
     }
+
+    @Override
+    public String buildSelectWithRowLimits(TableId tableId, int limit, String projection,
+                                           Optional<String> condition, Optional<String> additionalCondition, String orderBy,
+                                           Optional<String> tableAlias) {
+        // DB2 for i: hint an index-driven, first-n-rows plan so each incremental chunk
+        // avoids materialising/sorting the whole table.
+        return super.buildSelectWithRowLimits(tableId, limit, projection, condition,
+                additionalCondition, orderBy, tableAlias) + " OPTIMIZE FOR " + limit + " ROWS";
+    }
+
 }
