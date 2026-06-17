@@ -51,6 +51,11 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
         return "";
     };
 
+    /**
+     * Floor for the default {@code snapshot.fetch.size}. Matches Debezium's stock relational default.
+     */
+    private static final int DEFAULT_SNAPSHOT_FETCH_SIZE = 2_000;
+
     private final CharSequenceTrimMode charSequenceTrimMode;
     private final SnapshotMode snapshotMode;
     private final Configuration config;
@@ -143,7 +148,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
         // tableIncludeList()), so names with metacharacters like $ are normalized. The journal path
         // reads the raw list via getRawTableIncludeList() instead.
         super(normalizeTableIncludeList(config), new SystemTablesPredicate(),
-                tableToString, 1, ColumnFilterMode.SCHEMA, false);
+                tableToString, DEFAULT_SNAPSHOT_FETCH_SIZE, ColumnFilterMode.SCHEMA, false);
         this.config = config;
         this.snapshotMode = SnapshotMode.parse(config.getString(SNAPSHOT_MODE), SNAPSHOT_MODE.defaultValueAsString());
         this.tableFilters = new As400NormalRelationalTableFilters(normalizeTableIncludeList(config), new SystemTablesPredicate(), tableToString);

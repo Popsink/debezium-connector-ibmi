@@ -47,6 +47,10 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
     private final int toCcsid;
     private boolean registered = false;
 
+    /** Skip the {@link Connection#isValid} liveness round-trip if we validated within this window. */
+    private static final long VALIDATION_INTERVAL_MS = 2_000;
+    private long lastValidatedEpochMs = 0;
+
     private static final String GET_DATABASE_NAME = "values ( CURRENT_SERVER )";
     private static final String GET_SYSTEM_TABLE_NAME = "select trim(system_table_name) from qsys2.systables where system_table_schema=? AND table_name=?";
     private static final String GET_ALL_SYSTEM_TABLE_NAME = "select trim(system_table_name), trim(table_name) from qsys2.systables where system_table_schema=?";
@@ -332,6 +336,12 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
         }
 
         Connection conn = super.connection(true);
+        // The host silently drops idle connections and isClosed() (checked by super) won't catch a half-dead
+        // socket, so we probe with isValid() - a network round-trip.
+        final long now = System.currentTimeMillis();
+        if (now - lastValidatedEpochMs < VALIDATION_INTERVAL_MS) {
+            return conn;
+        }
         if (!conn.isValid(3)) {
             log.info("connection dead closing");
             try {
@@ -345,6 +355,7 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
         else {
             log.debug("validated connection OK");
         }
+        lastValidatedEpochMs = System.currentTimeMillis();
         return conn;
     }
 
