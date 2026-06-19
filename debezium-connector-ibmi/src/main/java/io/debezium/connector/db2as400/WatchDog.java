@@ -13,9 +13,10 @@ import org.slf4j.LoggerFactory;
 public class WatchDog implements Runnable {
     private static final Logger log = LoggerFactory.getLogger(As400StreamingChangeEventSource.class);
 
-    private long lastSeen = System.currentTimeMillis();
+    private volatile long lastSeen = System.currentTimeMillis();
     private final Thread notify;
-    private boolean running = true;
+    private volatile boolean running = true;
+    private volatile boolean paused = false;
     private final long wait;
     private Thread watchDogThread;
 
@@ -31,7 +32,7 @@ public class WatchDog implements Runnable {
             try {
                 Thread.sleep(wait);
                 long now = System.currentTimeMillis();
-                if (now - lastSeen > wait) {
+                if (!paused && now - lastSeen > wait) {
                     log.warn("No update since {} interrupting streaming thread {}", new Date(lastSeen), notify.getName());
                     notify.interrupt();
                 }
@@ -57,5 +58,23 @@ public class WatchDog implements Runnable {
 
     public void alive() {
         lastSeen = System.currentTimeMillis();
+    }
+
+    /**
+     * Suspends interruption while the streaming thread is legitimately idle, e.g. parked waiting
+     * for an ad-hoc blocking snapshot to complete. Without this the watchdog would interrupt the
+     * paused streaming thread after {@code wait} ms and abort the snapshot.
+     */
+    public void pause() {
+        this.paused = true;
+    }
+
+    /**
+     * Resumes interruption monitoring, resetting the activity timer so a long pause does not cause
+     * an immediate interruption on the next check.
+     */
+    public void resume() {
+        this.lastSeen = System.currentTimeMillis();
+        this.paused = false;
     }
 }
