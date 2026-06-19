@@ -70,7 +70,7 @@ If the journal is deleted before it is read it will log an error: "Lost journal 
 
 At this point you really need to resync, this does not happen automatically
 
-* Todo needs to support ad-jhoc snapshotting
+Ad-hoc snapshots (both incremental and blocking) are supported via the signalling channel.
 
 ## Memory
 

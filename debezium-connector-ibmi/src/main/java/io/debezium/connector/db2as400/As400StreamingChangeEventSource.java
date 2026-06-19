@@ -122,6 +122,18 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
         watchDog.start();
         try {
             while (context.isRunning()) {
+                // Cooperate with the coordinator when an ad-hoc blocking snapshot is requested:
+                // acknowledge the pause so the blocking snapshot can start, then wait for it to
+                // complete before resuming journal streaming. Without this the coordinator's
+                // blocking-snapshot thread waits forever on waitStreamingPaused() and the snapshot
+                // never runs. The check happens between RPC polls, so the pause takes effect after
+                // the current getJournalEntries() call returns (bounded by the watchdog timeout).
+                if (context.isPaused()) {
+                    log.info("Streaming will now pause for an ad-hoc blocking snapshot");
+                    context.streamingPaused();
+                    context.waitSnapshotCompletion();
+                    log.info("Streaming resumed after blocking snapshot");
+                }
                 try {
                     try {
                         switch (dataConnection.getJournalEntries(context, offsetContext,
