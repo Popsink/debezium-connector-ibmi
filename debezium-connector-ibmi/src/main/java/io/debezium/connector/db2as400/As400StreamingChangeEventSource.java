@@ -130,8 +130,12 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                 // the current getJournalEntries() call returns (bounded by the watchdog timeout).
                 if (context.isPaused()) {
                     log.info("Streaming will now pause for an ad-hoc blocking snapshot");
+                    // The streaming thread parks in waitSnapshotCompletion() below and stops calling
+                    // watchDog.alive(); suspend the watchdog so it does not interrupt us mid-snapshot.
+                    watchDog.pause();
                     context.streamingPaused();
                     context.waitSnapshotCompletion();
+                    watchDog.resume();
                     log.info("Streaming resumed after blocking snapshot");
                 }
                 try {
