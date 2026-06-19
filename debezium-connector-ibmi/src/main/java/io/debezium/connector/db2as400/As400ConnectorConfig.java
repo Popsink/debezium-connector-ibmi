@@ -7,7 +7,9 @@ package io.debezium.connector.db2as400;
 
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.Optional;
+import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -222,6 +224,46 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
 
     public String getSchema() {
         return config.getString(SCHEMA).toUpperCase();
+    }
+
+    /**
+     * The set of libraries (schemas) to capture, derived from the raw {@code table.include.list}.
+     *
+     * <p>A connector may capture tables spread across several libraries (e.g.
+     * {@code LIB1.T1,LIB2.T2}). Each qualified entry contributes its own library; unqualified
+     * entries fall back to {@link #getSchema()}, which is always included. The library is taken as
+     * the segment before the table name, mirroring {@code As400JdbcConnection.shortIncludes}.</p>
+     *
+     * @return the distinct uppercased libraries, with {@link #getSchema()} first
+     */
+    public Set<String> getCaptureSchemas() {
+        final Set<String> schemas = new LinkedHashSet<>();
+        final String defaultSchema = getSchema();
+        schemas.add(defaultSchema);
+
+        final String includeList = getRawTableIncludeList();
+        if (includeList == null || includeList.isBlank()) {
+            return schemas;
+        }
+        for (String entry : includeList.split(",")) {
+            entry = entry.trim();
+            if (entry.isEmpty()) {
+                continue;
+            }
+            int o = entry.lastIndexOf('.');
+            if (o <= 0) {
+                schemas.add(defaultSchema);
+                continue;
+            }
+            String schemaName = entry.substring(0, o);
+            // Handle the "database.schema.table" form: keep only the schema segment.
+            o = schemaName.lastIndexOf('.');
+            if (o > 0) {
+                schemaName = schemaName.substring(o + 1);
+            }
+            schemas.add(schemaName.toUpperCase());
+        }
+        return schemas;
     }
 
     public Integer getJournalBufferSize() {
