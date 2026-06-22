@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -152,29 +153,43 @@ public class JournalInfoRetrieval {
         return getOffset(as400, ji);
     }
 
+    /**
+     * Resolve the single journal shared by all included tables.
+     *
+     * <p>Tables may live in several libraries (schemas): each table's journal is resolved using
+     * its own library, so a single connector can capture tables spread across multiple libraries
+     * as long as they all journal to the <em>same</em> journal. The multi-journal case is rejected
+     * because the offset model is single-journal.</p>
+     *
+     * @param schema the connector's default library, used only when {@code includes} is empty
+     * @param includes the qualified table filters (each carries its own library)
+     * @return the journal common to every included table
+     * @throws IllegalStateException if the journal cannot be retrieved, or if the tables span more
+     *         than one journal
+     */
     public JournalInfo getJournal(AS400 as400, String schema, List<FileFilter> includes) throws IllegalStateException {
+        if (includes.isEmpty()) {
+            return getJournal(as400, schema);
+        }
+        final Set<JournalInfo> jis = new HashSet<>();
+        final Set<String> libraries = new TreeSet<>();
         try {
-            if (includes.isEmpty()) {
-                return getJournal(as400, schema);
-            }
-            final Set<JournalInfo> jis = new HashSet<>();
             for (final FileFilter f : includes) {
-                if (!schema.equals(f.schema())) {
-                    throw new IllegalArgumentException(
-                            String.format("schema %s does not match for filter: %s", schema, f));
-                }
-                final JournalInfo ji = getJournal(as400, f.schema(), f.table());
-                jis.add(ji);
+                libraries.add(f.schema());
+                jis.add(getJournal(as400, f.schema(), f.table()));
             }
-            if (jis.size() > 1) {
-                throw new IllegalArgumentException(
-                        String.format("more than one journal for the set of tables journals: %s", jis));
-            }
-            return jis.iterator().next();
         }
         catch (final Exception e) {
             throw new IllegalStateException("unable to retrieve journal details", e);
         }
+        if (jis.size() > 1) {
+            throw new IllegalStateException(String.format(
+                    "tables span more than one journal, which is not supported: a single connector must "
+                            + "capture tables that all journal to the same journal. Libraries requested: %s; "
+                            + "distinct journals found: %s",
+                    libraries, jis));
+        }
+        return jis.iterator().next();
     }
 
     public JournalInfo getJournal(AS400 as400, String schema, String table) throws Exception {
