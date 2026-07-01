@@ -38,6 +38,7 @@ import com.ibm.as400.access.ProgramParameter;
 import com.ibm.as400.access.QSYSObjectPathName;
 import com.ibm.as400.access.ServiceProgramCall;
 
+import io.debezium.ibmi.db2.journal.retrieve.exception.JournalReceiverNotFoundException;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.DetailedJournalReceiver;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.JournalReceiverInfo;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.JournalStatus;
@@ -54,6 +55,19 @@ public class JournalInfoRetrieval {
     private static final Logger log = LoggerFactory.getLogger(JournalInfoRetrieval.class);
 
     public static final String JOURNAL_SERVICE_LIB = "/QSYS.LIB/QJOURNAL.SRVPGM";
+
+    /**
+     * IBM i message ids that identify a permanently missing object (typically a pruned journal
+     * receiver or its library). When a service program call fails with one of these, the stored
+     * position is gone for good and the failure must be treated as non-transient rather than retried.
+     * <ul>
+     * <li>CPF9801 - Object &amp;2 in library &amp;3 not found</li>
+     * <li>CPF9810 - Library &amp;1 not found</li>
+     * <li>CPF9812 - File &amp;1 in library &amp;2 not found</li>
+     * <li>CPF7025 - Object cannot be found (journal API)</li>
+     * </ul>
+     */
+    static final Set<String> RECEIVER_NOT_FOUND_MESSAGE_IDS = Set.of("CPF9801", "CPF9810", "CPF9812", "CPF7025");
 
     private static final byte[] EMPTY_AS400_TEXT = new AS400Text(0).toBytes("");
     private final AS400Text as400Text8 = new AS400Text(8);
@@ -506,10 +520,7 @@ public class JournalInfoRetrieval {
             return processor.process(parameters);
         }
         else {
-            final String msg = Arrays.asList(spc.getMessageList()).stream().map(AS400Message::getText).reduce("",
-                    (a, s) -> a + s);
-            log.error(String.format("service program %s/%s call failed %s", programLibrary, program, msg));
-            throw new Exception(msg);
+            throw classifyServiceProgramFailure(programLibrary, program, spc.getMessageList());
         }
     }
 
@@ -529,6 +540,25 @@ public class JournalInfoRetrieval {
             throws Exception {
         return callServiceProgramParams(as400, programLibrary, program, parameters,
                 p -> processor.process(p[0].getOutputData()));
+    }
+
+    /**
+     * Build the exception for a failed service program call, distinguishing a permanently missing
+     * object (pruned receiver / library -> {@link JournalReceiverNotFoundException}) from any other,
+     * potentially transient, failure (generic {@link Exception}).
+     */
+    static Exception classifyServiceProgramFailure(String programLibrary, String program, AS400Message[] messages) {
+        final String msg = Arrays.stream(messages).map(AS400Message::getText).reduce("", (a, s) -> a + s);
+        log.error(String.format("service program %s/%s call failed %s", programLibrary, program, msg));
+        final Optional<String> notFoundId = Arrays.stream(messages)
+                .map(AS400Message::getID)
+                .filter(id -> id != null && RECEIVER_NOT_FOUND_MESSAGE_IDS.contains(id.toUpperCase()))
+                .findFirst();
+        if (notFoundId.isPresent()) {
+            // Non-transient: the referenced object (pruned receiver / library) is gone for good.
+            return new JournalReceiverNotFoundException(msg, notFoundId.get());
+        }
+        return new Exception(msg);
     }
 
     public Integer decodeInt(byte[] data, int offset) {
