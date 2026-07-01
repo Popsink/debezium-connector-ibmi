@@ -28,6 +28,7 @@ import io.debezium.connector.db2as400.metrics.As400StreamingChangeEventSourceMet
 import io.debezium.document.DocumentReader;
 import io.debezium.ibmi.db2.journal.retrieve.FileFilter;
 import io.debezium.ibmi.db2.journal.retrieve.JournalInfoRetrieval;
+import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.jdbc.DefaultMainConnectionProvidingConnectionFactory;
 import io.debezium.jdbc.MainConnectionProvidingConnectionFactory;
 import io.debezium.pipeline.ChangeEventSourceCoordinator;
@@ -141,6 +142,10 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
         final As400RpcConnection rpcConnection = new As400RpcConnection(connectorConfig, streamingMetrics,
                 shortIncludes, cacheWait);
 
+        // Detect and recover from a stored position whose receiver has been pruned, before Debezium
+        // core turns an unavailable position into a generic crash-loop.
+        applyUnavailablePositionRecovery(connectorConfig, rpcConnection, previousOffsetPartition);
+
         validateSchemaHistory(connectorConfig, rpcConnection::validateLogPosition, previousOffsetPartition, schema,
                 snapshotterService.getSnapshotter());
 
@@ -178,6 +183,44 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
         coordinator.start(taskContext, this.queue, metadataProvider);
 
         return coordinator;
+    }
+
+    /**
+     * When the stored journal position points at a receiver that has been pruned off the server, apply
+     * the configured {@link As400ConnectorConfig.UnavailablePositionRecovery} strategy instead of letting
+     * Debezium core throw a generic, retried-to-death engine failure. Transient validation failures are
+     * left to propagate so the engine restart is a legitimate retry.
+     */
+    private void applyUnavailablePositionRecovery(As400ConnectorConfig connectorConfig, As400RpcConnection rpcConnection,
+                                                  Offsets<As400Partition, As400OffsetContext> previousOffsets) {
+        if (!connectorConfig.isLogPositionCheckEnabled()) {
+            return;
+        }
+        final As400ConnectorConfig.UnavailablePositionRecovery mode = connectorConfig.getUnavailablePositionRecovery();
+        for (Map.Entry<As400Partition, As400OffsetContext> entry : previousOffsets) {
+            final As400OffsetContext offset = entry.getValue();
+            if (offset == null || rpcConnection.checkLogPosition(offset) != As400RpcConnection.PositionAvailability.PRUNED) {
+                continue;
+            }
+            switch (mode) {
+                case FAIL:
+                    throw new OffsetNoLongerAvailableException(
+                            "stored journal position " + offset.getPosition() + " is no longer available on the server "
+                                    + "(pruned receiver). Reset the offset and trigger a snapshot, or set "
+                                    + "'" + As400ConnectorConfig.UNAVAILABLE_POSITION_RECOVERY.name() + "' to 'snapshot' or 'earliest' to auto-recover.");
+                case SNAPSHOT:
+                    LOGGER.warn("Stored journal position {} is no longer available (pruned receiver); resetting the offset so "
+                            + "snapshot.mode '{}' can take a fresh snapshot to fill the gap.", offset.getPosition(), connectorConfig.getSnapshotMode().getValue());
+                    previousOffsets.resetOffset(entry.getKey());
+                    break;
+                case EARLIEST:
+                    LOGGER.warn("DATA GAP: stored journal position {} is no longer available (pruned receiver); resetting streaming to "
+                            + "the earliest available journal receiver. Changes between the lost position and the earliest available "
+                            + "receiver are unrecoverable.", offset.getPosition());
+                    offset.setPosition(new JournalProcessedPosition());
+                    break;
+            }
+        }
     }
 
     @Override

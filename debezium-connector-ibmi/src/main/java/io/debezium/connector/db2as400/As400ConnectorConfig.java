@@ -60,6 +60,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
 
     private final CharSequenceTrimMode charSequenceTrimMode;
     private final SnapshotMode snapshotMode;
+    private final UnavailablePositionRecovery unavailablePositionRecovery;
     private final Configuration config;
     private String incrementalTables = "";
 
@@ -145,6 +146,18 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                     "are CHAR/VARCHAR or other Character sequence types.  Defaults to both to conform to pre-existing " +
                     "functionality.  Options are none, both, leading, trailing.");
 
+    public static final Field UNAVAILABLE_POSITION_RECOVERY = Field.create("journal.unavailable.position.recovery")
+            .withDisplayName("Recovery strategy when the stored journal position is no longer available")
+            .withEnum(UnavailablePositionRecovery.class, UnavailablePositionRecovery.FAIL)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("Controls how the connector recovers when its stored journal position points at a receiver "
+                    + "that has been pruned/rotated off the server (typically after downtime longer than the journal "
+                    + "retention). 'fail' (default) stops with a distinct, non-transient error so an orchestrator can "
+                    + "reset the offset or alert; 'snapshot' resets the offset and lets the configured snapshot.mode take "
+                    + "a fresh snapshot to fill the gap; 'earliest' resets streaming to the earliest available journal "
+                    + "receiver and continues, logging that changes between the lost position and the earliest receiver "
+                    + "are unrecoverable.");
+
     public As400ConnectorConfig(Configuration config) {
         // Debezium treats table.include.list as regex (filters + the base snapshot's re-filter via
         // tableIncludeList()), so names with metacharacters like $ are normalized. The journal path
@@ -156,6 +169,8 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
         this.tableFilters = new As400NormalRelationalTableFilters(normalizeTableIncludeList(config), new SystemTablesPredicate(), tableToString);
         this.charSequenceTrimMode = CharSequenceTrimMode.parse(config.getString(TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE),
                 TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE.defaultValueAsString());
+        this.unavailablePositionRecovery = UnavailablePositionRecovery.parse(
+                config.getString(UNAVAILABLE_POSITION_RECOVERY), UNAVAILABLE_POSITION_RECOVERY.defaultValueAsString());
     }
 
     /** The raw {@code table.include.list} as supplied (e.g. {@code PYP31."$SCHAR"}), for the journal path. */
@@ -203,6 +218,10 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
 
     public SnapshotMode getSnapshotMode() {
         return snapshotMode;
+    }
+
+    public UnavailablePositionRecovery getUnavailablePositionRecovery() {
+        return unavailablePositionRecovery;
     }
 
     @Override
@@ -342,7 +361,8 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
     public static Field.Set ALL_FIELDS = Field.setOf(JdbcConfiguration.HOSTNAME, USER, PASSWORD, SCHEMA, BUFFER_SIZE,
             RelationalDatabaseConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE, SOCKET_TIMEOUT,
             MAX_SERVER_SIDE_ENTRIES, TOPIC_NAMING_STRATEGY, FROM_CCSID, TO_CCSID, SECURE,
-            DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED);
+            DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
+            UNAVAILABLE_POSITION_RECOVERY);
 
     public static ConfigDef configDef() {
         final ConfigDef c = RelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
@@ -350,7 +370,8 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                 .type(
                         HOSTNAME, USER, PASSWORD, SCHEMA, BUFFER_SIZE,
                         SOCKET_TIMEOUT, FROM_CCSID, TO_CCSID, SECURE,
-                        DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED)
+                        DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
+                        UNAVAILABLE_POSITION_RECOVERY)
                 .connector(
                         SCHEMA_NAME_ADJUSTMENT_MODE)
                 .events(
@@ -457,6 +478,65 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
          */
         public static SnapshotMode parse(String value, String defaultValue) {
             SnapshotMode mode = parse(value);
+            if (mode == null && defaultValue != null) {
+                mode = parse(defaultValue);
+            }
+            return mode;
+        }
+    }
+
+    /**
+     * Recovery strategy applied at startup when the stored journal position points at a receiver that
+     * is no longer available on the server (pruned/rotated).
+     */
+    public enum UnavailablePositionRecovery implements EnumeratedValue {
+
+        /**
+         * Stop with a distinct, non-transient error ({@link OffsetNoLongerAvailableException}) so the
+         * orchestrator can reset the offset / trigger a snapshot / alert. Default; preserves the
+         * pre-existing "do not silently lose data" behaviour, but without a blind crash-loop.
+         */
+        FAIL("fail"),
+
+        /**
+         * Reset the offset and let the configured {@code snapshot.mode} take a fresh snapshot to
+         * re-establish table state, then resume streaming from the current journal position.
+         */
+        SNAPSHOT("snapshot"),
+
+        /**
+         * Reset streaming to the earliest journal receiver still available and continue. Intended for
+         * streaming-only / {@code no_data} connectors; changes between the lost position and the
+         * earliest available receiver are unrecoverable and a loud warning is logged.
+         */
+        EARLIEST("earliest");
+
+        private final String value;
+
+        UnavailablePositionRecovery(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        public static UnavailablePositionRecovery parse(String value) {
+            if (value == null) {
+                return null;
+            }
+            value = value.trim();
+            for (UnavailablePositionRecovery option : UnavailablePositionRecovery.values()) {
+                if (option.getValue().equalsIgnoreCase(value)) {
+                    return option;
+                }
+            }
+            return null;
+        }
+
+        public static UnavailablePositionRecovery parse(String value, String defaultValue) {
+            UnavailablePositionRecovery mode = parse(value);
             if (mode == null && defaultValue != null) {
                 mode = parse(defaultValue);
             }

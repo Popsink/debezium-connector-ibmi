@@ -20,6 +20,7 @@ import com.ibm.as400.access.AS400;
 import com.ibm.as400.access.SecureAS400;
 import com.ibm.as400.access.SocketProperties;
 
+import io.debezium.DebeziumException;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.connector.db2as400.metrics.As400StreamingChangeEventSourceMetrics;
 import io.debezium.ibmi.db2.journal.retrieve.Connect;
@@ -32,6 +33,7 @@ import io.debezium.ibmi.db2.journal.retrieve.RetrievalState;
 import io.debezium.ibmi.db2.journal.retrieve.RetrieveConfig;
 import io.debezium.ibmi.db2.journal.retrieve.RetrieveConfigBuilder;
 import io.debezium.ibmi.db2.journal.retrieve.RetrieveJournal;
+import io.debezium.ibmi.db2.journal.retrieve.exception.JournalReceiverNotFoundException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
 import io.debezium.ibmi.db2.journal.retrieve.rjne0200.EntryHeader;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.DetailedJournalReceiver;
@@ -101,21 +103,53 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
 
     }
 
-    public boolean validateLogPosition(Partition partition, OffsetContext offsetContext, CommonConnectorConfig config) {
-        try {
-            if (offsetContext instanceof As400OffsetContext offset) {
-                if (offset.isPositionSet()) {
-                    JournalReceiverInfo receiver = new JournalReceiverInfo(offset.getPosition().getReceiver(), null, null, Optional.empty());
+    /**
+     * Availability of a stored journal position on the server.
+     */
+    public enum PositionAvailability {
+        /** The receiver referenced by the stored position still exists. */
+        AVAILABLE,
+        /** No position is stored yet (fresh start / blank offset); streaming begins at the earliest receiver. */
+        NOT_SET,
+        /** The receiver has been pruned/rotated off the server; the position can never be resolved again. */
+        PRUNED
+    }
 
-                    DetailedJournalReceiver dr = journalInfoRetrieval.getReceiverDetails(as400, receiver);
-                    return dr != null;
-                }
-            }
+    /**
+     * Classify a stored offset without collapsing every failure mode into a single boolean.
+     * A pruned receiver ({@link PositionAvailability#PRUNED}) is a permanent condition, whereas a
+     * transient RPC/connection failure is rethrown so the caller retries instead of wrongly treating
+     * the position as lost.
+     *
+     * @throws DebeziumException if the position could not be validated for a transient reason
+     */
+    public PositionAvailability checkLogPosition(OffsetContext offsetContext) {
+        return checkLogPosition(journalInfoRetrieval, as400, offsetContext);
+    }
+
+    static PositionAvailability checkLogPosition(JournalInfoRetrieval journalInfoRetrieval, AS400 as400, OffsetContext offsetContext) {
+        if (!(offsetContext instanceof As400OffsetContext offset) || !offset.isPositionSet()) {
+            return PositionAvailability.NOT_SET;
+        }
+        try {
+            JournalReceiverInfo receiver = new JournalReceiverInfo(offset.getPosition().getReceiver(), null, null, Optional.empty());
+            DetailedJournalReceiver dr = journalInfoRetrieval.getReceiverDetails(as400, receiver);
+            return dr != null ? PositionAvailability.AVAILABLE : PositionAvailability.PRUNED;
+        }
+        catch (JournalReceiverNotFoundException e) {
+            // Non-transient: the receiver has been pruned on the source and will never come back.
+            log.warn("stored journal position {} points at a receiver that no longer exists on the server ({})", offsetContext, e.getMessageId());
+            return PositionAvailability.PRUNED;
         }
         catch (Exception e) {
-            log.warn("unable to find journal poisition {}", offsetContext, e);
+            // Transient (connection/RPC): do not misreport as lost, let the caller retry.
+            throw new DebeziumException("transient failure while validating stored journal position " + offsetContext, e);
         }
-        return false;
+    }
+
+    public boolean validateLogPosition(Partition partition, OffsetContext offsetContext, CommonConnectorConfig config) {
+        // AVAILABLE and NOT_SET are both valid starting points; only a pruned receiver is unavailable.
+        return checkLogPosition(offsetContext) != PositionAvailability.PRUNED;
     }
 
     @Override

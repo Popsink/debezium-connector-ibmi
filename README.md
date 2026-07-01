@@ -66,11 +66,37 @@ If running natively import the cert
 
 ## Journals deleted
 
-If the journal is deleted before it is read it will log an error: "Lost journal at position xxx" and reset to the beginning journal
+If the journal is deleted *while streaming* it logs an error ("Lost journal at position xxx") and resets to the earliest available journal receiver.
 
-At this point you really need to resync, this does not happen automatically
+### Stored offset no longer available at startup
 
-Ad-hoc snapshots (both incremental and blocking) are supported via the signalling channel.
+If the connector has been down longer than the source keeps its journal receivers, its committed offset
+points at a receiver that has since been pruned/rotated. On restart the connector cannot resolve that
+position. This is a **non-transient** condition — the receiver will never come back — so retrying the
+engine only delays an inevitable failure.
+
+Two things are done to keep this from turning into a silent crash-loop:
+
+* A pruned receiver is told apart from a transient RPC/connection error. Only the former is treated as
+  "position lost"; a transient failure is retried as before.
+* The `journal.unavailable.position.recovery` option controls what happens when the stored position is
+  gone:
+
+  | value | behaviour |
+  | --- | --- |
+  | `fail` (default) | Stop with a distinct, non-transient error (marker `IBMI_OFFSET_NO_LONGER_AVAILABLE`) so an orchestrator can reset the offset / trigger a snapshot / alert, rather than retry to death. |
+  | `snapshot` | Reset the offset and let the configured `snapshot.mode` take a fresh snapshot to re-establish table state, then resume streaming from the current journal position. Use with `snapshot.mode=initial`/`always`/`when_needed`. |
+  | `earliest` | Reset streaming to the earliest available journal receiver and continue. Intended for streaming-only / `no_data` connectors. Changes between the lost position and the earliest available receiver are **unrecoverable** and a loud warning is logged. |
+
+  Setting `snapshot.mode=when_needed` also triggers Debezium core's own re-snapshot-on-data-error path,
+  which is equivalent to `journal.unavailable.position.recovery=snapshot`.
+
+Data already lost from pruned receivers cannot be recovered via CDC; recovery is about getting the
+connector healthy again, not replaying the gap. Ad-hoc snapshots (both incremental and blocking) are
+also supported via the signalling channel.
+
+> Not to be confused with a stale JDBC connection detected mid-snapshot, which is a connection-liveness
+> issue rather than offset/position recovery.
 
 ## Memory
 
