@@ -156,7 +156,6 @@ public class As400OffsetContext extends CommonOffsetContext<SourceInfo> {
         sourceInfo.setReceiver(position.getReceiver().name());
         sourceInfo.setReceiverLib(position.getReceiver().library());
         sourceInfo.setSequence(position.getOffset().toString());
-        // sourceInfo.setRrn(String.valueOf(rrn));
         // sourceInfo.tableEvent((TableId) collectionId);
     }
 
