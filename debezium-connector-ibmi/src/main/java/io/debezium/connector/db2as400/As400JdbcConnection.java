@@ -411,4 +411,15 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
                 additionalCondition, orderBy, tableAlias) + " OPTIMIZE FOR " + limit + " ROWS";
     }
 
+    @Override
+    public String buildSelectPrimaryKeyBoundaries(TableId tableId, long size, String projection, String orderBy) {
+        // DB2 for i: the blocking-snapshot chunk boundary probe orders by the chunk key (often
+        // unindexed) with a large OFFSET. Without a hint the Predictive Query Governor estimates a
+        // full sort and can reject the query with SQL0666 on large tables (issue #21). The probe
+        // fetches a single boundary row, so OPTIMIZE FOR 1 ROW steers the optimizer toward a
+        // first-row plan and keeps the estimate under QQRYTIMLMT. Mirrors the buildSelectWithRowLimits
+        // hint used for incremental chunks above.
+        return super.buildSelectPrimaryKeyBoundaries(tableId, size, projection, orderBy) + " OPTIMIZE FOR 1 ROW";
+    }
+
 }
