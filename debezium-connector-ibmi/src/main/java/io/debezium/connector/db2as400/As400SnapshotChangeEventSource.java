@@ -5,6 +5,9 @@
  */
 package io.debezium.connector.db2as400;
 
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashSet;
@@ -20,6 +23,7 @@ import org.slf4j.LoggerFactory;
 import io.debezium.connector.db2as400.As400OffsetContext.Loader;
 import io.debezium.ibmi.db2.journal.retrieve.JournalPosition;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
+import io.debezium.jdbc.JdbcConnection;
 import io.debezium.jdbc.MainConnectionProvidingConnectionFactory;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.notification.NotificationService;
@@ -69,6 +73,88 @@ public class As400SnapshotChangeEventSource
             throws InterruptedException {
 
         return super.execute(context, partition, previousOffset, snapshottingTask);
+    }
+
+    /**
+     * Raise the DB2 for i Predictive Query Governor on the main snapshot connection. A full-table snapshot
+     * of a large unindexed table can be estimated over {@code QQRYTIMLMT} and rejected with {@code SQL0666}
+     * before any row is read; {@code CHGQRYA QRYTIMLMT(*NOMAX)} removes that ceiling for snapshot work only.
+     */
+    @Override
+    protected void connectionCreated(RelationalSnapshotContext<As400Partition, As400OffsetContext> snapshotContext) throws Exception {
+        super.connectionCreated(snapshotContext);
+        applySnapshotQueryTimeLimit(jdbcConnection);
+    }
+
+    /**
+     * Same governor raise for each additional connection in the parallel snapshot pool
+     * ({@code snapshot.max.threads > 1}).
+     */
+    @Override
+    protected void connectionPoolConnectionCreated(RelationalSnapshotContext<As400Partition, As400OffsetContext> snapshotContext,
+                                                   JdbcConnection connection)
+            throws SQLException {
+        super.connectionPoolConnectionCreated(snapshotContext, connection);
+        applySnapshotQueryTimeLimit(connection);
+    }
+
+    private void applySnapshotQueryTimeLimit(JdbcConnection connection) {
+        final String configured = connectorConfig.snapshotQueryTimeLimit();
+        final Optional<String> sql = queryTimeLimitCommand(configured);
+        if (sql.isEmpty()) {
+            if (configured != null && !configured.isBlank() && !"*SAME".equalsIgnoreCase(configured.trim())) {
+                log.warn("Ignoring invalid snapshot.query.time.limit '{}'; expected *NOMAX, *SAME or a number of seconds", configured);
+            }
+            return;
+        }
+        // Best-effort: this is a job-attribute tweak, never data. It runs against the connection's OWN job
+        // (so it needs no special authority — *JOBCTL is only required to change another job) and is
+        // entirely optional. If the environment rejects it (authority, unsupported QCMDEXC, invalid value),
+        // we swallow the error and roll the connection back so the snapshot proceeds unchanged with the
+        // existing limit. This runs before any table lock or data read, so a rollback here loses nothing.
+        try {
+            final Connection jdbc = connection.connection();
+            try (Statement statement = jdbc.createStatement()) {
+                statement.execute(sql.get());
+            }
+            log.info("Raised DB2 for i query governor on snapshot connection: {}", sql.get());
+        }
+        catch (SQLException e) {
+            log.warn("Could not set snapshot query governor time limit (continuing without it): {}", e.getMessage());
+            rollbackQuietly(connection);
+        }
+    }
+
+    private static void rollbackQuietly(JdbcConnection connection) {
+        try {
+            final Connection jdbc = connection.connection();
+            if (!jdbc.getAutoCommit()) {
+                jdbc.rollback();
+            }
+        }
+        catch (SQLException e) {
+            log.debug("Rollback after a failed query governor command also failed (ignored)", e);
+        }
+    }
+
+    /**
+     * Build the {@code CALL QSYS2.QCMDEXC('CHGQRYA QRYTIMLMT(...)')} statement for the configured limit, or
+     * empty when the limit should not be applied ({@code *SAME}, blank) or is invalid. {@code CHGQRYA
+     * QRYTIMLMT} only accepts {@code *NOMAX} or a non-negative number of seconds, so anything else is
+     * rejected rather than interpolated into the CL command.
+     */
+    static Optional<String> queryTimeLimitCommand(String configured) {
+        if (configured == null) {
+            return Optional.empty();
+        }
+        final String value = configured.trim();
+        if (value.isEmpty() || "*SAME".equalsIgnoreCase(value)) {
+            return Optional.empty();
+        }
+        if (!"*NOMAX".equalsIgnoreCase(value) && !value.matches("\\d+")) {
+            return Optional.empty();
+        }
+        return Optional.of("CALL QSYS2.QCMDEXC('CHGQRYA QRYTIMLMT(" + value.toUpperCase() + ")')");
     }
 
     @Override
