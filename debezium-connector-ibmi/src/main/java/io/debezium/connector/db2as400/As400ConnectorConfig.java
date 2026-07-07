@@ -105,6 +105,20 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
             "folder to dump failed decodings to", "used when there is a decoding failure to aid diagnostics");
 
     /**
+     * Query time limit applied to the DB2 for i Predictive Query Governor on the connector's snapshot
+     * connections via {@code CHGQRYA QRYTIMLMT(...)}. The governor rejects a query at optimize time with
+     * {@code SQL0666} when its estimated runtime exceeds this limit, which a full-table snapshot of a large
+     * unindexed table routinely does. Accepted values: {@code *NOMAX} (no limit), {@code *SAME} (leave the
+     * job attribute untouched), or a non-negative number of seconds. Applied only to snapshot connections,
+     * so journal streaming is unaffected.
+     */
+    public static final Field SNAPSHOT_QUERY_TIME_LIMIT = Field.create("snapshot.query.time.limit",
+            "Snapshot query time limit (CHGQRYA QRYTIMLMT)",
+            "Query governor time limit for snapshot connections; '*NOMAX' avoids SQL0666 rejection, "
+                    + "'*SAME' leaves the job attribute untouched, or a non-negative number of seconds.",
+            "*NOMAX");
+
+    /**
      * Maximum number of journal entries to process server side
      */
     public static final Field MAX_SERVER_SIDE_ENTRIES = Field.create("max.entries", "max server side entries",
@@ -317,6 +331,10 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
         return config.getString(DIAGNOSTICS_FOLDER);
     }
 
+    public String snapshotQueryTimeLimit() {
+        return config.getString(SNAPSHOT_QUERY_TIME_LIMIT);
+    }
+
     public Long cacheAdditionalDelay() {
         return config.getLong(JOURNAL_CACHE_ADDITIONAL_DELAY);
     }
@@ -362,7 +380,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
             RelationalDatabaseConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE, SOCKET_TIMEOUT,
             MAX_SERVER_SIDE_ENTRIES, TOPIC_NAMING_STRATEGY, FROM_CCSID, TO_CCSID, SECURE,
             DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
-            UNAVAILABLE_POSITION_RECOVERY);
+            UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT);
 
     public static ConfigDef configDef() {
         final ConfigDef c = RelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
@@ -371,7 +389,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                         HOSTNAME, USER, PASSWORD, SCHEMA, BUFFER_SIZE,
                         SOCKET_TIMEOUT, FROM_CCSID, TO_CCSID, SECURE,
                         DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
-                        UNAVAILABLE_POSITION_RECOVERY)
+                        UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT)
                 .connector(
                         SCHEMA_NAME_ADJUSTMENT_MODE)
                 .events(
