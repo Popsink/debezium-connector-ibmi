@@ -8,9 +8,12 @@ package io.debezium.connector.db2as400.snapshot.query;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import org.junit.jupiter.api.Test;
+
+import io.debezium.connector.db2as400.As400ConnectorConfig;
 
 /**
  * Unit tests for the snapshot query builder, in particular the trailing RRN column added so that
@@ -45,6 +48,35 @@ public class SelectAllSnapshotQueryTest {
         final String sql = query.snapshotQuery("MYLIB.MYTABLE", List.of("'$SCHAR'", "COL2")).orElseThrow();
 
         assertThat(sql).startsWith("SELECT \"$SCHAR\", COL2, ");
+        assertThat(sql).contains("RRN(DBZ_T) AS \"" + SelectAllSnapshotQuery.RRN_COLUMN_ALIAS + "\"");
+    }
+
+    @Test
+    public void omitsRrnColumnWhenDisabled() {
+        query.configure(Map.of(As400ConnectorConfig.SNAPSHOT_RRN_ENABLED.name(), "false"));
+
+        final String sql = query.snapshotQuery("MYLIB.MYTABLE", List.of("COL1", "COL2")).orElseThrow();
+
+        assertThat(sql).isEqualTo("SELECT COL1, COL2 FROM MYLIB.MYTABLE");
+        assertThat(sql).doesNotContain("RRN(");
+    }
+
+    @Test
+    public void appendsRrnColumnWhenExplicitlyEnabled() {
+        query.configure(Map.of(As400ConnectorConfig.SNAPSHOT_RRN_ENABLED.name(), "true"));
+
+        final String sql = query.snapshotQuery("MYLIB.MYTABLE", List.of("COL1")).orElseThrow();
+
+        assertThat(sql).endsWith("RRN(DBZ_T) AS \"" + SelectAllSnapshotQuery.RRN_COLUMN_ALIAS + "\" FROM MYLIB.MYTABLE DBZ_T");
+    }
+
+    @Test
+    public void defaultsToAppendingRrnWhenUnconfigured() {
+        // an empty configuration map (property absent) must keep the default behaviour: RRN present
+        query.configure(Map.of());
+
+        final String sql = query.snapshotQuery("MYLIB.MYTABLE", List.of("COL1")).orElseThrow();
+
         assertThat(sql).contains("RRN(DBZ_T) AS \"" + SelectAllSnapshotQuery.RRN_COLUMN_ALIAS + "\"");
     }
 }

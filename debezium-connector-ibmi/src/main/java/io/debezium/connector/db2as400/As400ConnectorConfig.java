@@ -135,6 +135,22 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                     "are CHAR/VARCHAR or other Character sequence types.  Defaults to both to conform to pre-existing " +
                     "functionality.  Options are none, both, leading, trailing.");
 
+    public static final boolean DEFAULT_SNAPSHOT_RRN_ENABLED = true;
+
+    /**
+     * When enabled, the initial snapshot query appends the Relative Record Number so {@code op=r}
+     * events carry {@code source.rrn} just like streaming events (#25). Disable it if the extra
+     * {@code RRN()} projection is unwanted; {@code source.rrn} then stays unset for snapshot events.
+     */
+    public static final Field SNAPSHOT_RRN_ENABLED = Field.create("snapshot.rrn")
+            .withDisplayName("Populate source.rrn during snapshot")
+            .withType(Type.BOOLEAN)
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.LOW)
+            .withDescription("Whether the initial snapshot should populate the Relative Record Number (source.rrn) "
+                    + "on op=r events by appending RRN() to the snapshot query. Defaults to true.")
+            .withDefault(DEFAULT_SNAPSHOT_RRN_ENABLED);
+
     public As400ConnectorConfig(Configuration config) {
         super(config, new SystemTablesPredicate(),
                 tableToString, 1, ColumnFilterMode.SCHEMA, false);
@@ -218,6 +234,10 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
         return config.getBoolean(TRANSACTION_MGMT_ENABLED);
     }
 
+    public boolean isSnapshotRrnEnabled() {
+        return config.getBoolean(SNAPSHOT_RRN_ENABLED);
+    }
+
     public JournalProcessedPosition getOffset() {
         final String receiver = config.getString(As400OffsetContext.RECEIVER);
         final String lib = config.getString(As400OffsetContext.RECEIVER_LIBRARY);
@@ -254,7 +274,8 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
     public static Field.Set ALL_FIELDS = Field.setOf(JdbcConfiguration.HOSTNAME, USER, PASSWORD, SCHEMA, BUFFER_SIZE,
             RelationalDatabaseConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE, SOCKET_TIMEOUT,
             MAX_SERVER_SIDE_ENTRIES, TOPIC_NAMING_STRATEGY, FROM_CCSID, TO_CCSID, SECURE,
-            DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED);
+            DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
+            SNAPSHOT_RRN_ENABLED);
 
     public static ConfigDef configDef() {
         final ConfigDef c = RelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
@@ -262,7 +283,8 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                 .type(
                         HOSTNAME, USER, PASSWORD, SCHEMA, BUFFER_SIZE,
                         SOCKET_TIMEOUT, FROM_CCSID, TO_CCSID, SECURE,
-                        DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED)
+                        DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
+                        SNAPSHOT_RRN_ENABLED)
                 .connector(
                         SCHEMA_NAME_ADJUSTMENT_MODE)
                 .events(

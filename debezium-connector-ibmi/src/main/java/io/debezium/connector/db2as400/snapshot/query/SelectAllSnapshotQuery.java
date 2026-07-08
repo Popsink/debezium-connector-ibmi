@@ -12,6 +12,7 @@ import java.util.stream.Collectors;
 
 import io.debezium.annotation.ConnectorSpecific;
 import io.debezium.config.CommonConnectorConfig;
+import io.debezium.connector.db2as400.As400ConnectorConfig;
 import io.debezium.connector.db2as400.As400RpcConnector;
 import io.debezium.snapshot.spi.SnapshotQuery;
 
@@ -32,6 +33,12 @@ public class SelectAllSnapshotQuery implements SnapshotQuery {
      */
     public static final String RRN_COLUMN_ALIAS = "PS_RRN";
 
+    /**
+     * Whether to append the trailing {@code RRN()} column (see {@link #snapshotQuery}). Controlled by
+     * {@link As400ConnectorConfig#SNAPSHOT_RRN_ENABLED}; defaults to its default when unconfigured.
+     */
+    private boolean rrnEnabled = As400ConnectorConfig.DEFAULT_SNAPSHOT_RRN_ENABLED;
+
     @Override
     public String name() {
         return CommonConnectorConfig.SnapshotQueryMode.SELECT_ALL.getValue();
@@ -39,7 +46,10 @@ public class SelectAllSnapshotQuery implements SnapshotQuery {
 
     @Override
     public void configure(Map<String, ?> properties) {
-
+        final Object value = properties.get(As400ConnectorConfig.SNAPSHOT_RRN_ENABLED.name());
+        if (value != null) {
+            this.rrnEnabled = Boolean.parseBoolean(value.toString());
+        }
     }
 
     @Override
@@ -48,6 +58,10 @@ public class SelectAllSnapshotQuery implements SnapshotQuery {
         // if we include single quotes the column names turn into 00001,00002,... which we then can't map to the table
         final String columns = snapshotSelectColumns.stream().map(x -> x.replace("'", "\""))
                 .collect(Collectors.joining(", "));
+        if (!rrnEnabled) {
+            // RRN population disabled: emit the plain projection so source.rrn stays unset for op=r events.
+            return Optional.of("SELECT " + columns + " FROM " + tableId);
+        }
         // Append the Relative Record Number as the last column so op=r snapshot events carry source.rrn
         // just like streaming events do (#25). It must stay last: the snapshot read path strips the
         // trailing, non-declared column before mapping the row back to the table's columns.
