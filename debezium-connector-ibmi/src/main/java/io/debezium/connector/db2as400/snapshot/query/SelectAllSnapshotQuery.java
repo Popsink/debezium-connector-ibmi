@@ -18,6 +18,20 @@ import io.debezium.snapshot.spi.SnapshotQuery;
 @ConnectorSpecific(connector = As400RpcConnector.class)
 public class SelectAllSnapshotQuery implements SnapshotQuery {
 
+    /**
+     * Correlation name given to the snapshotted table so the trailing {@code RRN()} scalar has an
+     * unambiguous table designator to reference. Chosen to be unlikely to clash with a real column.
+     */
+    private static final String TABLE_CORRELATION = "DBZ_T";
+
+    /**
+     * Alias of the synthetic Relative Record Number column appended to the snapshot query (see #25).
+     * It is emitted as the <em>last</em> projected column and is not a declared table column;
+     * {@code As400SnapshotChangeEventSource} reads it out and strips it before the row is mapped to
+     * the table columns.
+     */
+    public static final String RRN_COLUMN_ALIAS = "PS_RRN";
+
     @Override
     public String name() {
         return CommonConnectorConfig.SnapshotQueryMode.SELECT_ALL.getValue();
@@ -32,7 +46,13 @@ public class SelectAllSnapshotQuery implements SnapshotQuery {
     public Optional<String> snapshotQuery(String tableId, List<String> snapshotSelectColumns) {
 
         // if we include single quotes the column names turn into 00001,00002,... which we then can't map to the table
-        return Optional.of(snapshotSelectColumns.stream().map(x -> x.replace("'", "\""))
-                .collect(Collectors.joining(", ", "SELECT ", " FROM " + tableId)));
+        final String columns = snapshotSelectColumns.stream().map(x -> x.replace("'", "\""))
+                .collect(Collectors.joining(", "));
+        // Append the Relative Record Number as the last column so op=r snapshot events carry source.rrn
+        // just like streaming events do (#25). It must stay last: the snapshot read path strips the
+        // trailing, non-declared column before mapping the row back to the table's columns.
+        return Optional.of("SELECT " + columns
+                + ", RRN(" + TABLE_CORRELATION + ") AS \"" + RRN_COLUMN_ALIAS + "\""
+                + " FROM " + tableId + " " + TABLE_CORRELATION);
     }
 }

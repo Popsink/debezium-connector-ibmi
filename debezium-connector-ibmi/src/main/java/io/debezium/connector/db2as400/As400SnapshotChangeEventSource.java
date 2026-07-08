@@ -5,26 +5,37 @@
  */
 package io.debezium.connector.db2as400;
 
+import java.math.BigInteger;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.connector.SnapshotRecord;
 import io.debezium.connector.db2as400.As400OffsetContext.Loader;
+import io.debezium.connector.db2as400.snapshot.query.SelectAllSnapshotQuery;
 import io.debezium.ibmi.db2.journal.retrieve.JournalPosition;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
+import io.debezium.jdbc.JdbcConnection;
 import io.debezium.jdbc.MainConnectionProvidingConnectionFactory;
 import io.debezium.pipeline.EventDispatcher;
+import io.debezium.pipeline.EventDispatcher.SnapshotReceiver;
 import io.debezium.pipeline.notification.NotificationService;
 import io.debezium.pipeline.source.SnapshottingTask;
 import io.debezium.pipeline.source.spi.SnapshotProgressListener;
 import io.debezium.pipeline.spi.SnapshotResult;
+import io.debezium.relational.Column;
 import io.debezium.relational.RelationalSnapshotChangeEventSource;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
@@ -34,16 +45,26 @@ import io.debezium.snapshot.SnapshotterService;
 import io.debezium.spi.schema.DataCollectionId;
 import io.debezium.spi.snapshot.Snapshotter;
 import io.debezium.util.Clock;
+import io.debezium.util.ColumnUtils;
+import io.debezium.util.Strings;
+import io.debezium.util.Threads;
+import io.debezium.util.Threads.Timer;
 
 public class As400SnapshotChangeEventSource
         extends RelationalSnapshotChangeEventSource<As400Partition, As400OffsetContext> {
     private static final Logger log = LoggerFactory.getLogger(As400SnapshotChangeEventSource.class);
+    // mirrors RelationalSnapshotChangeEventSource.LOG_INTERVAL (private there); used by our row-loop override
+    private static final Duration LOG_INTERVAL = Duration.ofSeconds(10);
 
     private final As400ConnectorConfig connectorConfig;
     private final As400JdbcConnection jdbcConnection;
     private final As400RpcConnection rpcConnection;
     private final As400DatabaseSchema schema;
     protected final SnapshotterService snapshotterService;
+    // Kept locally because the same members are private in RelationalSnapshotChangeEventSource but are
+    // needed by our doCreateDataEventsForTable override (which mirrors the parent's row loop, see #25).
+    private final SnapshotProgressListener<As400Partition> snapshotProgressListener;
+    private final NotificationService<As400Partition, As400OffsetContext> notificationService;
 
     public As400SnapshotChangeEventSource(As400ConnectorConfig connectorConfig, As400RpcConnection rpcConnection,
                                           MainConnectionProvidingConnectionFactory<As400JdbcConnection> jdbcConnectionFactory,
@@ -60,6 +81,8 @@ public class As400SnapshotChangeEventSource
         this.jdbcConnection = jdbcConnectionFactory.mainConnection();
         this.schema = schema;
         this.snapshotterService = snapshotterService;
+        this.snapshotProgressListener = snapshotProgressListener;
+        this.notificationService = notificationService;
     }
 
     @Override
@@ -192,6 +215,156 @@ public class As400SnapshotChangeEventSource
                                                  List<String> columns) {
         String fullTableName = String.format("%s.%s", tableId.schema(), tableId.table());
         return snapshotterService.getSnapshotQuery().snapshotQuery(fullTableName, columns);
+    }
+
+    /**
+     * Row loop for the initial snapshot. Mirrors
+     * {@link RelationalSnapshotChangeEventSource#doCreateDataEventsForTable} (debezium 3.6) verbatim
+     * except for the RRN handling below; keep it in sync when upgrading debezium.
+     * <p>
+     * The default snapshot query appends the Relative Record Number as a trailing, non-declared
+     * column (see {@link SelectAllSnapshotQuery}). That column would make {@code ColumnUtils.toArray}
+     * throw, so here we (a) build the {@link ColumnUtils.ColumnArray} from the declared columns only,
+     * stripping the trailing RRN column, and (b) read the RRN out per row and stamp it on the offset
+     * so {@code op=r} events carry {@code source.rrn} exactly like the streaming path (#25). If no RRN
+     * column is present (e.g. a user {@code snapshot.select.statement.overrides}), behaviour is
+     * identical to the parent and {@code source.rrn} stays unset.
+     */
+    @Override
+    protected void doCreateDataEventsForTable(ChangeEventSourceContext sourceContext,
+                                              RelationalSnapshotContext<As400Partition, As400OffsetContext> snapshotContext,
+                                              As400OffsetContext offset, SnapshotReceiver<As400Partition> snapshotReceiver, Table table,
+                                              boolean firstTable, boolean lastTable, int tableOrder, int tableCount, String selectStatement,
+                                              OptionalLong rowCount, Set<TableId> rowCountTablesKeySet, JdbcConnection jdbcConnection)
+            throws InterruptedException, SQLException {
+
+        if (!sourceContext.isRunning()) {
+            throw new InterruptedException("Interrupted while snapshotting table " + table.id());
+        }
+
+        long exportStart = clock.currentTimeInMillis();
+        log.info("Exporting data from table '{}' ({} of {} tables)", table.id(), tableOrder, tableCount);
+
+        notificationService.initialSnapshotNotificationService().notifyTableInProgress(
+                snapshotContext.partition, snapshotContext.offset, table.id().identifier(), rowCountTablesKeySet);
+
+        Instant sourceTableSnapshotTimestamp = getSnapshotSourceTimestamp(jdbcConnection, offset, table.id());
+
+        try (Statement statement = readTableStatement(jdbcConnection, rowCount);
+                ResultSet rs = resultSetForDataEvents(selectStatement, statement)) {
+
+            final ResultSetMetaData metaData = rs.getMetaData();
+            final int resultColumnCount = metaData.getColumnCount();
+            // The RRN is projected as the last column and is not a declared table column.
+            final boolean hasRrnColumn = resultColumnCount > 0
+                    && table.columnWithName(metaData.getColumnName(resultColumnCount)) == null;
+            final int rrnColumnIndex = hasRrnColumn ? resultColumnCount : -1;
+            final ColumnUtils.ColumnArray columnArray = declaredColumnArray(metaData, table,
+                    hasRrnColumn ? resultColumnCount - 1 : resultColumnCount);
+
+            long rows = 0;
+            Timer logTimer = getTableScanLogTimer();
+            boolean hasNext = rs.next();
+
+            if (hasNext) {
+                while (hasNext) {
+                    if (!sourceContext.isRunning()) {
+                        throw new InterruptedException("Interrupted while snapshotting table " + table.id());
+                    }
+
+                    rows++;
+                    final Object[] row = jdbcConnection.rowToArray(table, rs, columnArray);
+                    // read the current row's RRN before rs.next() advances the cursor
+                    final BigInteger rrn = readRrn(rs, rrnColumnIndex);
+
+                    if (logTimer.expired()) {
+                        long stop = clock.currentTimeInMillis();
+                        if (rowCount.isPresent()) {
+                            log.info("\t Exported {} of {} records for table '{}' after {}", rows, rowCount.getAsLong(),
+                                    table.id(), Strings.duration(stop - exportStart));
+                        }
+                        else {
+                            log.info("\t Exported {} records for table '{}' after {}", rows, table.id(),
+                                    Strings.duration(stop - exportStart));
+                        }
+                        snapshotProgressListener.rowsScanned(snapshotContext.partition, table.id(), rows);
+                        logTimer = getTableScanLogTimer();
+                    }
+
+                    hasNext = rs.next();
+                    setSnapshotMarker(offset, firstTable, lastTable, rows == 1, !hasNext);
+
+                    // Stamp the RRN before dispatch. getChangeRecordEmitter -> offset.event(...) re-stamps
+                    // time/receiver/sequence but leaves the RRN untouched, so it flows into this op=r event.
+                    offset.setRrn(rrn);
+                    dispatcher.dispatchSnapshotEvent(snapshotContext.partition, table.id(),
+                            getChangeRecordEmitter(snapshotContext.partition, offset, table.id(), row, sourceTableSnapshotTimestamp),
+                            snapshotReceiver);
+                }
+            }
+            else {
+                setSnapshotMarker(offset, firstTable, lastTable, false, true);
+            }
+
+            log.info("\t Finished exporting {} records for table '{}' ({} of {} tables); total duration '{}'",
+                    rows, table.id(), tableOrder, tableCount, Strings.duration(clock.currentTimeInMillis() - exportStart));
+            snapshotProgressListener.dataCollectionSnapshotCompleted(snapshotContext.partition, table.id(), rows);
+            notificationService.initialSnapshotNotificationService().notifyCompletedTableSuccessfully(
+                    snapshotContext.partition, snapshotContext.offset, table.id().identifier(), rows, snapshotContext.capturedTables);
+        }
+    }
+
+    /**
+     * Like {@code ColumnUtils.toArray} but maps only the first {@code declaredColumnCount} result-set
+     * columns to declared table columns, ignoring a trailing synthetic column (the RRN). Throws the
+     * same way as core if a mapped column is unknown to the table.
+     */
+    private ColumnUtils.ColumnArray declaredColumnArray(ResultSetMetaData metaData, Table table, int declaredColumnCount)
+            throws SQLException {
+        final Column[] columns = new Column[declaredColumnCount];
+        int greatestColumnPosition = 0;
+        for (int i = 0; i < declaredColumnCount; i++) {
+            final String columnName = metaData.getColumnName(i + 1);
+            columns[i] = table.columnWithName(columnName);
+            if (columns[i] == null) {
+                throw new IllegalArgumentException("Column '" + columnName + "' not found in table '" + table.id() + "', " + table);
+            }
+            greatestColumnPosition = Math.max(greatestColumnPosition, columns[i].position());
+        }
+        return new ColumnUtils.ColumnArray(columns, greatestColumnPosition);
+    }
+
+    /** Reads the Relative Record Number from the given column, or null when absent/SQL NULL. */
+    private BigInteger readRrn(ResultSet rs, int rrnColumnIndex) throws SQLException {
+        if (rrnColumnIndex < 1) {
+            return null;
+        }
+        final long value = rs.getLong(rrnColumnIndex);
+        return rs.wasNull() ? null : BigInteger.valueOf(value);
+    }
+
+    // mirrors the (private) RelationalSnapshotChangeEventSource#setSnapshotMarker
+    private void setSnapshotMarker(As400OffsetContext offset, boolean firstTable, boolean lastTable,
+                                   boolean firstRecordInTable, boolean lastRecordInTable) {
+        if (lastRecordInTable && lastTable) {
+            offset.markSnapshotRecord(SnapshotRecord.LAST);
+        }
+        else if (firstRecordInTable && firstTable) {
+            offset.markSnapshotRecord(SnapshotRecord.FIRST);
+        }
+        else if (lastRecordInTable) {
+            offset.markSnapshotRecord(SnapshotRecord.LAST_IN_DATA_COLLECTION);
+        }
+        else if (firstRecordInTable) {
+            offset.markSnapshotRecord(SnapshotRecord.FIRST_IN_DATA_COLLECTION);
+        }
+        else {
+            offset.markSnapshotRecord(SnapshotRecord.TRUE);
+        }
+    }
+
+    private Timer getTableScanLogTimer() {
+        return Threads.timer(clock, LOG_INTERVAL);
     }
 
     @Override
