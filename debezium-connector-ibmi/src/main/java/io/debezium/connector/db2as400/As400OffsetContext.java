@@ -142,7 +142,17 @@ public class As400OffsetContext extends CommonOffsetContext<SourceInfo> {
         sourceInfo.setReceiver(position.getReceiver().name());
         sourceInfo.setReceiverLib(position.getReceiver().library());
         sourceInfo.setSequence(position.getOffset().toString());
-        sourceInfo.setRrn(String.valueOf(rrn));
+        setRrn(rrn);
+    }
+
+    /**
+     * Sets only the Relative Record Number on the source info, leaving the rest of the source
+     * position untouched. Used by the initial snapshot, where {@code event(...)} already stamps the
+     * time/receiver/sequence but does not carry an RRN (#25). Null-safe: a null RRN clears the field
+     * rather than writing the literal string "null".
+     */
+    public void setRrn(BigInteger rrn) {
+        sourceInfo.setRrn(rrn == null ? null : rrn.toString());
     }
 
     @Override
