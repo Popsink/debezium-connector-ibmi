@@ -37,11 +37,15 @@ public class As400StreamingChangeEventSourcePauseTest {
 
     /**
      * Fake context that requests a pause on the first streaming iteration and simulates a snapshot
-     * that runs longer than the watchdog timeout.
+     * that runs longer than the watchdog timeout. Mirrors the real coordinator's {@code isPaused()},
+     * which is a stable flag: true from when the blocking snapshot is requested until it completes and
+     * streaming is resumed. The watchdog polls this flag, so a one-shot fake would look like a
+     * "snapshot finished but not resumed" desync.
      */
     private static final class PausingContext implements ChangeEventSourceContext {
         private final AtomicInteger runningChecks = new AtomicInteger();
-        private final AtomicInteger pausedChecks = new AtomicInteger();
+        // paused for the whole simulated snapshot; cleared when the snapshot "resumes" streaming
+        private volatile boolean paused = true;
         boolean streamingPausedCalled = false;
         boolean waitSnapshotCompletionCalled = false;
         boolean interruptedDuringSnapshot = false;
@@ -54,8 +58,7 @@ public class As400StreamingChangeEventSourcePauseTest {
 
         @Override
         public boolean isPaused() {
-            // a blocking snapshot is pending only on the first iteration
-            return pausedChecks.getAndIncrement() == 0;
+            return paused;
         }
 
         @Override
@@ -70,6 +73,8 @@ public class As400StreamingChangeEventSourcePauseTest {
                 // stand in for a long blocking snapshot; without WatchDog.pause() the streaming
                 // thread would be interrupted here and the snapshot would be aborted
                 Thread.sleep(SNAPSHOT_DURATION_MS);
+                // the coordinator clears the pause when the snapshot completes, before waking the thread
+                paused = false;
             }
             catch (InterruptedException e) {
                 interruptedDuringSnapshot = true;
@@ -92,6 +97,8 @@ public class As400StreamingChangeEventSourcePauseTest {
         final As400ConnectorConfig config = mock(As400ConnectorConfig.class);
         when(config.getPollInterval()).thenReturn(Duration.ofMillis(1));
         when(config.getMaxRetrievalTimeout()).thenReturn(WATCHDOG_TIMEOUT_MS);
+        // comfortably longer than the simulated snapshot so the pause is never treated as a wedge
+        when(config.getBlockingSnapshotPauseTimeout()).thenReturn(10_000L);
 
         final As400JdbcConnection jdbcConnection = mock(As400JdbcConnection.class);
         when(jdbcConnection.getRealDatabaseName()).thenReturn("DB");

@@ -118,7 +118,9 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
             throws InterruptedException {
         final Metronome metronome = Metronome.sleeper(pollInterval, clock);
         int retries = 0;
-        final WatchDog watchDog = new WatchDog(Thread.currentThread(), connectorConfig.getMaxRetrievalTimeout());
+        final WatchDog watchDog = new WatchDog(Thread.currentThread(), connectorConfig.getMaxRetrievalTimeout(),
+                connectorConfig.getBlockingSnapshotPauseTimeout(), context::isPaused,
+                errorHandler::setProducerThrowable);
         watchDog.start();
         try {
             while (context.isRunning()) {
@@ -126,8 +128,10 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                 // acknowledge the pause so the blocking snapshot can start, then wait for it to
                 // complete before resuming journal streaming. Without this the coordinator's
                 // blocking-snapshot thread waits forever on waitStreamingPaused() and the snapshot
-                // never runs. The check happens between RPC polls, so the pause takes effect after
-                // the current getJournalEntries() call returns (bounded by the watchdog timeout).
+                // never runs. getJournalEntries() also checks isPaused() and returns promptly once a
+                // pause is requested (issue #27), so this handshake is reached within one journal entry
+                // rather than after a whole shared-journal block; the WatchDog is the backstop if it is
+                // not reached at all.
                 if (context.isPaused()) {
                     log.info("Streaming will now pause for an ad-hoc blocking snapshot");
                     // The streaming thread parks in waitSnapshotCompletion() below and stops calling

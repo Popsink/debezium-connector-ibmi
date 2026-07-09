@@ -201,7 +201,13 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
             watchDog.alive();
 
             if (state.hasData()) {
-                while (retrieveJournal.nextEntry() && context.isRunning()) {
+                // Also break out when an ad-hoc blocking snapshot has been requested (context.isPaused()).
+                // Over a large shared journal a single block can hold a huge run of entries that are mostly
+                // filtered out; draining it fully keeps refreshing the watchdog (alive() below) yet never
+                // returns to the caller's pause handshake, wedging the connector while it still looks live
+                // (issue #27). Leaving the loop early lets the caller acknowledge the pause after one entry;
+                // the position persisted below makes the next retrieval resume from here.
+                while (retrieveJournal.nextEntry() && context.isRunning() && !context.isPaused()) {
                     watchDog.alive();
                     final EntryHeader eheader = retrieveJournal.getEntryHeader();
                     final BigInteger processingOffset = eheader.getSequenceNumber();

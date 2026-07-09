@@ -131,6 +131,23 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
     public static final Field MAX_RETRIEVAL_TIMEOUT = Field.create("max.journal.timeout", "max time to fetch the journal entries",
             "Maximum time to fetch the journal entries in ms", DEFAULT_MAX_JOURNAL_TIMEOUT);
 
+    public static final long DEFAULT_BLOCKING_SNAPSHOT_PAUSE_TIMEOUT = 120000;
+    /**
+     * How long (ms) the streaming thread's paused view may stay out of sync with the coordinator's
+     * ad-hoc blocking-snapshot pause before the {@link WatchDog} interrupts it to force it back in sync.
+     * Guards the issue #27 wedges, where either a requested pause is never honored (the thread churns
+     * inside {@code getJournalEntries} over a large shared journal, refreshing the activity watchdog but
+     * never reaching the pause handshake, so the snapshot never starts) or a finished snapshot never
+     * resumes streaming. Must be comfortably larger than the time to drain a single journal block;
+     * defaults to twice {@code max.journal.timeout}.
+     */
+    public static final Field BLOCKING_SNAPSHOT_PAUSE_TIMEOUT = Field.create("blocking.snapshot.pause.timeout.ms",
+            "blocking snapshot pause timeout",
+            "Max time in ms the streaming thread may stay out of sync with a coordinator-requested ad-hoc "
+                    + "blocking-snapshot pause/resume before it is interrupted (and, after repeated failures, the "
+                    + "connector is failed) to avoid a silent wedge.",
+            DEFAULT_BLOCKING_SNAPSHOT_PAUSE_TIMEOUT);
+
     public static final long DEFAULT_CACHE_ADDITIONAL_DELAY = 5000;
 
     public static final Field JOURNAL_CACHE_ADDITIONAL_DELAY = Field.create("journal.additional.delay", "additional delay when journal caching is enabled",
@@ -315,6 +332,10 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
         return config.getInteger(MAX_RETRIEVAL_TIMEOUT);
     }
 
+    public long getBlockingSnapshotPauseTimeout() {
+        return config.getLong(BLOCKING_SNAPSHOT_PAUSE_TIMEOUT);
+    }
+
     public Integer getFromCcsid() {
         return config.getInteger(FROM_CCSID);
     }
@@ -380,7 +401,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
             RelationalDatabaseConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE, SOCKET_TIMEOUT,
             MAX_SERVER_SIDE_ENTRIES, TOPIC_NAMING_STRATEGY, FROM_CCSID, TO_CCSID, SECURE,
             DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
-            UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT);
+            UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT);
 
     public static ConfigDef configDef() {
         final ConfigDef c = RelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
@@ -389,7 +410,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                         HOSTNAME, USER, PASSWORD, SCHEMA, BUFFER_SIZE,
                         SOCKET_TIMEOUT, FROM_CCSID, TO_CCSID, SECURE,
                         DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
-                        UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT)
+                        UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT)
                 .connector(
                         SCHEMA_NAME_ADJUSTMENT_MODE)
                 .events(
