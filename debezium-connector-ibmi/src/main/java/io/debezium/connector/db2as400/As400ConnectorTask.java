@@ -113,7 +113,9 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
                 .pollInterval(connectorConfig.getPollInterval())
                 .loggingContextSupplier(() -> taskContext.configureLoggingContext(CONTEXT_NAME)).build();
 
-        errorHandler = new ErrorHandler(As400RpcConnector.class, connectorConfig, queue, null);
+        // pass the previous handler so the retry count survives task restarts and
+        // errors.max.retries can actually cap retriable failures (e.g. a persistent wedge)
+        errorHandler = new ErrorHandler(As400RpcConnector.class, connectorConfig, queue, errorHandler);
 
         final SnapshotterService snapshotterService = connectorConfig.getServiceRegistry().tryGetService(SnapshotterService.class);
 

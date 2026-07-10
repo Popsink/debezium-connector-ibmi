@@ -207,7 +207,7 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
                 // returns to the caller's pause handshake, wedging the connector while it still looks live
                 // (issue #27). Leaving the loop early lets the caller acknowledge the pause after one entry;
                 // the position persisted below makes the next retrieval resume from here.
-                while (retrieveJournal.nextEntry() && context.isRunning() && !context.isPaused()) {
+                while (context.isRunning() && !context.isPaused() && retrieveJournal.nextEntry()) {
                     watchDog.alive();
                     final EntryHeader eheader = retrieveJournal.getEntryHeader();
                     final BigInteger processingOffset = eheader.getSequenceNumber();

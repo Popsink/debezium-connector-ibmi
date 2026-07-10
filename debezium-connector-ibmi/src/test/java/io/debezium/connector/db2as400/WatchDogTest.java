@@ -5,7 +5,6 @@
  */
 package io.debezium.connector.db2as400;
 
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.assertj.core.api.Assertions;
@@ -88,80 +87,81 @@ public class WatchDogTest {
     }
 
     /**
-     * Issue #27: a blocking-snapshot pause stays pending (context.isPaused() == true) while the
-     * streaming thread keeps calling alive() — so the activity timeout never fires. The watchdog must
-     * still interrupt the thread once the pause has gone unacknowledged for pauseTimeout.
+     * Issue #27 (first wedge): a blocking-snapshot pause stays pending (context.isPaused() == true)
+     * while the streaming thread keeps calling alive() — so the activity timeout never fires. The
+     * watchdog must not interrupt (rescue attempts are unreliable) but must report the wedge with a
+     * retriable exception so the task restarts.
      */
     @Test
-    public void testPendingPauseInterruptsEvenWhenAlive() throws Exception {
+    public void testUnhonoredPauseFailsTask() throws Exception {
+        final AtomicReference<Throwable> wedged = new AtomicReference<>();
         // long activity timeout so failure mode 1 cannot fire; short pause timeout is what we test
-        final WatchDog testSubject = new WatchDog(Thread.currentThread(), 10_000, 30, () -> true, t -> {
-        });
+        final WatchDog testSubject = new WatchDog(Thread.currentThread(), 10_000, 30, () -> true, wedged::set);
         testSubject.start();
-        final AtomicBoolean interrupted = new AtomicBoolean(false);
+        Exception thrown = null;
         try {
-            final long deadline = System.currentTimeMillis() + 500;
+            final long deadline = System.currentTimeMillis() + 400;
             while (System.currentTimeMillis() < deadline) {
-                testSubject.alive(); // keep the activity watchdog satisfied
+                testSubject.alive(); // keep the activity watchdog satisfied, as the #27 drain loop did
                 Thread.sleep(5);
             }
         }
-        catch (final InterruptedException e) {
-            interrupted.set(true);
+        catch (final Exception e) {
+            thrown = e;
         }
-        Assertions.assertThat(interrupted).isTrue();
-        testSubject.stop();
+        finally {
+            testSubject.stop();
+        }
+        Assertions.assertThat(thrown).isNull();
+        // IOException is what Debezium's ErrorHandler classifies as retriable
+        Assertions.assertThat(wedged.get()).isInstanceOf(java.io.IOException.class);
     }
 
     /**
      * Issue #27 (second wedge): the blocking snapshot finished so the coordinator cleared the pause
      * (pausePending == false), but the streaming thread stayed parked (paused == true) and never
-     * resumed. The watchdog must detect this desync and interrupt to unstick it.
+     * resumed. The watchdog must report the wedge without interrupting the parked thread.
      */
     @Test
-    public void testStuckResumeInterrupts() throws Exception {
+    public void testStuckResumeFailsTask() throws Exception {
+        final AtomicReference<Throwable> wedged = new AtomicReference<>();
         // coordinator is no longer paused, but the streaming thread still believes it is paused
-        final WatchDog testSubject = new WatchDog(Thread.currentThread(), 10_000, 30, () -> false, t -> {
-        });
+        final WatchDog testSubject = new WatchDog(Thread.currentThread(), 10_000, 30, () -> false, wedged::set);
         testSubject.pause();
         testSubject.start();
         Exception thrown = null;
         try {
-            Thread.sleep(500);
+            Thread.sleep(400);
         }
         catch (final Exception e) {
             thrown = e;
         }
-        Assertions.assertThat(thrown).isInstanceOf(InterruptedException.class);
-        testSubject.stop();
+        finally {
+            testSubject.stop();
+        }
+        Assertions.assertThat(thrown).isNull();
+        Assertions.assertThat(wedged.get()).isInstanceOf(java.io.IOException.class);
     }
 
     /**
-     * Issue #27: if interrupting does not clear the desync after MAX_UNHONORED_PAUSE_INTERRUPTS windows,
-     * the watchdog escalates to the fatal handler so the connector fails loudly instead of wedging.
+     * The pause handshake normally completes between journal entries: a mismatch that resolves within
+     * pauseTimeout is not a wedge and must not fail the task.
      */
     @Test
-    public void testUnhonoredPauseEscalatesToFatal() throws Exception {
-        final AtomicReference<Throwable> fatal = new AtomicReference<>();
-        // stay interruptible but never acknowledge the pause; short pause timeout so the test is quick
-        final WatchDog testSubject = new WatchDog(Thread.currentThread(), 10_000, 20, () -> true, fatal::set);
+    public void testPauseHonoredWithinTimeoutIsNotAWedge() throws Exception {
+        final AtomicReference<Throwable> wedged = new AtomicReference<>();
+        final WatchDog testSubject = new WatchDog(Thread.currentThread(), 10_000, 200, () -> true, wedged::set);
         testSubject.start();
         try {
-            // outlast MAX_UNHONORED_PAUSE_INTERRUPTS windows; swallow interrupts to mimic a stuck thread
-            final long deadline = System.currentTimeMillis() + 20L * (WatchDog.MAX_UNHONORED_PAUSE_INTERRUPTS + 4);
-            while (System.currentTimeMillis() < deadline) {
-                testSubject.alive();
-                try {
-                    Thread.sleep(5);
-                }
-                catch (final InterruptedException e) {
-                    // ignore, as a thread wedged in a tight loop would
-                }
-            }
+            // honor the pending pause well before the timeout, then linger past several check ticks
+            Thread.sleep(50);
+            testSubject.pause();
+            Thread.sleep(500);
         }
         finally {
             testSubject.stop();
         }
-        Assertions.assertThat(fatal.get()).isInstanceOf(io.debezium.DebeziumException.class);
+        Assertions.assertThat(wedged.get()).isNull();
+        Assertions.assertThat(Thread.currentThread().isInterrupted()).isFalse();
     }
 }

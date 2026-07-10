@@ -108,9 +108,10 @@ are possible while the connector still reports `live` (issue #27): a requested p
   honored within one journal entry rather than after a whole block.
 * `blocking.snapshot.pause.timeout.ms` (default `120000`) bounds how long the streaming thread's paused
   view may stay out of sync with the coordinator (pause requested but not honored, or snapshot finished
-  but not resumed). Past that, the `WatchDog` interrupts the streaming thread to force it back in sync; if
-  repeated interrupts still do not resolve it the connector is failed with a loud error so the wedge
-  surfaces to the orchestrator/monitoring instead of stalling silently.
+  but not resumed). Past that, the `WatchDog` fails the task with a retriable error and Debezium restarts
+  it (bounded by `errors.max.retries`), clearing the wedge instead of stalling silently — a loud, logged
+  restart rather than an in-place rescue, because interrupting the wedged thread cannot reliably resync
+  the handshake.
 
 > Not to be confused with a stale JDBC connection detected mid-snapshot, which is a connection-liveness
 > issue rather than offset/position recovery.

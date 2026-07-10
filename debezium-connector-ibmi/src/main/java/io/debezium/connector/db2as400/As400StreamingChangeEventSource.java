@@ -130,8 +130,8 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                 // blocking-snapshot thread waits forever on waitStreamingPaused() and the snapshot
                 // never runs. getJournalEntries() also checks isPaused() and returns promptly once a
                 // pause is requested (issue #27), so this handshake is reached within one journal entry
-                // rather than after a whole shared-journal block; the WatchDog is the backstop if it is
-                // not reached at all.
+                // rather than after a whole shared-journal block; if it is not reached at all the
+                // WatchDog fails the task with a retriable error so it restarts.
                 if (context.isPaused()) {
                     log.info("Streaming will now pause for an ad-hoc blocking snapshot");
                     // The streaming thread parks in waitSnapshotCompletion() below and stops calling
