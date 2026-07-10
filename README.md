@@ -95,6 +95,24 @@ Data already lost from pruned receivers cannot be recovered via CDC; recovery is
 connector healthy again, not replaying the gap. Ad-hoc snapshots (both incremental and blocking) are
 also supported via the signalling channel.
 
+### Blocking-snapshot pause safety
+
+An ad-hoc **blocking** snapshot is a cooperative handshake: the coordinator pauses streaming and waits
+for the streaming thread to acknowledge before the snapshot starts, then resumes it when the snapshot
+finishes. The streaming thread only reaches those handshake points between journal polls, so two wedges
+are possible while the connector still reports `live` (issue #27): a requested pause is never honored
+(the thread keeps draining a large shared-journal block), or a finished snapshot never resumes streaming
+(and later ad-hoc signals pile up). Two safeguards prevent this:
+
+* The journal-drain loop breaks out as soon as a blocking-snapshot pause is requested, so the pause is
+  honored within one journal entry rather than after a whole block.
+* `blocking.snapshot.pause.timeout.ms` (default `120000`) bounds how long the streaming thread's paused
+  view may stay out of sync with the coordinator (pause requested but not honored, or snapshot finished
+  but not resumed). Past that, the `WatchDog` fails the task with a retriable error and Debezium restarts
+  it (bounded by `errors.max.retries`), clearing the wedge instead of stalling silently — a loud, logged
+  restart rather than an in-place rescue, because interrupting the wedged thread cannot reliably resync
+  the handshake.
+
 > Not to be confused with a stale JDBC connection detected mid-snapshot, which is a connection-liveness
 > issue rather than offset/position recovery.
 
