@@ -463,7 +463,8 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
             }
             catch (final Exception e) {
                 log.error("Failed to process record at offset = " + eheader.getSequenceNumber() + "  in table = " + longName +
-                        " at RRN = " + eheader.getRelativeRecordNumber() + " [journalCode = " + eheader.getJournalCode() + ", journalEntryType = " + eheader.getJournalEntryType() + "], " +
+                        " at RRN = " + eheader.getRelativeRecordNumber() + " [journalCode = " + eheader.getJournalCode() + ", journalEntryType = "
+                        + eheader.getJournalEntryType() + "], " +
                         "skipping and dumping diagnostics if enabled ...", e);
             }
         };

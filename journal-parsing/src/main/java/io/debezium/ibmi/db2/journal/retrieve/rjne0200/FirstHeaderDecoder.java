@@ -15,11 +15,10 @@ import org.slf4j.LoggerFactory;
 import com.ibm.as400.access.AS400Bin4;
 import com.ibm.as400.access.AS400DataType;
 import com.ibm.as400.access.AS400Structure;
-import com.ibm.as400.access.AS400Text;
 import com.ibm.as400.access.BinaryFieldDescription;
-import com.ibm.as400.access.CharacterFieldDescription;
 import com.ibm.as400.access.FieldDescription;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.JournalPosition;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.ibmi.db2.journal.retrieve.JournalReceiver;
@@ -30,17 +29,17 @@ public class FirstHeaderDecoder {
 
     private final AS400Structure structure;
 
-    public FirstHeaderDecoder() {
+    public FirstHeaderDecoder(As400TextFactory textFactory) {
         final ArrayList<AS400DataType> dataTypes = new ArrayList<>();
         final FieldDescription[] fds = new FieldDescription[]{
                 new BinaryFieldDescription(new AS400Bin4(), "0 bytes returned"),
                 new BinaryFieldDescription(new AS400Bin4(), "1 offset to first journal entry"),
                 new BinaryFieldDescription(new AS400Bin4(), "2 number of entries retrieved"),
-                new CharacterFieldDescription(new AS400Text(1), "3 continuation indicator"),
-                new CharacterFieldDescription(new AS400Text(10), "4 continuation starting receiver"),
-                new CharacterFieldDescription(new AS400Text(10), "5 continuation starting receiver library"),
-                new CharacterFieldDescription(new AS400Text(20), "6 continutation starting sequence number"),
-                // new CharacterFieldDescription(new AS400Text(11), "7 reserved"),
+                textFactory.charField(1, "3 continuation indicator"),
+                textFactory.charField(10, "4 continuation starting receiver"),
+                textFactory.charField(10, "5 continuation starting receiver library"),
+                textFactory.charField(20, "6 continutation starting sequence number"),
+                // textFactory.charField(11, "7 reserved"),
         };
         for (int i = 0; i < fds.length; i++) {
             dataTypes.add(fds[i].getDataType());

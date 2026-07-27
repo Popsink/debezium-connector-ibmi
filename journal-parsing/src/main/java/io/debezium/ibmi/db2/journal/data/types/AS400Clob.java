@@ -26,10 +26,12 @@ public class AS400Clob implements AS400DataType {
     private static final Logger log = LoggerFactory.getLogger(AS400Clob.class);
     private static final String EMPTY_STRING = "";
     private final AS400 as400;
+    private final As400TextFactory textFactory;
     private static final byte[] EMPTY_BYTES = new byte[0];
 
-    public AS400Clob(AS400 as400) {
+    public AS400Clob(AS400 as400, As400TextFactory textFactory) {
         this.as400 = as400;
+        this.textFactory = textFactory;
     }
 
     @Override
@@ -109,7 +111,8 @@ public class AS400Clob implements AS400DataType {
             final byte[] data = parameters[0].getOutputData();
             final int retrivedLength = (Integer) new AS400Bin4().toObject(data, 0);
             final byte[] btext = Arrays.copyOfRange(data, 2, data.length);
-            final String text = new String(btext);
+            // the clob comes back in the system CCSID, not the JVM's default charset
+            final String text = (String) textFactory.text(btext.length).toObject(btext);
             log.debug(text);
             return text;
         }

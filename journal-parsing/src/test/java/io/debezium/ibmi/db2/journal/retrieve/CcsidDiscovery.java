@@ -12,6 +12,7 @@ import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.SchemaCacheIF.TableInfo;
 import io.debezium.ibmi.db2.journal.test.TestConnector;
 
@@ -34,7 +35,8 @@ public class CcsidDiscovery {
     }
 
     public static void testToDataType() throws Exception {
-        final JdbcFileDecoder decoder = new JdbcFileDecoder(sqlConnect, database, new SchemaCacheHash(), -1, -1);
+        final JdbcFileDecoder decoder = new JdbcFileDecoder(sqlConnect, database, new SchemaCacheHash(),
+                As400TextFactory.forConnection(sqlConnect), -1, -1);
         final Optional<TableInfo> info = decoder.getRecordFormat(table, connector.getSchema());
 
         log.info("{}", info.get());

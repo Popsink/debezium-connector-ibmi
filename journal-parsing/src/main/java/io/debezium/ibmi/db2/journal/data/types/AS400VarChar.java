@@ -15,7 +15,6 @@ public class AS400VarChar implements AS400DataType {
     private final AS400Bin2 as400Bin2 = new AS400Bin2();
     private final int maxLenght;
     private final static String defaultValue = "";
-    private int actualLength;
     private final int ccsid;
     /*
      * as400 correctly decodes the charset but relies on the length being the buffer
@@ -36,12 +35,12 @@ public class AS400VarChar implements AS400DataType {
      */
     private final int bytesPerChar;
 
-    public AS400VarChar(int maxLenght, int bytesPerChar) {
-        this.maxLenght = maxLenght * bytesPerChar;
-        this.bytesPerChar = bytesPerChar;
-        ccsid = -1;
-    }
-
+    /**
+     * @param ccsid the CCSID the text is encoded in, or {@link As400TextFactory#UNKNOWN_CCSID} to let
+     *              jt400 guess it from the local locale. Build these through
+     *              {@link As400TextFactory#varChar(int, int, int)} so the remote system CCSID is used
+     *              rather than the locale of the process.
+     */
     public AS400VarChar(int maxLenght, int bytesPerChar, int ccsid) {
         this.ccsid = ccsid;
         this.bytesPerChar = bytesPerChar;
@@ -91,8 +90,9 @@ public class AS400VarChar implements AS400DataType {
     @Override
     public Object toObject(byte[] data, int offset) {
         final int lenOffset = 2;
-        actualLength = (Short) as400Bin2.toObject(data, offset);
-        actualLength *= bytesPerChar;
+        // a local, not a field: this instance is shared via the AS400Structure cached per table, so a
+        // field here would let concurrent decodes of the same table overwrite each other's length
+        final int actualLength = ((Short) as400Bin2.toObject(data, offset)) * bytesPerChar;
         final AS400Text txt = (ccsid > 0) ? new AS400Text(actualLength, ccsid) : new AS400Text(actualLength);
         final String text = (String) txt.toObject(data, offset + lenOffset);
         return text;

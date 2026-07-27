@@ -20,6 +20,7 @@ import org.slf4j.LoggerFactory;
 
 import com.ibm.as400.access.AS400;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.Connect;
 import io.debezium.ibmi.db2.journal.retrieve.FileFilter;
 import io.debezium.ibmi.db2.journal.retrieve.JournalInfo;
@@ -37,10 +38,11 @@ public class JournalFilterTimeout {
     private static final Logger log = LoggerFactory.getLogger(JournalFilterTimeout.class);
 
     private static SchemaCacheHash schemaCache = new SchemaCacheHash();
-    private static JournalInfoRetrieval journalInfoRetrieval = new JournalInfoRetrieval(30000, 5000, 2000);
 
     public static void main(String[] args) throws Exception {
         final TestConnector connector = new TestConnector();
+        final As400TextFactory textFactory = connector.getTextFactory();
+        final JournalInfoRetrieval journalInfoRetrieval = new JournalInfoRetrieval(textFactory, 30000, 5000, 2000);
         final Connect<AS400, IOException> as400Connect = connector.getAs400();
         final Connect<Connection, SQLException> sqlConnect = connector.getJdbc();
         final String schema = connector.getSchema();
@@ -65,7 +67,7 @@ public class JournalFilterTimeout {
 
         try (PrintWriter pw = new PrintWriter(new File("exceptions.txt"))) {
             log.info("journal: {}", journal);
-            final RetrieveConfig config = new RetrieveConfigBuilder().withAs400(as400Connect).withJournalInfo(journal)
+            final RetrieveConfig config = new RetrieveConfigBuilder().withAs400(as400Connect).withTextFactory(textFactory).withJournalInfo(journal)
                     .withDumpFolder("./bad-journal").withServerFiltering(true).withIncludeFiles(includes).build();
             final RetrieveJournal rj = new RetrieveJournal(config, journalInfoRetrieval);
 

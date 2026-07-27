@@ -20,12 +20,11 @@ import org.slf4j.LoggerFactory;
 import com.ibm.as400.access.AS400Bin4;
 import com.ibm.as400.access.AS400DataType;
 import com.ibm.as400.access.AS400Structure;
-import com.ibm.as400.access.AS400Text;
 import com.ibm.as400.access.AS400Timestamp;
 import com.ibm.as400.access.BinaryFieldDescription;
-import com.ibm.as400.access.CharacterFieldDescription;
 import com.ibm.as400.access.FieldDescription;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.JournalReceiver;
 import io.debezium.ibmi.db2.journal.retrieve.StringHelpers;
 
@@ -34,7 +33,7 @@ public class ReceiverDecoder {
     private final AS400Structure structure;
     private static final Logger log = LoggerFactory.getLogger(ReceiverDecoder.class);
 
-    public ReceiverDecoder() {
+    public ReceiverDecoder(As400TextFactory textFactory) {
         ArrayList<AS400DataType> dataTypes = new ArrayList<AS400DataType>();
         AS400Timestamp timeType = new AS400Timestamp();
         try {
@@ -50,15 +49,15 @@ public class ReceiverDecoder {
         }
 
         FieldDescription[] fds = new FieldDescription[]{
-                new CharacterFieldDescription(new AS400Text(10), "0 receiver name"),
-                new CharacterFieldDescription(new AS400Text(10), "1 library name"),
-                new CharacterFieldDescription(new AS400Text(5), "2 receiver number"),
-                new CharacterFieldDescription(new AS400Text(13), "3 attach date and time"),
+                textFactory.charField(10, "0 receiver name"),
+                textFactory.charField(10, "1 library name"),
+                textFactory.charField(5, "2 receiver number"),
+                textFactory.charField(13, "3 attach date and time"),
 
-                new CharacterFieldDescription(new AS400Text(1), "4 status"),
-                new CharacterFieldDescription(new AS400Text(13), "5 save date and time"),
-                new CharacterFieldDescription(new AS400Text(8), "6 local journal system"),
-                new CharacterFieldDescription(new AS400Text(8), "7 source journal system"),
+                textFactory.charField(1, "4 status"),
+                textFactory.charField(13, "5 save date and time"),
+                textFactory.charField(8, "6 local journal system"),
+                textFactory.charField(8, "7 source journal system"),
                 new BinaryFieldDescription(new AS400Bin4(), "8 receiver size")
                 // reserved char(56)
         };

@@ -15,6 +15,7 @@ import org.slf4j.LoggerFactory;
 import io.debezium.connector.common.CdcSourceTaskContext;
 import io.debezium.connector.db2as400.conversion.As400DefaultValueConverter;
 import io.debezium.connector.db2as400.conversion.SchemaInfoConversion;
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.JdbcFileDecoder;
 import io.debezium.ibmi.db2.journal.retrieve.SchemaCacheIF;
 import io.debezium.relational.CustomConverterRegistry;
@@ -46,7 +47,10 @@ public class As400DatabaseSchema extends RelationalDatabaseSchema implements Sch
 
         this.config = config;
         this.jdbcConnection = jdbcConnection;
+        // columns carry their own CCSID in qsys2.syscolumns; where they don't, fall back to the CCSID
+        // of the remote system rather than one guessed from this process's locale
         fileDecoder = new JdbcFileDecoder(jdbcConnection, jdbcConnection.getRealDatabaseName(), this,
+                As400TextFactory.forConnection(jdbcConnection),
                 config.getFromCcsid(),
                 config.getToCcsid());
 

@@ -15,7 +15,8 @@ import org.slf4j.LoggerFactory;
 import com.ibm.as400.access.AS400Bin4;
 import com.ibm.as400.access.AS400DataType;
 import com.ibm.as400.access.AS400Structure;
-import com.ibm.as400.access.AS400Text;
+
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 
 /**
  * Inner class representing Journal Entry to Retrieve section. Mainly used to
@@ -33,10 +34,15 @@ import com.ibm.as400.access.AS400Text;
  *
  */
 public class RetrievalCriteria {
-    private static final int AS400_TEXT_20_LENGTTH = (new AS400Text(20)).getByteLength();
+    private static final int AS400_TEXT_20_LENGTTH = 20;
     private static final Logger log = LoggerFactory.getLogger(RetrievalCriteria.class);
     private ArrayList<AS400DataType> structure = new ArrayList<AS400DataType>();
     private ArrayList<Object> data = new ArrayList<Object>();
+    private final As400TextFactory textFactory;
+
+    public RetrievalCriteria(As400TextFactory textFactory) {
+        this.textFactory = textFactory;
+    }
 
     public AS400DataType[] getStructure() {
         return structure.toArray(new AS400DataType[structure.size()]);
@@ -61,16 +67,16 @@ public class RetrievalCriteria {
             throw new IllegalArgumentException(
                     String.format("value '%s' for 'Range of journal receivers' must be either '*CURAVLCHN' or '*CURCHAIN' or '*CURRENT'", value));
         }
-        addStructureData(RetrieveKey.RCVRNG, new AS400Text(40), temp);
+        addStructureData(RetrieveKey.RCVRNG, textFactory.text(40), temp);
     }
 
     public void withReceiverRange(String startReceiver, String startLibrary, String endReceiver, String endLibrary) {
         String padded = String.format("%-10s%-10s%-10s%-10s", startReceiver, startLibrary, endReceiver, endLibrary);
-        addStructureData(RetrieveKey.RCVRNG, new AS400Text(40), padded);
+        addStructureData(RetrieveKey.RCVRNG, textFactory.text(40), padded);
     }
 
     public void withLenNullPointerIndicatorVarLength() {
-        addStructureData(RetrieveKey.NULLINDLEN, new AS400Text(10), StringHelpers.padRight("*VARLEN", 10));
+        addStructureData(RetrieveKey.NULLINDLEN, textFactory.text(10), StringHelpers.padRight("*VARLEN", 10));
     }
 
     public void withNullPointerIndicatorLength(int value) {
@@ -80,7 +86,7 @@ public class RetrievalCriteria {
                     "Value %d for 'Null value indicators length' should be divisible by 16", value));
         }
         padded = StringHelpers.padLeft(Integer.toString(value), 10);
-        addStructureData(RetrieveKey.NULLINDLEN, new AS400Text(10), padded);
+        addStructureData(RetrieveKey.NULLINDLEN, textFactory.text(10), padded);
     }
 
     /**
@@ -91,7 +97,7 @@ public class RetrievalCriteria {
      */
     public void withFromEnt(FromEnt value) {
         String temp = StringHelpers.padRight(value.getValue(), AS400_TEXT_20_LENGTTH);
-        addStructureData(RetrieveKey.FROMENT, new AS400Text(20), temp);
+        addStructureData(RetrieveKey.FROMENT, textFactory.text(20), temp);
     }
 
     /**
@@ -102,20 +108,20 @@ public class RetrievalCriteria {
      */
     public void withFromEnt(BigInteger value) {
         String temp = String.format("%20d", value);
-        addStructureData(RetrieveKey.FROMENT, new AS400Text(20), temp);
+        addStructureData(RetrieveKey.FROMENT, textFactory.text(20), temp);
     }
 
     public void withStart() {
-        addStructureData(RetrieveKey.FROMENT, new AS400Text(20), "*FIRST");
+        addStructureData(RetrieveKey.FROMENT, textFactory.text(20), "*FIRST");
     }
 
     public void withEnd() {
-        addStructureData(RetrieveKey.TOENT, new AS400Text(20), "*LAST");
+        addStructureData(RetrieveKey.TOENT, textFactory.text(20), "*LAST");
     }
 
     public void withEnd(BigInteger value) {
         String temp = String.format("%20d", value);
-        addStructureData(RetrieveKey.TOENT, new AS400Text(20), temp);
+        addStructureData(RetrieveKey.TOENT, textFactory.text(20), temp);
     }
 
     /**
@@ -155,7 +161,7 @@ public class RetrievalCriteria {
 
         AS400DataType type[] = new AS400DataType[2];
         type[0] = new AS400Bin4();
-        type[1] = new AS400Text(codes.length());
+        type[1] = textFactory.text(codes.length());
         AS400Structure temp2Structure = new AS400Structure(type);
 
         addStructureData(RetrieveKey.JRNCDE, temp2Structure, temp2);
@@ -183,7 +189,7 @@ public class RetrievalCriteria {
 
         AS400DataType[] type = new AS400DataType[2];
         type[0] = new AS400Bin4();
-        type[1] = new AS400Text(temp.length());
+        type[1] = textFactory.text(temp.length());
         AS400Structure temp2Structure = new AS400Structure(type);
 
         addStructureData(RetrieveKey.ENTTYP, temp2Structure, temp2);
@@ -216,11 +222,11 @@ public class RetrievalCriteria {
 
         int i = 1;
         for (FileFilter f : fileFilters) {
-            types[i] = new AS400Text(10);
+            types[i] = textFactory.text(10);
             fdata[i++] = StringHelpers.padRight(f.table().toUpperCase(), 10);
-            types[i] = new AS400Text(10);
+            types[i] = textFactory.text(10);
             fdata[i++] = StringHelpers.padRight(f.schema().toUpperCase(), 10);
-            types[i] = new AS400Text(10);
+            types[i] = textFactory.text(10);
             fdata[i++] = "*ALL      ";
         }
 

@@ -196,6 +196,21 @@ the above help with connections that can be blocked (firewalled) or dropped due 
 
 ## CCSID
 
+Character conversion is always done against the CCSID of the **remote IBM i**, never one inferred from
+the connector's own locale. jt400's `new AS400Text(length)` constructor falls back to
+`ExecutionEnvironment.getBestGuessAS400Ccsid()`, which derives a CCSID from the JVM's default locale -
+so a connector container defaulting to `en_US` reading a French or Japanese system would encode journal
+API parameters with the wrong EBCDIC page and decode journal headers and record images into mojibake.
+Every character `AS400DataType` is therefore built through `As400TextFactory`, which pins the CCSID the
+system itself reports at sign-on (`AS400.getCcsid()`).
+
+CCSIDs are resolved in this order:
+
+1. the column's own CCSID from `qsys2.syscolumns` (remapped by `from.ccsid`/`to.ccsid` if configured);
+2. the remote system CCSID, for API parameters and headers, and for any column the catalogue has no
+   CCSID for (or that is tagged 65535, meaning "no translation");
+3. the local locale guess - only if the system could not be reached to ask, which is logged as an error.
+
 Unusually we have the incorrect CCSID on all our tables and the data is forced into the tables with the wrong encoding
 
 This issue should really be corrected and the data translated but with thousands of tables and many clients all configured incorrectly this is a huge job with significant risk. Instead we have an additional pair of settings from.ccsid which is the ccsid on the table and to.ccsid which will use this ccsid instead - this is for the entire system and all tables.

@@ -15,9 +15,9 @@ import org.slf4j.LoggerFactory;
 
 import com.ibm.as400.access.AS400Bin4;
 import com.ibm.as400.access.AS400Structure;
-import com.ibm.as400.access.AS400Text;
 import com.ibm.as400.access.ProgramParameter;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalCriteria.JournalCode;
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalCriteria.JournalEntryType;
 
@@ -29,14 +29,15 @@ public class ParameterListBuilder {
     public static final int ERROR_CODE = 0;
     private static final byte[] errorCodeData = new AS400Bin4().toBytes(ERROR_CODE);
     public static final String FORMAT_NAME = "RJNE0200";
-    private static final byte[] formatNameData = new AS400Text(8).toBytes(FORMAT_NAME);
 
     private int bufferLength = DEFAULT_JOURNAL_BUFFER_SIZE;
     private byte[] bufferLengthData = new AS400Bin4().toBytes(bufferLength);
 
     private String receiver = "";
     private String receiverLibrary = "";
-    private final RetrievalCriteria criteria = new RetrievalCriteria();
+    private final As400TextFactory textFactory;
+    private final byte[] formatNameData;
+    private final RetrievalCriteria criteria;
     private byte[] journalData;
 
     // for diagnostics
@@ -50,7 +51,10 @@ public class ParameterListBuilder {
     private RetrievalCriteria.JournalEntryType[] journalEntryTypes;
     private JournalCode[] journalCode;
 
-    public ParameterListBuilder() {
+    public ParameterListBuilder(As400TextFactory textFactory) {
+        this.textFactory = textFactory;
+        this.formatNameData = textFactory.text(8).toBytes(FORMAT_NAME);
+        this.criteria = new RetrievalCriteria(textFactory);
         criteria.withLenNullPointerIndicatorVarLength();
     }
 
@@ -78,7 +82,7 @@ public class ParameterListBuilder {
 
             final String jrnLib = StringHelpers.padRight(receiver, 10)
                     + StringHelpers.padRight(receiverLibrary, 10);
-            journalData = new AS400Text(20).toBytes(jrnLib);
+            journalData = textFactory.text(20).toBytes(jrnLib);
         }
         return this;
     }
