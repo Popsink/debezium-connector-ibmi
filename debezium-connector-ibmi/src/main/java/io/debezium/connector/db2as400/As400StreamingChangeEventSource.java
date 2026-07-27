@@ -230,6 +230,13 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
     private BlockingReceiverConsumer processJournalEntries(As400Partition partition, As400OffsetContext offsetContext)
             throws IOException, SQLNonTransientConnectionException {
         return (nextOffset, r, eheader) -> {
+            String longName = eheader.getFile();
+            try {
+                longName = jdbcConnection.getLongName(eheader.getLibrary(), eheader.getFile());
+            }
+            catch (final IllegalStateException e) {
+                log.error("failed to look up long name", e);
+            }
             try {
                 final JournalEntryType journalEntryType = eheader.getJournalEntryType();
 
@@ -238,13 +245,6 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                     return;
                 }
 
-                String longName = eheader.getFile();
-                try {
-                    longName = jdbcConnection.getLongName(eheader.getLibrary(), eheader.getFile());
-                }
-                catch (final IllegalStateException e) {
-                    log.error("failed to look up long name", e);
-                }
                 final TableId tableId = new TableId(database, eheader.getLibrary(), longName);
 
                 final boolean includeTable = connectorConfig.getTableFilters().dataCollectionFilter()
@@ -458,7 +458,9 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                 throw e;
             }
             catch (final Exception e) {
-                log.error("Failed to process record", e);
+                log.error("Failed to process record at offset = " + eheader.getSequenceNumber() + "  in table = " + longName +
+                        " at RRN = " + eheader.getRelativeRecordNumber() + " [journalCode = " + eheader.getJournalCode() + ", journalEntryType = " + eheader.getJournalEntryType() + "], " +
+                        "skipping and dumping diagnostics if enabled ...", e);
             }
         };
     }
