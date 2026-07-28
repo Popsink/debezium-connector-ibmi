@@ -424,7 +424,7 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
 
     // Quote qualified name to handle special chars in table name
     public String getQualifiedTableName(TableId tableId) {
-        return "\"" + tableId.schema() + "." + tableId.table() + "\"";
+        return "\"" + tableId.schema() + "\".\"" + tableId.table() + "\"";
     }
 
 }
