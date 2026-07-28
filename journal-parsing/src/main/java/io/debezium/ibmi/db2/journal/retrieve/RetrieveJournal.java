@@ -54,11 +54,11 @@ public class RetrieveJournal {
     private static final JournalEntryType[] REQURED_ENTRY_TYPES = new JournalEntryType[]{ JournalEntryType.PT,
             JournalEntryType.PX, JournalEntryType.UP, JournalEntryType.UB, JournalEntryType.DL, JournalEntryType.DR,
             JournalEntryType.CT, JournalEntryType.CG, JournalEntryType.SC, JournalEntryType.CM };
-    private final FirstHeaderDecoder firstHeaderDecoder = new FirstHeaderDecoder();
-    private final EntryHeaderDecoder entryHeaderDecoder = new EntryHeaderDecoder();
+    private final FirstHeaderDecoder firstHeaderDecoder;
+    private final EntryHeaderDecoder entryHeaderDecoder;
     private final SimpleDateFormat dateFormatter = new SimpleDateFormat("yyMMdd-hhmm");
     private final ReceiverPagination journalReceivers;
-    private final ParameterListBuilder builder = new ParameterListBuilder();
+    private final ParameterListBuilder builder;
 
     RetrieveConfig config;
     private byte[] outputData = null;
@@ -71,6 +71,9 @@ public class RetrieveJournal {
 
     public RetrieveJournal(RetrieveConfig config, JournalInfoRetrieval journalRetrieval) {
         this.config = config;
+        firstHeaderDecoder = new FirstHeaderDecoder(config.textFactory());
+        entryHeaderDecoder = new EntryHeaderDecoder(config.textFactory());
+        builder = new ParameterListBuilder(config.textFactory());
         journalReceivers = new ReceiverPagination(journalRetrieval, config.maxServerSideEntries(), config.journalInfo());
 
         builder.withJournal(config.journalInfo().journalName(), config.journalInfo().journalLibrary());

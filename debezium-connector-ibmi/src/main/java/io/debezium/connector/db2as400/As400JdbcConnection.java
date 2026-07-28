@@ -422,4 +422,9 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
         return super.buildSelectPrimaryKeyBoundaries(tableId, size, projection, orderBy) + " OPTIMIZE FOR 1 ROW";
     }
 
+    // Quote qualified name to handle special chars in table name
+    public String getQualifiedTableName(TableId tableId) {
+        return "\"" + tableId.schema() + "\".\"" + tableId.table() + "\"";
+    }
+
 }

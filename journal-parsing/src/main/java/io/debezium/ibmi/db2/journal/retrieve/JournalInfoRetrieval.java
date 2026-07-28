@@ -38,6 +38,7 @@ import com.ibm.as400.access.ProgramParameter;
 import com.ibm.as400.access.QSYSObjectPathName;
 import com.ibm.as400.access.ServiceProgramCall;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.exception.JournalReceiverNotFoundException;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.DetailedJournalReceiver;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.JournalReceiverInfo;
@@ -69,11 +70,12 @@ public class JournalInfoRetrieval {
      */
     static final Set<String> RECEIVER_NOT_FOUND_MESSAGE_IDS = Set.of("CPF9801", "CPF9810", "CPF9812", "CPF7025");
 
-    private static final byte[] EMPTY_AS400_TEXT = new AS400Text(0).toBytes("");
-    private final AS400Text as400Text8 = new AS400Text(8);
-    private final AS400Text as400Text20 = new AS400Text(20);
-    private final AS400Text as400Text1 = new AS400Text(1);
-    private final AS400Text as400Text10 = new AS400Text(10);
+    private final As400TextFactory textFactory;
+    private final byte[] emptyAs400Text;
+    private final AS400Text as400Text8;
+    private final AS400Text as400Text20;
+    private final AS400Text as400Text1;
+    private final AS400Text as400Text10;
     private final AS400Bin8 as400Bin8 = new AS400Bin8();
     private final AS400Bin4 as400Bin4 = new AS400Bin4();
     private static final int KEY_HEADER_LENGTH = 20;
@@ -84,8 +86,15 @@ public class JournalInfoRetrieval {
     private final long additionalJournalDelay;
     private final long pollInterval;
 
-    public JournalInfoRetrieval(long journalCacheDelay, long additionalJournalDelay, long pollInterval) {
+    public JournalInfoRetrieval(As400TextFactory textFactory, long journalCacheDelay, long additionalJournalDelay,
+                                long pollInterval) {
         super();
+        this.textFactory = textFactory;
+        this.emptyAs400Text = textFactory.text(0).toBytes("");
+        this.as400Text8 = textFactory.text(8);
+        this.as400Text20 = textFactory.text(20);
+        this.as400Text1 = textFactory.text(1);
+        this.as400Text10 = textFactory.text(10);
         this.journalCacheDelay = journalCacheDelay;
         this.additionalJournalDelay = additionalJournalDelay;
         this.pollInterval = pollInterval;
@@ -295,13 +304,13 @@ public class JournalInfoRetrieval {
         private final ArrayList<AS400DataType> structure = new ArrayList<>();
         private final ArrayList<Object> data = new ArrayList<>();
 
-        public JournalRetrievalCriteria() {
+        public JournalRetrievalCriteria(As400TextFactory textFactory) {
             // first element is the number of variable length records
             structure.add(new AS400Bin4());
             structure.add(new AS400Bin4());
             structure.add(new AS400Bin4());
             structure.add(new AS400Bin4());
-            structure.add(new AS400Text(1));
+            structure.add(textFactory.text(1));
             data.add(ONE_INT); // number of records
             data.add(TWELVE_INT); // data length
             data.add(ONE_INT); // 1 = journal directory info
@@ -350,7 +359,7 @@ public class JournalInfoRetrieval {
                 new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, as400Bin4.toBytes(rcvLen / 4096)),
                 new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, as400Text20.toBytes(jrnLib)),
                 new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, as400Text8.toBytes(format)),
-                new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, EMPTY_AS400_TEXT),
+                new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, emptyAs400Text),
                 new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, as400Bin4.toBytes(0)) };
 
         return callServiceProgram(as400, JOURNAL_SERVICE_LIB, "QjoRetrieveJournalInformation", parameters, f::apply);
@@ -360,7 +369,7 @@ public class JournalInfoRetrieval {
         final String jrnLib = padRight(journalLib.journalName(), 10) + padRight(journalLib.journalLibrary(), 10);
         final String format = "RJRN0200";
 
-        final JournalRetrievalCriteria criteria = new JournalRetrievalCriteria();
+        final JournalRetrievalCriteria criteria = new JournalRetrievalCriteria(textFactory);
         final byte[] toRetrieve = new AS400Structure(criteria.getStructure()).toBytes(criteria.getObject());
         final ProgramParameter[] parameters = new ProgramParameter[]{
                 new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, bufSize),
@@ -415,7 +424,7 @@ public class JournalInfoRetrieval {
             final KeyHeader kheader = keyDecoder.decode(data, keyOffset + k * KEY_HEADER_LENGTH);
             if (kheader.getKey() == 1) {
 
-                final ReceiverDecoder dec = new ReceiverDecoder();
+                final ReceiverDecoder dec = new ReceiverDecoder(textFactory);
                 for (int i = 0; i < kheader.getNumberOfEntries(); i++) {
                     final int kioffset = keyOffset + kheader.getOffset() + kheader.getLengthOfHeader()
                             + i * kheader.getLengthOfKeyInfo();
@@ -571,9 +580,9 @@ public class JournalInfoRetrieval {
         return Long.valueOf(as400Bin8.toLong(b));
     }
 
-    public static String decodeString(byte[] data, int offset, int length) {
+    public String decodeString(byte[] data, int offset, int length) {
         final byte[] b = Arrays.copyOfRange(data, offset, offset + length);
-        return StringHelpers.safeTrim((String) new AS400Text(length).toObject(b));
+        return StringHelpers.safeTrim(textFactory.decode(b, 0, length));
     }
 
     public static String padRight(String s, int n) {

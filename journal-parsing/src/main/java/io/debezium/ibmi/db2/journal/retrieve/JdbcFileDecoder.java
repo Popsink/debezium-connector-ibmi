@@ -38,6 +38,7 @@ import io.debezium.ibmi.db2.journal.data.types.AS400Boolean;
 import io.debezium.ibmi.db2.journal.data.types.AS400VarBin;
 import io.debezium.ibmi.db2.journal.data.types.AS400VarChar;
 import io.debezium.ibmi.db2.journal.data.types.AS400Xml;
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.SchemaCacheIF.Structure;
 import io.debezium.ibmi.db2.journal.retrieve.SchemaCacheIF.TableInfo;
 import io.debezium.ibmi.db2.journal.retrieve.rjne0200.EntryHeader;
@@ -65,13 +66,16 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
     private final CcsidCache ccsidCache;
     private final BytesPerChar octetLengthCache;
     private final DateTimeFormatCache dateTimeFormatCache;
+    private final As400TextFactory textFactory;
 
     public JdbcFileDecoder(Connect<Connection, SQLException> con, String database, SchemaCacheIF schemaCache,
-                           int fromCcsid, int toCcsid) {
+                           As400TextFactory textFactory, int fromCcsid, int toCcsid) {
         super();
         this.jdbcConnect = con;
         this.schemaCache = schemaCache;
         this.databaseName = database;
+        this.textFactory = textFactory;
+        this.lengthDecoder = textFactory.text(5);
         ccsidCache = new CcsidCache(con, fromCcsid, toCcsid);
         octetLengthCache = new BytesPerChar(con);
         dateTimeFormatCache = new DateTimeFormatCache(con);
@@ -83,7 +87,7 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
      * CHAR(5) Length of entry specific data 5 5 CHAR(11) Reserved 16 16 CHAR(*)
      * Entry specific data
      */
-    private final AS400Text lengthDecoder = new AS400Text(5);
+    private final AS400Text lengthDecoder;
     private static final Object[] EMPTY = new Object[]{};
 
     @Override
@@ -291,18 +295,22 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
     static final Pattern BIT_DATA = Pattern.compile("CHAR \\(([(0-9]*)\\) FOR BIT DATA");
     static final Pattern VAR_BIT_DATA = Pattern.compile("VARCHAR \\(([(0-9]*)\\) FOR BIT DATA");
 
-    AS400Text getText(int length, int ccsid) {
-        if (ccsid != -1) {
-            return new AS400Text(length, ccsid);
-        }
-        return new AS400Text(length);
+    /**
+     * The column's own CCSID from {@code qsys2.syscolumns} wins; where the catalogue has none the
+     * remote system CCSID is used, so a connector running under a different locale from the IBM i
+     * still decodes the text the same way.
+     */
+    AS400Text getText(int length, Integer ccsid) {
+        return textFactory.text(length, ccsidOrUnknown(ccsid));
     }
 
     AS400VarChar getVarText(int length, int bytesPerChar, Integer ccsid) {
-        if (ccsid != -1) {
-            return new AS400VarChar(length, bytesPerChar, ccsid);
-        }
-        return new AS400VarChar(length, bytesPerChar);
+        return textFactory.varChar(length, bytesPerChar, ccsidOrUnknown(ccsid));
+    }
+
+    private static int ccsidOrUnknown(Integer ccsid) {
+        // a table we can't see in syscolumns leaves the lookup with no entry at all
+        return (ccsid == null) ? As400TextFactory.UNKNOWN_CCSID : ccsid;
     }
 
     public AS400DataType toDataType(String schema, String table, String columnName, String type, int length,

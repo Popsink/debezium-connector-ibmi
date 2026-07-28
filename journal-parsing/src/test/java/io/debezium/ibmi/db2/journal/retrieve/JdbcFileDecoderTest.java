@@ -23,12 +23,17 @@ import com.ibm.as400.access.AS400Text;
 import com.ibm.as400.access.AS400ZonedDecimal;
 
 import io.debezium.ibmi.db2.journal.data.types.AS400VarChar;
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 
 public class JdbcFileDecoderTest {
 
+    /** Pinned so the tests decode the same way whatever locale they run under. */
+    private static final int EBCDIC_37 = 37;
+    private static final As400TextFactory TEXT_FACTORY = As400TextFactory.forCcsid(EBCDIC_37);
+
     @Test
     public void testToDataType() throws Exception {
-        final JdbcFileDecoder decoder = new JdbcFileDecoder(null, null, new SchemaCacheHash(), -1, -1);
+        final JdbcFileDecoder decoder = new JdbcFileDecoder(null, null, new SchemaCacheHash(), TEXT_FACTORY, -1, -1);
         final AS400DataType passwordNoLength = decoder.toDataType("schem", "table", "password", "CHAR () FOR BIT DATA",
                 10, 0);
         assertEquals(AS400DataType.TYPE_BYTE_ARRAY, passwordNoLength.getInstanceType());
@@ -45,7 +50,7 @@ public class JdbcFileDecoderTest {
         assertEquals(20, passwordLength.getByteLength());
     }
 
-    private static final JdbcFileDecoder DECODER = new JdbcFileDecoder(null, null, new SchemaCacheHash(), -1, -1);
+    private static final JdbcFileDecoder DECODER = new JdbcFileDecoder(null, null, new SchemaCacheHash(), TEXT_FACTORY, -1, -1);
 
     // [CHAR(3), DECIMAL(5,0), CHAR(2)] -> 3 + 3 + 2 = 8 bytes
     private static AS400Structure threeFieldStructure() {
@@ -96,7 +101,7 @@ public class JdbcFileDecoderTest {
     public void testDecodeEntryMatchesDriverForVariableLengthTypes() {
         // [VARCHAR(max 5), CHAR(2)] -> (5 + 2) + 2 = 9 bytes
         final AS400Structure structure = new AS400Structure(
-                new AS400DataType[]{ new AS400VarChar(5, 1), new AS400Text(2) });
+                new AS400DataType[]{ new AS400VarChar(5, 1, EBCDIC_37), new AS400Text(2) });
         final byte[] data = new byte[structure.getByteLength()];
         new AS400Bin2().toBytes((short) 3, data, 0); // varchar actual length = 3 (< max 5)
 
@@ -208,7 +213,7 @@ public class JdbcFileDecoderTest {
     public void dateAndTimeFallBackToIsoWhenFormatUnknown() throws Exception {
         // null connection -> the format cache lookup fails and is swallowed; DATE/TIME must default to *ISO
         // rather than throwing (preserves prior behaviour for ISO files and never NPEs the decoder).
-        final JdbcFileDecoder decoder = new JdbcFileDecoder(null, null, new SchemaCacheHash(), -1, -1);
+        final JdbcFileDecoder decoder = new JdbcFileDecoder(null, null, new SchemaCacheHash(), TEXT_FACTORY, -1, -1);
 
         final AS400DataType date = decoder.toDataType("schem", "table", "d", "DATE", 10, 0);
         assertEquals(AS400DataType.TYPE_DATE, date.getInstanceType());

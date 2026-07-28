@@ -23,6 +23,7 @@ import com.ibm.as400.access.SocketProperties;
 import io.debezium.DebeziumException;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.connector.db2as400.metrics.As400StreamingChangeEventSourceMetrics;
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.Connect;
 import io.debezium.ibmi.db2.journal.retrieve.FileFilter;
 import io.debezium.ibmi.db2.journal.retrieve.JournalInfo;
@@ -53,6 +54,7 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
     private static SocketProperties socketProperties = new SocketProperties();
     private final LogLimmiting periodic = new LogLimmiting(5 * 60 * 1000l);
     private final JournalInfoRetrieval journalInfoRetrieval;
+    private final As400TextFactory textFactory;
 
     private final boolean isSecure;
 
@@ -61,14 +63,18 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
         this.config = config;
         this.isSecure = config.getJdbcConfig().getBoolean("secure", config.isSecure());
         this.streamingMetrics = streamingMetrics;
-        this.journalInfoRetrieval = new JournalInfoRetrieval(cacheWait, config.cacheAdditionalDelay(), config.getPollInterval().toMillis());
+        System.setProperty("com.ibm.as400.access.AS400.guiAvailable", "False");
+        // every AS400Text used to encode API parameters and decode journal data is built against
+        // this, so the CCSID follows the remote system instead of the connector's own locale
+        this.textFactory = createTextFactory();
+        this.journalInfoRetrieval = new JournalInfoRetrieval(textFactory, cacheWait, config.cacheAdditionalDelay(), config.getPollInterval().toMillis());
         try {
-            System.setProperty("com.ibm.as400.access.AS400.guiAvailable", "False");
             journalInfo = journalInfoRetrieval.getJournal(connection(), config.getSchema(), includes);
 
             boolean transactionMgt = config.isTransactionMgmtEnabled();
 
             final RetrieveConfig rconfig = new RetrieveConfigBuilder().withAs400(this)
+                    .withTextFactory(textFactory)
                     .withJournalBufferSize(config.getJournalBufferSize())
                     .withJournalInfo(journalInfo)
                     .withMaxServerSideEntries(config.getMaxServerSideEntries())
@@ -79,6 +85,17 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
         }
         catch (final IOException e) {
             log.error("Failed to fetch library", e);
+        }
+    }
+
+    private As400TextFactory createTextFactory() {
+        try {
+            return As400TextFactory.forSystem(connection());
+        }
+        catch (final IOException e) {
+            log.error("unable to reach the system to read its ccsid, character conversion will fall back "
+                    + "to guessing one from the local locale", e);
+            return As400TextFactory.localeDefault();
         }
     }
 

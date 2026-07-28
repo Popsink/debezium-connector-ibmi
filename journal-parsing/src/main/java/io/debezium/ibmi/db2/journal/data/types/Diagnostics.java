@@ -66,10 +66,10 @@ public class Diagnostics {
         return sb.toString();
     }
 
-    public static String binAsEbcdic(byte[] data, int offset, int length) {
+    public static String binAsEbcdic(As400TextFactory textFactory, byte[] data, int offset, int length) {
         // byte[] bdata = Arrays.copyOfRange(data, offset, offset + length);
         StringBuilder sb = new StringBuilder();
-        AS400Text td = new AS400Text(1);
+        AS400Text td = textFactory.text(1);
         sb.append(String.format("%04d: ", (offset)));
         for (int j = 0; j < length; j++) {
             String s = (String) td.toObject(data, j + offset);

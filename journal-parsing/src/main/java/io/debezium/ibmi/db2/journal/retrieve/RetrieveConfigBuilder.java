@@ -15,6 +15,7 @@ import org.slf4j.LoggerFactory;
 
 import com.ibm.as400.access.AS400;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalCriteria.JournalCode;
 
 public class RetrieveConfigBuilder {
@@ -22,6 +23,7 @@ public class RetrieveConfigBuilder {
     private static final Logger log = LoggerFactory.getLogger(RetrieveConfigBuilder.class);
 
     private Connect<AS400, IOException> as400;
+    private As400TextFactory textFactory = As400TextFactory.localeDefault();
     private JournalInfo journalInfo;
     private File dumpFolder;
     private int journalBufferSize = ParameterListBuilder.DEFAULT_JOURNAL_BUFFER_SIZE;
@@ -35,6 +37,15 @@ public class RetrieveConfigBuilder {
 
     public RetrieveConfigBuilder withAs400(Connect<AS400, IOException> as400) {
         this.as400 = as400;
+        return this;
+    }
+
+    /**
+     * Pins character conversion to the remote system's CCSID; without it jt400 guesses one from the
+     * local default locale.
+     */
+    public RetrieveConfigBuilder withTextFactory(As400TextFactory textFactory) {
+        this.textFactory = textFactory;
         return this;
     }
 
@@ -102,6 +113,6 @@ public class RetrieveConfigBuilder {
     }
 
     public RetrieveConfig build() {
-        return new RetrieveConfig(as400, journalInfo, journalBufferSize, filtering, filterCodes, includeFiles, maxServerSideEntries, dumpFolder);
+        return new RetrieveConfig(as400, textFactory, journalInfo, journalBufferSize, filtering, filterCodes, includeFiles, maxServerSideEntries, dumpFolder);
     }
 }

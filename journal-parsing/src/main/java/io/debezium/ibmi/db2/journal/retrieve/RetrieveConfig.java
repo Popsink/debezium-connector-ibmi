@@ -11,11 +11,12 @@ import java.util.List;
 
 import com.ibm.as400.access.AS400;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalCriteria.JournalCode;
 
-public record RetrieveConfig(Connect<AS400, IOException> as400, JournalInfo journalInfo, int journalBufferSize,
-        boolean filtering, JournalCode[] filterCodes, List<FileFilter> includeFiles, int maxServerSideEntries,
-        File dumpFolder) {
+public record RetrieveConfig(Connect<AS400, IOException> as400, As400TextFactory textFactory, JournalInfo journalInfo,
+        int journalBufferSize, boolean filtering, JournalCode[] filterCodes, List<FileFilter> includeFiles,
+        int maxServerSideEntries, File dumpFolder) {
 
     public static final int DEFAULT_MAX_SERVER_SIDE_ENTRIES = 1000000;
 }

@@ -20,6 +20,8 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import com.ibm.as400.access.AS400;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
+
 /**
  * Unit tests for {@link JournalInfoRetrieval#getJournal(AS400, String, List)} covering the
  * multi-library support: tables spread across libraries are allowed as long as they share a single
@@ -37,7 +39,7 @@ class JournalInfoRetrievalGetJournalTest {
     @Test
     void multipleLibrariesSharingOneJournalResolveToSingleJournal() throws Exception {
         // Given two tables in two different libraries that both journal to JRN
-        final JournalInfoRetrieval retrieval = spy(new JournalInfoRetrieval(0L, 0L, 0L));
+        final JournalInfoRetrieval retrieval = spy(new JournalInfoRetrieval(As400TextFactory.forCcsid(37), 0L, 0L, 0L));
         doReturn(journalA).when(retrieval).getJournal(as400, "LIB1", "T1");
         doReturn(journalA).when(retrieval).getJournal(as400, "LIB2", "T2");
 
@@ -52,7 +54,7 @@ class JournalInfoRetrievalGetJournalTest {
     @Test
     void multipleLibrariesWithDistinctJournalsFailWithExplicitMessage() throws Exception {
         // Given two tables in two libraries that journal to different journals
-        final JournalInfoRetrieval retrieval = spy(new JournalInfoRetrieval(0L, 0L, 0L));
+        final JournalInfoRetrieval retrieval = spy(new JournalInfoRetrieval(As400TextFactory.forCcsid(37), 0L, 0L, 0L));
         doReturn(journalA).when(retrieval).getJournal(as400, "LIB1", "T1");
         doReturn(journalB).when(retrieval).getJournal(as400, "LIB2", "T2");
 

@@ -16,7 +16,6 @@ public class AS400VarBin implements AS400DataType {
     private final AS400Bin2 as400Bin2 = new AS400Bin2();
     private final int maxLenght;
     private final static byte[] defaultValue = new byte[0];
-    private int actualLength;
 
     public AS400VarBin(int maxLenght) {
         this.maxLenght = maxLenght;
@@ -64,7 +63,9 @@ public class AS400VarBin implements AS400DataType {
 
     @Override
     public Object toObject(byte[] data, int offset) {
-        actualLength = (Short) as400Bin2.toObject(data, offset);
+        // a local, not a field: this instance is shared via the AS400Structure cached per table, so a
+        // field here would let concurrent decodes of the same table overwrite each other's length
+        final int actualLength = (Short) as400Bin2.toObject(data, offset);
         // note the below insert will put data in as EBIDIC so test = a385a2a3 and not the ascii 74657374
         // INSERT INTO msbinary (id, mybin) VALUES (2, CAST('test' AS VARBINARY(10)))
         return Arrays.copyOfRange(data, offset + 2, offset + 2 + actualLength);
