@@ -241,15 +241,20 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
             return state;
         }
         catch (LostJournalException e) {
-            // this is bad, we've probably lost data
-            final List<DetailedJournalReceiver> receivers = journalInfoRetrieval.getReceivers(connection(), journalInfo);
-            log.error("Failed to fetch journal entries '{}', resetting journal to blank",
-                    Map.of("position", position,
-                            "receivers", receivers));
-            offsetCtx.setPosition(new JournalProcessedPosition());
+            // this is bad, we've probably lost data; the caller applies the configured recovery strategy
+            logLostJournal(position);
+            throw e;
         }
+    }
 
-        return RetrievalState.NotCalled;
+    private void logLostJournal(JournalProcessedPosition position) {
+        try {
+            final List<DetailedJournalReceiver> receivers = journalInfoRetrieval.getReceivers(connection(), journalInfo);
+            log.error("Failed to fetch journal entries '{}'", Map.of("position", position, "receivers", receivers));
+        }
+        catch (final Exception e) {
+            log.error("Failed to fetch journal entries for position {}, receiver list unavailable", position, e);
+        }
     }
 
     private void logOffsets(JournalProcessedPosition position, RetrievalState state) throws IOException, Exception {

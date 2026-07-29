@@ -18,7 +18,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalState;
-import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.source.spi.ChangeEventSource.ChangeEventSourceContext;
 import io.debezium.relational.TableId;
@@ -107,11 +106,10 @@ public class As400StreamingChangeEventSourcePauseTest {
         when(dataConnection.getJournalEntries(any(), any(), any(), any())).thenReturn(RetrievalState.Success);
 
         final EventDispatcher<As400Partition, TableId> dispatcher = mock(EventDispatcher.class);
-        final ErrorHandler errorHandler = mock(ErrorHandler.class);
         final As400DatabaseSchema schema = mock(As400DatabaseSchema.class);
 
         final As400StreamingChangeEventSource source = new As400StreamingChangeEventSource(
-                config, dataConnection, jdbcConnection, dispatcher, errorHandler, Clock.SYSTEM, schema);
+                config, dataConnection, jdbcConnection, dispatcher, Clock.SYSTEM, schema);
 
         final PausingContext context = new PausingContext();
         final As400Partition partition = new As400Partition("server");

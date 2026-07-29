@@ -610,4 +610,26 @@ class ReceiverPaginationTest {
         assertEquals(new JournalPosition(BigInteger.valueOf(40), j3.info().receiver()), found.get().end());
     }
 
+    /**
+     * Starting over has to work from a fresh receiver list. The cached one is only refreshed when the
+     * attached receiver changes, which deleting older receivers does not do, so a connector resetting to the
+     * earliest receiver after losing its position would otherwise be sent straight back to a deleted one.
+     */
+    @Test
+    void findRangeFromBeginningRefetchesReceivers() throws Exception {
+        final ReceiverPagination jreceivers = new ReceiverPagination(journalInfoRetrieval, 100, journalInfo);
+
+        // j1 is deleted between the two calls while j2 stays attached
+        when(journalInfoRetrieval.getReceivers(any(), any())).thenReturn(Arrays.asList(dr1, dr2)).thenReturn(Arrays.asList(dr2));
+        when(journalInfoRetrieval.getDelayedDetailedJournalReceiver(any(), any())).thenReturn(Optional.of(dr2));
+
+        final JournalProcessedPosition inFirstReceiver = new JournalProcessedPosition(BigInteger.ONE,
+                dr1.info().receiver(), Instant.ofEpochSecond(0), true);
+        jreceivers.findRange(as400, inFirstReceiver);
+
+        final Optional<PositionRange> result = jreceivers.findRange(as400, new JournalProcessedPosition());
+        assertEquals(dr2.info().receiver(), result.get().start().getReceiver());
+        assertEquals(dr2.start(), result.get().start().getOffset());
+    }
+
 }

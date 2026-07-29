@@ -9,7 +9,6 @@ import java.io.IOException;
 import java.sql.SQLNonTransientConnectionException;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -22,12 +21,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.DebeziumException;
+import io.debezium.connector.db2as400.As400ConnectorConfig.UnavailablePositionRecovery;
 import io.debezium.connector.db2as400.As400RpcConnection.BlockingReceiverConsumer;
 import io.debezium.data.Envelope.Operation;
 import io.debezium.ibmi.db2.journal.retrieve.JournalEntryType;
+import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.ibmi.db2.journal.retrieve.exception.FatalException;
-import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidPositionException;
-import io.debezium.pipeline.ErrorHandler;
+import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
 import io.debezium.pipeline.txmetadata.TransactionContext;
@@ -42,9 +42,7 @@ import io.debezium.util.Metronome;
  * </p>
  */
 public class As400StreamingChangeEventSource implements StreamingChangeEventSource<As400Partition, As400OffsetContext> {
-    private static final String NO_TRANSACTION_ID = "00000000000000000000";
-    private long connectionTime = -1;
-    private final long MIN_DISCONNECT_TIME_MS = 30000;
+    private static final int MAX_RETRIES = 20;
 
     private static final Logger log = LoggerFactory.getLogger(As400StreamingChangeEventSource.class);
 
@@ -62,7 +60,6 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
      * buffering will not work.
      */
     private final EventDispatcher<As400Partition, TableId> dispatcher;
-    private final ErrorHandler errorHandler;
     private final Clock clock;
     private final As400DatabaseSchema schema;
     private final Duration pollInterval;
@@ -74,12 +71,11 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
 
     public As400StreamingChangeEventSource(As400ConnectorConfig connectorConfig, As400RpcConnection dataConnection,
                                            As400JdbcConnection jdbcConnection, EventDispatcher<As400Partition, TableId> dispatcher,
-                                           ErrorHandler errorHandler, Clock clock, As400DatabaseSchema schema) {
+                                           Clock clock, As400DatabaseSchema schema) {
         this.connectorConfig = connectorConfig;
         this.dataConnection = dataConnection;
         this.jdbcConnection = jdbcConnection;
         this.dispatcher = dispatcher;
-        this.errorHandler = errorHandler;
         this.clock = clock;
         this.schema = schema;
         this.pollInterval = connectorConfig.getPollInterval();
@@ -160,9 +156,12 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         }
                         retries = 0;
                     }
-                    catch (final InvalidPositionException e) {
-                        throw new DebeziumException("Invalid journal receiver/sequence are we using the wrong offset for the receiver: " + offsetContext.getPosition(),
-                                e);
+                    catch (final LostJournalException e) {
+                        // the journal or the receivers we were reading are gone, e.g. deleted while we were
+                        // streaming: data is already lost, so apply the configured recovery strategy rather
+                        // than silently skipping on
+                        applyUnavailablePositionRecovery(offsetContext, e);
+                        retries = pauseBeforeRetry(retries, offsetContext, e, metronome);
                     }
                     catch (final FatalException e) {
                         throw new DebeziumException("Unable to process offset " + offsetContext.getPosition(), e);
@@ -171,8 +170,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         if (context.isRunning()) {
                             log.error("Interrupted processing offset {} retry {}", offsetContext.getPosition(), retries);
                             closeAndReconnect();
-                            retries++;
-                            metronome.pause();
+                            retries = pauseBeforeRetry(retries, offsetContext, e, metronome);
                         }
                     }
                     catch (IOException | SQLNonTransientConnectionException e) { // SQLNonTransientConnectionException
@@ -181,14 +179,12 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         log.error("Connection failed offset {} retry {}", offsetContext.getPosition(), retries, e);
                         closeAndReconnect();
 
-                        retries++;
-                        metronome.pause(); // throws interruptedException
+                        retries = pauseBeforeRetry(retries, offsetContext, e, metronome);
                     }
                     catch (final Exception e) {
                         log.error("Failed to process offset {} retry {}", offsetContext.getPosition(), retries, e);
 
-                        retries++;
-                        metronome.pause();
+                        retries = pauseBeforeRetry(retries, offsetContext, e, metronome);
                     }
                 }
                 catch (final InterruptedException e) { // handle InterruptedException during the exception handling
@@ -203,13 +199,56 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
         }
     }
 
-    public void rateLimittedClose() {
-        if (System.currentTimeMillis() - connectionTime > MIN_DISCONNECT_TIME_MS) {
-            closeAndReconnect();
+    /**
+     * Streaming counterpart of {@code As400ConnectorTask.applyUnavailablePositionRecovery}: the journal and its
+     * receivers can go away while the connector is running, not only between restarts, so the configured
+     * {@link UnavailablePositionRecovery} strategy has to be honoured here too.
+     * <p>
+     * {@code SNAPSHOT} cannot re-run the initial snapshot from the streaming thread, so it fails the task
+     * with the same machine-readable marker used at startup; the offset reset and the fresh snapshot are then
+     * done by the startup recovery when the task restarts. Set {@code errors.max.retries} together with a
+     * {@code custom.retriable.exception} matching {@link OffsetNoLongerAvailableException#ERROR_CODE} to have
+     * the engine restart itself rather than waiting for the orchestrator.
+     */
+    private void applyUnavailablePositionRecovery(As400OffsetContext offsetContext, Exception cause) {
+        final String lost = "journal position " + offsetContext.getPosition() + " is no longer available on the server while streaming";
+        switch (connectorConfig.getUnavailablePositionRecovery()) {
+            case FAIL:
+                throw new OffsetNoLongerAvailableException(lost + ". Reset the offset and trigger a snapshot, or set '"
+                        + As400ConnectorConfig.UNAVAILABLE_POSITION_RECOVERY.name() + "' to 'snapshot' or 'earliest' to auto-recover.", cause);
+            case SNAPSHOT:
+                throw new OffsetNoLongerAvailableException(lost + "; failing the task so snapshot.mode '"
+                        + connectorConfig.getSnapshotMode().getValue() + "' can take a fresh snapshot to fill the gap when it restarts.", cause);
+            case EARLIEST:
+                log.warn("DATA GAP: {}; resetting streaming to the earliest available journal receiver. Changes between the "
+                        + "lost position and the earliest available receiver are unrecoverable.", lost, cause);
+                offsetContext.setPosition(new JournalProcessedPosition());
+                // discard ongoing transactions
+                beforeMap.clear();
+                txMap.clear();
+                bufferRecordMap.clear();
+                offsetContext.endTransaction();
         }
-        else {
-            log.debug("Only connected since {} ignoring disconnect", new Date(connectionTime));
+    }
+
+
+    /**
+     * Waits out the poll interval before the next attempt, giving up once the same failure has been retried
+     * {@link #MAX_RETRIES} times so a permanently broken stream fails the connector instead of retrying
+     * forever. A lost connection is retriable, so failing here restarts the connector, see
+     * {@link As400ErrorHandler}.
+     *
+     * @return the number of retries attempted so far
+     */
+    private static int pauseBeforeRetry(int retries, As400OffsetContext offsetContext, Exception e, Metronome metronome)
+            throws InterruptedException {
+        final int attempted = retries + 1;
+        if (attempted >= MAX_RETRIES) {
+            throw new DebeziumException(
+                    String.format("Failed to process offset %s after %d retries", offsetContext.getPosition(), attempted), e);
         }
+        metronome.pause();
+        return attempted;
     }
 
     public void closeAndReconnect() {
@@ -227,7 +266,6 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
         catch (final Exception e) {
             log.error("Failure reconnecting sql", e);
         }
-        connectionTime = System.currentTimeMillis();
     }
 
     // TODO tidy up exception handling

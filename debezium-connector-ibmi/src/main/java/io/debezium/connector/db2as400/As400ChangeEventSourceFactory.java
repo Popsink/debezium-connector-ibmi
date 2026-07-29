@@ -8,7 +8,6 @@ package io.debezium.connector.db2as400;
 import java.util.Optional;
 
 import io.debezium.jdbc.MainConnectionProvidingConnectionFactory;
-import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.notification.NotificationService;
 import io.debezium.pipeline.source.snapshot.incremental.IncrementalSnapshotChangeEventSource;
@@ -29,7 +28,6 @@ public class As400ChangeEventSourceFactory implements ChangeEventSourceFactory<A
     private final As400ConnectorConfig snapshotConfig;
     private final As400RpcConnection rpcConnection;
     private final MainConnectionProvidingConnectionFactory<As400JdbcConnection> jdbcConnectionFactory;
-    private final ErrorHandler errorHandler;
     private final EventDispatcher<As400Partition, TableId> dispatcher;
     private final Clock clock;
     private final As400DatabaseSchema schema;
@@ -38,13 +36,12 @@ public class As400ChangeEventSourceFactory implements ChangeEventSourceFactory<A
     public As400ChangeEventSourceFactory(As400ConnectorConfig configuration, As400ConnectorConfig snapshotConfig,
                                          As400RpcConnection rpcConnection,
                                          MainConnectionProvidingConnectionFactory<As400JdbcConnection> jdbcConnectionFactory,
-                                         ErrorHandler errorHandler, EventDispatcher<As400Partition, TableId> dispatcher, Clock clock,
+                                         EventDispatcher<As400Partition, TableId> dispatcher, Clock clock,
                                          As400DatabaseSchema schema,
                                          SnapshotterService snapshotterService) {
         this.configuration = configuration;
         this.rpcConnection = rpcConnection;
         this.jdbcConnectionFactory = jdbcConnectionFactory;
-        this.errorHandler = errorHandler;
         this.dispatcher = dispatcher;
         this.clock = clock;
         this.schema = schema;
@@ -85,6 +82,6 @@ public class As400ChangeEventSourceFactory implements ChangeEventSourceFactory<A
     @Override
     public StreamingChangeEventSource<As400Partition, As400OffsetContext> getStreamingChangeEventSource() {
         return new As400StreamingChangeEventSource(configuration, rpcConnection, jdbcConnectionFactory.mainConnection(),
-                dispatcher, errorHandler, clock, schema);
+                dispatcher, clock, schema);
     }
 }
