@@ -28,6 +28,7 @@ import io.debezium.ibmi.db2.journal.retrieve.JournalEntryType;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.ibmi.db2.journal.retrieve.exception.FatalException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
+import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
 import io.debezium.pipeline.txmetadata.TransactionContext;
@@ -60,6 +61,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
      * buffering will not work.
      */
     private final EventDispatcher<As400Partition, TableId> dispatcher;
+    private final ErrorHandler errorHandler;
     private final Clock clock;
     private final As400DatabaseSchema schema;
     private final Duration pollInterval;
@@ -71,11 +73,12 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
 
     public As400StreamingChangeEventSource(As400ConnectorConfig connectorConfig, As400RpcConnection dataConnection,
                                            As400JdbcConnection jdbcConnection, EventDispatcher<As400Partition, TableId> dispatcher,
-                                           Clock clock, As400DatabaseSchema schema) {
+                                           ErrorHandler errorHandler, Clock clock, As400DatabaseSchema schema) {
         this.connectorConfig = connectorConfig;
         this.dataConnection = dataConnection;
         this.jdbcConnection = jdbcConnection;
         this.dispatcher = dispatcher;
+        this.errorHandler = errorHandler;
         this.clock = clock;
         this.schema = schema;
         this.pollInterval = connectorConfig.getPollInterval();
@@ -230,7 +233,6 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                 offsetContext.endTransaction();
         }
     }
-
 
     /**
      * Waits out the poll interval before the next attempt, giving up once the same failure has been retried

@@ -171,7 +171,7 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
         final Clock clock = Clock.system();
 
         final As400ChangeEventSourceFactory changeFactory = new As400ChangeEventSourceFactory(newConfig, snapshotConnectorConfig, rpcConnection,
-                jdbcConnectionFactory, dispatcher, clock, schema, snapshotterService);
+                jdbcConnectionFactory, errorHandler, dispatcher, clock, schema, snapshotterService);
 
         final NotificationService<As400Partition, As400OffsetContext> notificationService = new NotificationService<>(getNotificationChannels(),
                 connectorConfig, SchemaFactory.get(), dispatcher::enqueueNotification);

@@ -29,6 +29,7 @@ import io.debezium.ibmi.db2.journal.retrieve.RetrievalState;
 import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalFilterException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.JournalReceiverNotFoundException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
+import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.source.spi.ChangeEventSource.ChangeEventSourceContext;
 import io.debezium.relational.TableId;
@@ -98,7 +99,7 @@ class As400StreamingChangeEventSourceRecoveryTest {
         @SuppressWarnings("unchecked")
         final EventDispatcher<As400Partition, TableId> dispatcher = mock(EventDispatcher.class);
         return new As400StreamingChangeEventSource(config, dataConnection, jdbcConnection, dispatcher,
-                Clock.SYSTEM, mock(As400DatabaseSchema.class));
+                mock(ErrorHandler.class), Clock.SYSTEM, mock(As400DatabaseSchema.class));
     }
 
     private void execute(As400StreamingChangeEventSource source, int iterations) throws InterruptedException {
