@@ -66,14 +66,16 @@ If running natively import the cert
 
 ## Journals deleted
 
-If the journal is deleted *while streaming* it logs an error ("Lost journal at position xxx") and resets to the earliest available journal receiver.
-
-### Stored offset no longer available at startup
+### Journal position no longer available
 
 If the connector has been down longer than the source keeps its journal receivers, its committed offset
 points at a receiver that has since been pruned/rotated. On restart the connector cannot resolve that
 position. This is a **non-transient** condition — the receiver will never come back — so retrying the
 engine only delays an inevitable failure.
+
+The same thing happens *while streaming*, e.g. when the journal or its receivers are deleted under a
+running connector. Both cases apply the same recovery strategy; earlier versions silently reset
+streaming to the earliest available receiver instead, which lost data without failing.
 
 Two things are done to keep this from turning into a silent crash-loop:
 
@@ -85,8 +87,15 @@ Two things are done to keep this from turning into a silent crash-loop:
   | value | behaviour |
   | --- | --- |
   | `fail` (default) | Stop with a distinct, non-transient error (marker `IBMI_OFFSET_NO_LONGER_AVAILABLE`) so an orchestrator can reset the offset / trigger a snapshot / alert, rather than retry to death. |
-  | `snapshot` | Reset the offset and let the configured `snapshot.mode` take a fresh snapshot to re-establish table state, then resume streaming from the current journal position. Use with `snapshot.mode=initial`/`always`/`when_needed`. |
+  | `snapshot` | Reset the offset and let the configured `snapshot.mode` take a fresh snapshot to re-establish table state, then resume streaming from the current journal position. Use with `snapshot.mode=initial`/`always`/`when_needed`. A snapshot cannot be started from the streaming thread, so when the position is lost mid-stream the task fails with the same marker and the snapshot is taken by the startup recovery on the next start. |
   | `earliest` | Reset streaming to the earliest available journal receiver and continue. Intended for streaming-only / `no_data` connectors. Changes between the lost position and the earliest available receiver are **unrecoverable** and a loud warning is logged. |
+
+  Mid-stream recovery is bounded: 20 consecutive failed polls fail the task rather than looping forever.
+  A lost connection (`IOException`, or the jt400 driver's `SQLNonTransientConnectionException`) is
+  classified as retriable, so hitting the bound restarts the connector — unlimited by default, see
+  `errors.max.retries` — rather than stopping the task. A position that no longer exists is not retriable
+  and stops the task; to have the engine restart on that too, set `errors.max.retries` together with
+  `custom.retriable.exception=.*IBMI_OFFSET_NO_LONGER_AVAILABLE.*`.
 
   Setting `snapshot.mode=when_needed` also triggers Debezium core's own re-snapshot-on-data-error path,
   which is equivalent to `journal.unavailable.position.recovery=snapshot`.

@@ -113,9 +113,7 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
                 .pollInterval(connectorConfig.getPollInterval())
                 .loggingContextSupplier(() -> taskContext.configureLoggingContext(CONTEXT_NAME)).build();
 
-        // pass the previous handler so the retry count survives task restarts and
-        // errors.max.retries can actually cap retriable failures (e.g. a persistent wedge)
-        errorHandler = new ErrorHandler(As400RpcConnector.class, connectorConfig, queue, errorHandler);
+        errorHandler = new As400ErrorHandler(connectorConfig, queue, errorHandler);
 
         final SnapshotterService snapshotterService = connectorConfig.getServiceRegistry().tryGetService(SnapshotterService.class);
 
@@ -192,6 +190,9 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
      * the configured {@link As400ConnectorConfig.UnavailablePositionRecovery} strategy instead of letting
      * Debezium core throw a generic, retried-to-death engine failure. Transient validation failures are
      * left to propagate so the engine restart is a legitimate retry.
+     * <p>
+     * A receiver can also be pruned once streaming is under way; that is handled by the equivalent recovery
+     * in {@code As400StreamingChangeEventSource.applyUnavailablePositionRecovery}.
      */
     private void applyUnavailablePositionRecovery(As400ConnectorConfig connectorConfig, As400RpcConnection rpcConnection,
                                                   Offsets<As400Partition, As400OffsetContext> previousOffsets) {

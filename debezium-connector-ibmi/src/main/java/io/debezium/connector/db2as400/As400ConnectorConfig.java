@@ -183,11 +183,13 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
             .withDisplayName("Recovery strategy when the stored journal position is no longer available")
             .withEnum(UnavailablePositionRecovery.class, UnavailablePositionRecovery.FAIL)
             .withImportance(Importance.MEDIUM)
-            .withDescription("Controls how the connector recovers when its stored journal position points at a receiver "
-                    + "that has been pruned/rotated off the server (typically after downtime longer than the journal "
-                    + "retention). 'fail' (default) stops with a distinct, non-transient error so an orchestrator can "
+            .withDescription("Controls how the connector recovers when the journal position it wants to read is no longer "
+                    + "on the server (typically after downtime longer than the journal retention, or because the journal "
+                    + "or its receivers were deleted while the connector was streaming). "
+                    + "'fail' (default) stops with a distinct, non-transient error so an orchestrator can "
                     + "reset the offset or alert; 'snapshot' resets the offset and lets the configured snapshot.mode take "
-                    + "a fresh snapshot to fill the gap; 'earliest' resets streaming to the earliest available journal "
+                    + "a fresh snapshot to fill the gap (detected while streaming it fails the task so the snapshot runs "
+                    + "on restart); 'earliest' resets streaming to the earliest available journal "
                     + "receiver and continues, logging that changes between the lost position and the earliest receiver "
                     + "are unrecoverable.");
 
@@ -527,8 +529,8 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
     }
 
     /**
-     * Recovery strategy applied at startup when the stored journal position points at a receiver that
-     * is no longer available on the server (pruned/rotated).
+     * Recovery strategy applied when the journal position is no longer available on the server (receiver
+     * pruned, rotated or deleted), both at startup and when it happens while streaming.
      */
     public enum UnavailablePositionRecovery implements EnumeratedValue {
 
@@ -541,7 +543,8 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
 
         /**
          * Reset the offset and let the configured {@code snapshot.mode} take a fresh snapshot to
-         * re-establish table state, then resume streaming from the current journal position.
+         * re-establish table state, then resume streaming from the current journal position. Detected while
+         * streaming, the task is failed instead so the snapshot is taken by the startup recovery on restart.
          */
         SNAPSHOT("snapshot"),
 

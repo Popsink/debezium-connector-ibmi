@@ -33,7 +33,6 @@ import io.debezium.ibmi.db2.journal.retrieve.RetrievalCriteria.JournalCode;
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalCriteria.JournalEntryType;
 import io.debezium.ibmi.db2.journal.retrieve.exception.FatalException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalFilterException;
-import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidPositionException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.RetrieveJournalException;
 import io.debezium.ibmi.db2.journal.retrieve.rjne0200.EntryHeader;
@@ -95,14 +94,11 @@ public class RetrieveJournal {
     public RetrievalState retrieveJournal(JournalProcessedPosition previousPosition) throws Exception {
 
         final Optional<PositionRange> rangeOpt = journalReceivers.findRange(config.as400().connection(), previousPosition);
-        return rangeOpt.map(range -> {
-            try {
-                return retrieveJournal(previousPosition, range);
-            }
-            catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-        }).orElse(RetrievalState.NotCalled);
+        if (rangeOpt.isPresent()) {
+            // don't wrap in a RuntimeException, callers recover from the fatal journal exceptions
+            return retrieveJournal(previousPosition, rangeOpt.get());
+        }
+        return RetrievalState.NotCalled;
     }
 
     public void cancelJob() {
@@ -212,7 +208,9 @@ public class RetrieveJournal {
                             idt, retrievePosition, builder, getFullAS400MessageText(id)));
                 }
                 case "CPF7054": { // e.g. last < first or using offset that doesn't belong to journal
-                    throw new InvalidPositionException(
+                    // the offset we hold is not in this journal, which is what a journal that was deleted and
+                    // recreated under us looks like, so treat it as a lost journal rather than a bad offset
+                    throw new LostJournalException(
                             String.format("Call failed position %s parameters %s failed to find offset or invalid offsets: %s",
                                     retrievePosition, builder, id.getText()));
                 }

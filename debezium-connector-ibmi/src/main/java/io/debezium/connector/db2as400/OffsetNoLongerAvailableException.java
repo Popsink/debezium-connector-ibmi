@@ -8,8 +8,8 @@ package io.debezium.connector.db2as400;
 import io.debezium.DebeziumException;
 
 /**
- * Thrown at startup when the stored journal position points at a receiver that has been pruned on
- * the IBM i and the connector is configured to {@code FAIL} rather than auto-recover.
+ * Thrown at startup, or while streaming, when the journal position points at a receiver that has been
+ * pruned on the IBM i and the connector is configured to {@code FAIL} rather than auto-recover.
  * <p>
  * This is a <em>non-transient</em> condition: retrying the engine will never make the pruned
  * receiver reappear, so an orchestrator must reset the offset (and trigger a snapshot) or alert an
@@ -23,5 +23,9 @@ public class OffsetNoLongerAvailableException extends DebeziumException {
 
     public OffsetNoLongerAvailableException(String message) {
         super(ERROR_CODE + ": " + message);
+    }
+
+    public OffsetNoLongerAvailableException(String message, Throwable cause) {
+        super(ERROR_CODE + ": " + message, cause);
     }
 }

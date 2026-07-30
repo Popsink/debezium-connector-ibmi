@@ -15,7 +15,7 @@ import org.slf4j.LoggerFactory;
 
 import com.ibm.as400.access.AS400;
 
-import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidPositionException;
+import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.DetailedJournalReceiver;
 
 public class ReceiverPagination {
@@ -35,15 +35,10 @@ public class ReceiverPagination {
 
     Optional<PositionRange> findRange(AS400 as400, JournalProcessedPosition startPosition) throws Exception {
         final Optional<DetailedJournalReceiver> endPositionOpt = journalInfoRetrieval.getDelayedDetailedJournalReceiver(as400, journalInfo);
-
-        return endPositionOpt.map(endPosition -> {
-            try {
-                return _findRange(as400, startPosition, endPosition);
-            }
-            catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-        });
+        if (endPositionOpt.isPresent()) {
+            return Optional.ofNullable(_findRange(as400, startPosition, endPositionOpt.get()));
+        }
+        return Optional.empty();
     }
 
     PositionRange _findRange(AS400 as400, JournalProcessedPosition startPosition, DetailedJournalReceiver endPosition) throws Exception {
@@ -54,7 +49,9 @@ public class ReceiverPagination {
             cachedEndPosition = endPosition;
         }
 
-        if (cachedReceivers == null) {
+        if (cachedReceivers == null || fromBeginning) {
+            // the cached list is only refreshed when the attached receiver changes, so starting over would
+            // otherwise resume from a receiver that has since been deleted and lose the journal again
             cachedReceivers = journalInfoRetrieval.getReceivers(as400, journalInfo);
         }
 
@@ -85,7 +82,8 @@ public class ReceiverPagination {
             cachedReceivers = journalInfoRetrieval.getReceivers(as400, journalInfo);
             endOpt = findPosition(startPosition, maxServerSideEntriesBI, cachedReceivers, endPosition);
             if (endOpt.isEmpty()) {
-                throw new InvalidPositionException("unable to find receiver " + startPosition + " in " + cachedReceivers);
+                // our position isn't in the journal's receivers any more, e.g. the receivers were deleted
+                throw new LostJournalException("unable to find receiver " + startPosition + " in " + cachedReceivers);
             }
         }
 

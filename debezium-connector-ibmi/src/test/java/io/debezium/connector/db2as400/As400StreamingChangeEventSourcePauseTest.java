@@ -107,8 +107,8 @@ public class As400StreamingChangeEventSourcePauseTest {
         when(dataConnection.getJournalEntries(any(), any(), any(), any())).thenReturn(RetrievalState.Success);
 
         final EventDispatcher<As400Partition, TableId> dispatcher = mock(EventDispatcher.class);
-        final ErrorHandler errorHandler = mock(ErrorHandler.class);
         final As400DatabaseSchema schema = mock(As400DatabaseSchema.class);
+        final ErrorHandler errorHandler = mock(ErrorHandler.class);
 
         final As400StreamingChangeEventSource source = new As400StreamingChangeEventSource(
                 config, dataConnection, jdbcConnection, dispatcher, errorHandler, Clock.SYSTEM, schema);
