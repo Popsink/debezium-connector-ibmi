@@ -65,6 +65,7 @@ public class RetrieveJournal {
     private EntryHeader entryHeader = null;
     private int offset = -1;
     private JournalProcessedPosition position;
+    private MoreData moreData = null;
     private long totalTransferred = 0;
     private AtomicReference<Job> ibmiJob = new AtomicReference<>();
 
@@ -93,12 +94,81 @@ public class RetrieveJournal {
      */
     public RetrievalState retrieveJournal(JournalProcessedPosition previousPosition) throws Exception {
 
+        final Optional<PositionRange> continuationOpt = continuationRange(moreData, previousPosition);
+        // one hop only: a range we declined, finished or failed on is never reused later
+        moreData = null;
+        if (continuationOpt.isPresent()) {
+            final PositionRange continuation = continuationOpt.get();
+            log.debug("continuing within the previous range {}", continuation);
+            try {
+                return retrieveJournal(previousPosition, continuation);
+            }
+            catch (LostJournalException e) {
+                // a stale range resolves to CPF7053/CPF9801/CPF7054, all of which report as a lost journal and
+                // would cost a re-snapshot: recalculate instead, so a bad guess can never be mistaken for data
+                // loss. Only the speculative refresh at the start of a block is skipped, never the corrective
+                // re-read of the receiver list that findRange does before declaring a position unresolvable
+                // (issue #30). Nothing else is caught: cancelled jobs and connection failures also surface here
+                // and retrying them fights the cancellation, while the streaming loop already recovers from
+                // them by pausing and refetching with a recalculated range
+                log.warn("failed to continue within the previous range {}, recalculating the range", continuation, e);
+            }
+        }
+
         final Optional<PositionRange> rangeOpt = journalReceivers.findRange(config.as400().connection(), previousPosition);
         if (rangeOpt.isPresent()) {
             // don't wrap in a RuntimeException, callers recover from the fatal journal exceptions
             return retrieveJournal(previousPosition, rangeOpt.get());
         }
         return RetrievalState.NotCalled;
+    }
+
+    /** where a call that ran out of buffer said to carry on from, and the end of the range it was given */
+    record MoreData(JournalProcessedPosition continuation, JournalPosition end) {
+    }
+
+    /**
+     * @return what to carry on from when the server left the range unfinished, otherwise null - the range was
+     *         read to its end and where to go next has to be worked out from the journal again
+     */
+    static MoreData moreDataAfter(FirstHeader header, PositionRange range) {
+        if (!header.hasFutureDataAvailable()) {
+            return null;
+        }
+        // copy the continuation, the header is only kept until the next call replaces it
+        return new MoreData(new JournalProcessedPosition(header.nextPosition()), range.end());
+    }
+
+    /**
+     * When a call ends with MORE_DATA_NEW_OFFSET the server stopped filling the buffer before reaching the
+     * end of the range we asked for, so we already know there is more data waiting and where it ends. Reusing
+     * that range lets us carry on downloading without asking the server for the current journal head and the
+     * receiver list again.
+     *
+     * <p>Only valid when we resume from exactly the continuation offset the server handed back, otherwise we
+     * can't tell whether the position is still inside the range. {@code moreData} is cleared on every call and
+     * only re-armed by a call that again ran out of buffer, so a range is reused at most once: anything
+     * unexpected - a failure, or a position moved by recovery - recalculates it.</p>
+     *
+     * @return the remaining part of the previous range, or empty when the range has to be recalculated
+     */
+    static Optional<PositionRange> continuationRange(MoreData moreData, JournalProcessedPosition previousPosition) {
+        if (moreData == null) {
+            return Optional.empty();
+        }
+        if (!previousPosition.equals(moreData.continuation())) {
+            log.debug("position {} is not the continuation offset {}, refreshing the range", previousPosition,
+                    moreData.continuation());
+            return Optional.empty();
+        }
+        final JournalPosition end = moreData.end();
+        if (previousPosition.getReceiver().equals(end.receiver())
+                && previousPosition.getOffset().compareTo(end.offset()) >= 0) {
+            // nothing left in this range - offsets are only comparable within a receiver, when the continuation
+            // is in an earlier receiver of the range there is by definition still data between it and the end
+            return Optional.empty();
+        }
+        return Optional.of(new PositionRange(false, new JournalProcessedPosition(previousPosition), end));
     }
 
     public void cancelJob() {
@@ -131,6 +201,9 @@ public class RetrieveJournal {
         this.offset = -1;
         this.entryHeader = null;
         this.position = new JournalProcessedPosition(previousPosition);
+        // only set again when this call comes back with more data left in the range, so anything going wrong
+        // here means the next call recalculates the range
+        this.moreData = null;
 
         // will return data for both first entry and last entry
         // but call fails if start == end
@@ -183,7 +256,8 @@ public class RetrieveJournal {
             log.debug("retrieve from {} to {} status {}", range.start(), range.end(), success);
             return reThrowIfFatal(previousPosition, spc, end, builder);
         }
-        if (futureDataAvailable()) {
+        moreData = moreDataAfter(header, range);
+        if (moreData != null) {
             return RetrievalState.MoreDataAvailable;
         }
         return RetrievalState.Success;
