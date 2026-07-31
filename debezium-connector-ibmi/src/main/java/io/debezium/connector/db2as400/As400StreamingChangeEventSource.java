@@ -148,12 +148,15 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                                 break;
                             case NotCalled:
                                 metronome.pause();
-                                dispatcher.dispatchHeartbeatEventAlsoToIncrementalSnapshot(partition, offsetContext);
                                 break;
                             default:
                                 metronome.pause();
                                 break;
                         }
+                        // The read position advances for every entry retrieved from the journal.
+                        // Debezium throttles this to heartbeat.interval.ms internally and
+                        // no-ops when heartbeats are disabled, so the per-iteration call is cheap.
+                        dispatcher.dispatchHeartbeatEventAlsoToIncrementalSnapshot(partition, offsetContext);
                         retries = 0;
                     }
                     catch (final InvalidPositionException e) {
