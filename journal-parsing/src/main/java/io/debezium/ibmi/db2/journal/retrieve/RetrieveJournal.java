@@ -177,22 +177,26 @@ public class RetrieveJournal {
             log.debug("No job to cancel");
             return;
         }
+        AS400 killerAs400 = null;
         try {
             AS400 as400 = config.as400().connection();
-            if (job != null) {
-                Job killer; // create a new instance with a new connection as current connection is tied up with this job
-                if (as400 instanceof SecureAS400) {
-                    killer = new Job(new SecureAS400(as400), job.getName(), job.getUser(), job.getNumber());
-                }
-                else {
-                    killer = new Job(new AS400(as400), job.getName(), job.getUser(), job.getNumber());
-                }
-                log.info("Killing job {}/{}/{}", job.getName(), job.getUser(), job.getNumber());
-                killer.end(0);
-            }
+            killerAs400 = (as400 instanceof SecureAS400) ? new SecureAS400(as400) : new AS400(as400);
+            final Job killer = new Job(killerAs400, job.getName(), job.getUser(), job.getNumber());
+            log.info("Killing job {}/{}/{}", job.getName(), job.getUser(), job.getNumber());
+            killer.end(0);
         }
         catch (Exception e) {
             log.error("Failed to cancel job name {} user {} number {}", job.getName(), job.getUser(), job.getNumber(), e);
+        }
+        finally {
+            if (killerAs400 != null) {
+                try {
+                    killerAs400.disconnectAllServices();
+                }
+                catch (Exception e) {
+                    log.warn("Failed to disconnect the job cancellation connection", e);
+                }
+            }
         }
     }
 
