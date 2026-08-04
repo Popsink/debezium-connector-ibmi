@@ -125,6 +125,39 @@ are possible while the connector still reports `live` (issue #27): a requested p
 > Not to be confused with a stale JDBC connection detected mid-snapshot, which is a connection-liveness
 > issue rather than offset/position recovery.
 
+## Tables that cannot be captured
+
+A table listed in `table.include.list` cannot be streamed at all when it does not exist, when it has no
+journal (never `STRJRNPF`'d), or when it is an **SQL view** — a view has no journal of its own and the
+IBM i journal RPC calls only accept physical files. Every case below is logged at **ERROR** level.
+
+**A table that does not exist is always dropped**, whatever `errors.tolerance` is set to, because
+Debezium ignores `table.include.list` entries with no matching table everywhere else (the snapshot
+discovers tables from the catalog).
+
+For a table that *does* exist but has no journal, `errors.tolerance` decides:
+
+| value | behaviour |
+| --- | --- |
+| `none` (default) | Startup fails, so the misconfiguration has to be fixed (or the table removed from the include list) rather than silently never streaming. |
+| `all` | The table is left out of the journal filters; the remaining tables stream as usual. |
+
+Two things stay fatal even with `all`, because they are not "one bad table": tables spanning more than
+one journal (the offset model is single-journal), and an include list where *no* table can be captured —
+an empty filter list would otherwise be read as "no include list", i.e. stream the whole library.
+
+Missing tables and views come from `QSYS2.SYSTABLES` before any RPC call (`TABLE_TYPE = 'V'` is a view);
+an unjournaled table shows up when its journal is resolved. That catalog lookup is deliberately loose —
+long or system name, any case, and `SYSTEM_TABLE_NAME` may come back delimited (`"Vue10002"`) — because a
+miss drops the table. If the lookup itself fails the table is kept, so a catalog hiccup cannot silently
+stop a healthy table from being captured.
+
+Snapshots already skipped both (table discovery asks for `TABLE` only), so this is about the streaming
+side.
+
+> `errors.tolerance` is the same property name and the same `none`/`all` values as Kafka Connect's own,
+> which governs converter/transform/producer errors; the setting is shared and the intent is the same.
+
 ## Memory
 
 Recommended minimum memory 1GB

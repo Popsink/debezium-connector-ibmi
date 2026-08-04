@@ -15,6 +15,7 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.DebeziumException;
 import io.debezium.bean.StandardBeanNames;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
@@ -138,7 +139,13 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
         }
 
         final List<FileFilter> shortIncludes = jdbcConnection.shortIncludes(schema.getSchemaName(),
-                configuredIncludes);
+                configuredIncludes, connectorConfig.skipUncapturableTables());
+        // No filters means "no include list", i.e. read the whole library's journal - which every configured
+        // table having been dropped must not silently turn into.
+        if (!Strings.isNullOrBlank(configuredIncludes) && shortIncludes.isEmpty()) {
+            throw new DebeziumException("none of the included tables exists, there is nothing to capture. Tables "
+                    + "requested: " + configuredIncludes);
+        }
 
         final long cacheWait = JournalInfoRetrieval.getJournalCacheDurationInMilliseconds(jdbcConnection);
 

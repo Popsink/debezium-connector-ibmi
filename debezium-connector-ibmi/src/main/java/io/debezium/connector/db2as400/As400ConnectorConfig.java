@@ -61,6 +61,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
     private final CharSequenceTrimMode charSequenceTrimMode;
     private final SnapshotMode snapshotMode;
     private final UnavailablePositionRecovery unavailablePositionRecovery;
+    private final ErrorsTolerance errorsTolerance;
     private final Configuration config;
     private String incrementalTables = "";
 
@@ -193,6 +194,17 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                     + "receiver and continues, logging that changes between the lost position and the earliest receiver "
                     + "are unrecoverable.");
 
+    /** Shares Kafka Connect's own {@code errors.tolerance}, so it is left out of {@link #configDef()}. */
+    public static final Field ERRORS_TOLERANCE = Field.create("errors.tolerance")
+            .withDisplayName("Tolerance for tables that cannot be captured")
+            .withEnum(ErrorsTolerance.class, ErrorsTolerance.NONE)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("What to do with a table in 'table.include.list' that exists but has no journal, "
+                    + "either because it was never journaled or because it is an SQL view. 'none' (default) fails "
+                    + "startup; 'all' logs it at ERROR level and captures the remaining tables. A table that does "
+                    + "not exist is always dropped, as Debezium ignores include-list entries with no matching table. "
+                    + "Tables spanning more than one journal, or none of them being capturable, always fails.");
+
     public As400ConnectorConfig(Configuration config) {
         // Debezium treats table.include.list as regex (filters + the base snapshot's re-filter via
         // tableIncludeList()), so names with metacharacters like $ are normalized. The journal path
@@ -206,6 +218,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                 TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE.defaultValueAsString());
         this.unavailablePositionRecovery = UnavailablePositionRecovery.parse(
                 config.getString(UNAVAILABLE_POSITION_RECOVERY), UNAVAILABLE_POSITION_RECOVERY.defaultValueAsString());
+        this.errorsTolerance = ErrorsTolerance.parse(config.getString(ERRORS_TOLERANCE), ERRORS_TOLERANCE.defaultValueAsString());
     }
 
     /** The raw {@code table.include.list} as supplied (e.g. {@code PYP31."$SCHAR"}), for the journal path. */
@@ -257,6 +270,14 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
 
     public UnavailablePositionRecovery getUnavailablePositionRecovery() {
         return unavailablePositionRecovery;
+    }
+
+    /**
+     * Whether an included table that exists but has no journal should be skipped with a loud ERROR instead
+     * of failing startup. A table that does not exist is dropped regardless.
+     */
+    public boolean skipUncapturableTables() {
+        return errorsTolerance == ErrorsTolerance.ALL;
     }
 
     @Override
@@ -405,7 +426,8 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
             RelationalDatabaseConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE, SOCKET_TIMEOUT,
             MAX_SERVER_SIDE_ENTRIES, TOPIC_NAMING_STRATEGY, FROM_CCSID, TO_CCSID, SECURE,
             DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
-            UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT);
+            UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
+            ERRORS_TOLERANCE);
 
     public static ConfigDef configDef() {
         final ConfigDef c = RelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
@@ -585,6 +607,49 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                 mode = parse(defaultValue);
             }
             return mode;
+        }
+    }
+
+    /**
+     * How much of the include list the connector insists on being able to capture before it starts. The
+     * default is strict: a configured table that silently never streams is worse than a visible failure.
+     */
+    public enum ErrorsTolerance implements EnumeratedValue {
+
+        NONE("none"),
+
+        ALL("all");
+
+        private final String value;
+
+        ErrorsTolerance(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        public static ErrorsTolerance parse(String value) {
+            if (value == null) {
+                return null;
+            }
+            value = value.trim();
+            for (final ErrorsTolerance option : ErrorsTolerance.values()) {
+                if (option.getValue().equalsIgnoreCase(value)) {
+                    return option;
+                }
+            }
+            return null;
+        }
+
+        public static ErrorsTolerance parse(String value, String defaultValue) {
+            ErrorsTolerance tolerance = parse(value);
+            if (tolerance == null && defaultValue != null) {
+                tolerance = parse(defaultValue);
+            }
+            return tolerance;
         }
     }
 
