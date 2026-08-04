@@ -46,7 +46,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
     private static final String NO_TRANSACTION_ID = "00000000000000000000";
     private long connectionTime = -1;
     private final long MIN_DISCONNECT_TIME_MS = 30000;
-    private static final int TRANSACTION_MAP_WARN_SIZE = 500_000;
+    private static final int TRANSACTION_MAP_WARN_SIZE = 50_000;
     private static final int MAX_RETRIES = 20;
 
     private static final Logger log = LoggerFactory.getLogger(As400StreamingChangeEventSource.class);
@@ -73,7 +73,6 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
     private final Map<String, TransactionContext> txMap = new HashMap<>();
     private final Map<String, List<As400ChangeRecord>> bufferRecordMap = new HashMap<>();
     private final String database;
-    private final boolean trackTransactions;
     private As400OffsetContext offsetContext;
 
     public As400StreamingChangeEventSource(As400ConnectorConfig connectorConfig, As400RpcConnection dataConnection,
@@ -88,7 +87,6 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
         this.schema = schema;
         this.pollInterval = connectorConfig.getPollInterval();
         this.database = jdbcConnection.getRealDatabaseName();
-        this.trackTransactions = connectorConfig.isTransactionMgmtEnabled();
     }
 
     @Override
@@ -322,10 +320,8 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         final TransactionContext txc = new TransactionContext();
                         txc.beginTransaction(txId);
                         offsetContext.setTransaction(txc);
-                        if (trackTransactions) {
-                            txMap.put(txId, txc);
-                            warnIfTransactionMapsOversized();
-                        }
+                        txMap.put(txId, txc);
+                        warnIfOversized();
                         log.debug("start transaction id {} tx {} table {}", nextOffset, txId, tableId);
                         if (connectorConfig.isTransactionMgmtEnabled()) {
                             startTransaction(txId);
@@ -538,16 +534,12 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
         bufferRecordMap.put(txId, bufferList);
     }
 
-    /**
-     * Both maps are keyed by commit cycle and populated together on START_COMMIT, so checking the smaller
-     * one is enough. Logged on each further multiple of the limit rather than on every insert.
-     */
-    private void warnIfTransactionMapsOversized() {
-        final int tracked = txMap.size();
-        if (tracked >= TRANSACTION_MAP_WARN_SIZE && tracked % TRANSACTION_MAP_WARN_SIZE == 0) {
+    private void warnIfOversized() {
+        final int txMapSize = txMap.size();
+        if (txMapSize >= TRANSACTION_MAP_WARN_SIZE && txMapSize % TRANSACTION_MAP_WARN_SIZE == 0) {
             log.warn("tracking {} in-flight transactions ({} of them buffering events) - commit cycles are being "
                     + "retained without a matching commit or rollback entry and will consume heap until the task restarts",
-                    tracked, bufferRecordMap.size());
+                    txMapSize, bufferRecordMap.size());
         }
     }
 
