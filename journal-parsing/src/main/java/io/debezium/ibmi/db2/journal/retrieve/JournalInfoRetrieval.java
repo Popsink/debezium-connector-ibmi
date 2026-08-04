@@ -222,7 +222,10 @@ public class JournalInfoRetrieval {
             }
             catch (final Exception e) {
                 if (!skipUncapturable) {
-                    throw new IllegalStateException("unable to retrieve journal details", e);
+                    throw new IllegalStateException(String.format(
+                            "unable to retrieve journal details for %s.%s - set errors.tolerance=all to skip it and "
+                                    + "capture the remaining tables",
+                            f.schema(), f.table()), e);
                 }
                 log.error("errors.tolerance=all: dropping {}.{} from the journal filters, it has no journal - "
                         + "nothing will be captured for it", f.schema(), f.table(), e);

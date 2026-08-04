@@ -68,8 +68,9 @@ class JournalInfoRetrievalGetJournalTest {
                 () -> retrieval.resolveJournal(as400, "LIB1",
                         List.of(new FileFilter("LIB1", "T1"), new FileFilter("LIB1", "VIEW1")), false));
 
-        // Then startup fails rather than silently never streaming that table
+        // Then startup fails rather than silently never streaming that table, naming the offending table
         assertTrue(ex.getMessage().contains("unable to retrieve journal details"), ex.getMessage());
+        assertTrue(ex.getMessage().contains("LIB1.VIEW1"), ex.getMessage());
     }
 
     @Test
