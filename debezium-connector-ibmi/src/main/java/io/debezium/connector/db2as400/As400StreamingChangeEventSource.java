@@ -43,6 +43,8 @@ import io.debezium.util.Metronome;
  * </p>
  */
 public class As400StreamingChangeEventSource implements StreamingChangeEventSource<As400Partition, As400OffsetContext> {
+
+    private static final int TRANSACTION_MAP_WARN_SIZE = 50_000;
     private static final int MAX_RETRIES = 20;
 
     private static final Logger log = LoggerFactory.getLogger(As400StreamingChangeEventSource.class);
@@ -151,6 +153,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                                 break;
                             case NotCalled:
                                 metronome.pause();
+                                dispatcher.dispatchHeartbeatEventAlsoToIncrementalSnapshot(partition, offsetContext);
                                 break;
                             default:
                                 metronome.pause();
@@ -316,6 +319,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         txc.beginTransaction(txId);
                         offsetContext.setTransaction(txc);
                         txMap.put(txId, txc);
+                        warnIfOversized();
                         log.debug("start transaction id {} tx {} table {}", nextOffset, txId, tableId);
                         if (connectorConfig.isTransactionMgmtEnabled()) {
                             startTransaction(txId);
@@ -526,6 +530,15 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
     private void startTransaction(String txId) {
         List<As400ChangeRecord> bufferList = new ArrayList<>();
         bufferRecordMap.put(txId, bufferList);
+    }
+
+    private void warnIfOversized() {
+        final int txMapSize = txMap.size();
+        if (txMapSize >= TRANSACTION_MAP_WARN_SIZE && txMapSize % TRANSACTION_MAP_WARN_SIZE == 0) {
+            log.warn("tracking {} in-flight transactions ({} of them buffering events) - commit cycles are being "
+                    + "retained without a matching commit or rollback entry and will consume heap until the task restarts",
+                    txMapSize, bufferRecordMap.size());
+        }
     }
 
     private boolean ignore(JournalEntryType journalCode) {

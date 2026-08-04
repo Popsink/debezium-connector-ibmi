@@ -253,11 +253,13 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
     protected void doStop() {
         if (rpcConnection != null) {
             rpcConnection.close();
+            rpcConnection = null;
         }
 
         try {
             if (jdbcConnection != null) {
                 jdbcConnection.close();
+                jdbcConnection = null;
             }
         }
         catch (final SQLException e) {
@@ -266,6 +268,7 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
 
         if (schema != null) {
             schema.close();
+            schema = null;
         }
     }
 
