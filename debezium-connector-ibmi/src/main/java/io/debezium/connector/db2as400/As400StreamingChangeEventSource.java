@@ -153,7 +153,6 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                                 break;
                             case NotCalled:
                                 metronome.pause();
-                                dispatcher.dispatchHeartbeatEventAlsoToIncrementalSnapshot(partition, offsetContext);
                                 break;
                             default:
                                 metronome.pause();

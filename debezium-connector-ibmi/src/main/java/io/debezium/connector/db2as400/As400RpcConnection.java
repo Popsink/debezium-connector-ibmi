@@ -28,6 +28,7 @@ import io.debezium.ibmi.db2.journal.retrieve.Connect;
 import io.debezium.ibmi.db2.journal.retrieve.FileFilter;
 import io.debezium.ibmi.db2.journal.retrieve.JournalInfo;
 import io.debezium.ibmi.db2.journal.retrieve.JournalInfoRetrieval;
+import io.debezium.ibmi.db2.journal.retrieve.JournalInfoRetrieval.ResolvedJournal;
 import io.debezium.ibmi.db2.journal.retrieve.JournalPosition;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalState;
@@ -69,7 +70,9 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
         this.textFactory = createTextFactory();
         this.journalInfoRetrieval = new JournalInfoRetrieval(textFactory, cacheWait, config.cacheAdditionalDelay(), config.getPollInterval().toMillis());
         try {
-            journalInfo = journalInfoRetrieval.getJournal(connection(), config.getSchema(), includes);
+            final ResolvedJournal resolved = journalInfoRetrieval.resolveJournal(connection(), config.getSchema(),
+                    includes, config.skipUncapturableTables());
+            journalInfo = resolved.journalInfo();
 
             boolean transactionMgt = config.isTransactionMgmtEnabled();
 
@@ -79,7 +82,7 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
                     .withJournalInfo(journalInfo)
                     .withMaxServerSideEntries(config.getMaxServerSideEntries())
                     .withServerFiltering(!transactionMgt)
-                    .withIncludeFiles(includes).withDumpFolder(config.diagnosticsFolder())
+                    .withIncludeFiles(resolved.includes()).withDumpFolder(config.diagnosticsFolder())
                     .build();
             retrieveJournal = new RetrieveJournal(rconfig, journalInfoRetrieval);
         }

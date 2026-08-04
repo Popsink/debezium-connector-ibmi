@@ -191,19 +191,42 @@ public class JournalInfoRetrieval {
      *         than one journal
      */
     public JournalInfo getJournal(AS400 as400, String schema, List<FileFilter> includes) throws IllegalStateException {
+        return resolveJournal(as400, schema, includes, false).journalInfo();
+    }
+
+    /** The journal shared by the included tables, and the filters that resolved to it. */
+    public record ResolvedJournal(JournalInfo journalInfo, List<FileFilter> includes) {
+    }
+
+    /**
+     * Resolve the journal shared by all included tables, as {@link #getJournal(AS400, String, List)}, but
+     * optionally tolerating tables that have no journal.
+     *
+     * @param skipUncapturable when true ({@code errors.tolerance=all}) a table whose journal cannot be
+     *        retrieved is logged at ERROR level and left out of the returned filters instead of failing;
+     *        the multi-journal case and an include list where nothing resolves stay fatal either way
+     */
+    public ResolvedJournal resolveJournal(AS400 as400, String schema, List<FileFilter> includes, boolean skipUncapturable)
+            throws IllegalStateException {
         if (includes.isEmpty()) {
-            return getJournal(as400, schema);
+            return new ResolvedJournal(getJournal(as400, schema), includes);
         }
         final Set<JournalInfo> jis = new HashSet<>();
         final Set<String> libraries = new TreeSet<>();
-        try {
-            for (final FileFilter f : includes) {
-                libraries.add(f.schema());
+        final List<FileFilter> journaled = new ArrayList<>();
+        for (final FileFilter f : includes) {
+            libraries.add(f.schema());
+            try {
                 jis.add(getJournal(as400, f.schema(), f.table()));
+                journaled.add(f);
             }
-        }
-        catch (final Exception e) {
-            throw new IllegalStateException("unable to retrieve journal details", e);
+            catch (final Exception e) {
+                if (!skipUncapturable) {
+                    throw new IllegalStateException("unable to retrieve journal details", e);
+                }
+                log.error("errors.tolerance=all: dropping {}.{} from the journal filters, it has no journal - "
+                        + "nothing will be captured for it", f.schema(), f.table(), e);
+            }
         }
         if (jis.size() > 1) {
             throw new IllegalStateException(String.format(
@@ -212,7 +235,12 @@ public class JournalInfoRetrieval {
                             + "distinct journals found: %s",
                     libraries, jis));
         }
-        return jis.iterator().next();
+        if (jis.isEmpty()) {
+            throw new IllegalStateException(String.format(
+                    "none of the included tables has a journal, there is nothing to capture. Libraries requested: %s",
+                    libraries));
+        }
+        return new ResolvedJournal(jis.iterator().next(), journaled);
     }
 
     public JournalInfo getJournal(AS400 as400, String schema, String table) throws Exception {

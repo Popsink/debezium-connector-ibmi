@@ -56,6 +56,17 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
     private static final String GET_ALL_SYSTEM_TABLE_NAME = "select trim(system_table_name), trim(table_name) from qsys2.systables where system_table_schema=?";
 
     private static final String GET_TABLE_NAME = "select trim(table_name) from qsys2.systables where system_table_schema=? AND system_table_name=?";
+    /**
+     * Deliberately the loosest of the catalog lookups here, because a miss drops the table: the include list
+     * may name a table by its long or its system name, in any case (the journal RPC calls upper-case it
+     * anyway), and {@code SYSTEM_TABLE_NAME} comes back delimited - {@code "Vue10002"} - when it is not an
+     * ordinary identifier.
+     */
+    private static final String GET_TABLE_TYPE = """
+            select trim(table_type) from qsys2.systables
+            where upper(system_table_schema)=upper(?)
+            AND (upper(table_name)=upper(?) OR upper(replace(system_table_name, '"', ''))=upper(?))
+            """;
     private static final String GET_INDEXES = """
             SELECT c.column_name FROM qsys.QADBKATR k
                   INNER JOIN qsys2.SYSCOLUMNS c on c.table_schema=k.dbklib and c.system_table_name=k.dbkfil AND c.system_column_name=k.DBKFLD
@@ -113,7 +124,17 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
         return this.connectionString(URL_PATTERN);
     }
 
-    public List<FileFilter> shortIncludes(String schema, String includes) {
+    /**
+     * Translate {@code table.include.list} into the journal's raw schema.table filters.
+     *
+     * <p>An entry that does not exist is dropped whatever {@code errors.tolerance} says, because Debezium
+     * ignores include-list entries with no matching table everywhere else; the journal path must not be the
+     * one component that refuses to start over it.</p>
+     *
+     * @param skipUncapturable when true ({@code errors.tolerance=all}) an SQL view is dropped too; when
+     *        false it is passed through and fails later, when its journal is resolved
+     */
+    public List<FileFilter> shortIncludes(String schema, String includes, boolean skipUncapturable) {
         if (includes == null || includes.isBlank()) {
             return Collections.<FileFilter> emptyList();
         }
@@ -141,9 +162,59 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
 
             final String tableSchema = schemaName;
             // AS400 does not handle double-quote escaping, so remove them before building FileFilter object
-            getSystemName(tableSchema, tableName.replaceAll("\"", "")).map(x -> r.add(new FileFilter(tableSchema, x)));
+            final String bareTableName = tableName.replaceAll("\"", "");
+            final IncludedObject included = classify(tableSchema, bareTableName);
+            if (included == IncludedObject.MISSING) {
+                log.error("dropping {}.{} from the journal filters, no such table - nothing will be captured for it",
+                        tableSchema, bareTableName);
+                continue;
+            }
+            if (included == IncludedObject.VIEW && skipUncapturable) {
+                log.error("errors.tolerance=all: dropping SQL view {}.{} from the journal filters, a view has no "
+                        + "journal of its own - nothing will be captured for it", tableSchema, bareTableName);
+                continue;
+            }
+            getSystemName(tableSchema, bareTableName).map(x -> r.add(new FileFilter(tableSchema, x)));
         }
         return r;
+    }
+
+    /** What the SQL catalog says about an entry of {@code table.include.list}. */
+    private enum IncludedObject {
+        CAPTURABLE,
+        VIEW,
+        MISSING
+    }
+
+    /**
+     * Classify an included table from the SQL catalog. A failure of the lookup itself counts as
+     * {@link IncludedObject#CAPTURABLE}, so a catalog hiccup cannot drop a table that is perfectly fine.
+     */
+    private IncludedObject classify(String schemaName, String tableName) {
+        final String tableType;
+        try {
+            tableType = getTableType(schemaName, tableName);
+        }
+        catch (final SQLException e) {
+            log.error("failed to look up the type of {}.{}, keeping it in the journal filters", schemaName, tableName, e);
+            return IncludedObject.CAPTURABLE;
+        }
+        if (tableType == null) {
+            return IncludedObject.MISSING;
+        }
+        return "V".equals(tableType) ? IncludedObject.VIEW : IncludedObject.CAPTURABLE;
+    }
+
+    /** The {@code TABLE_TYPE} of a table named by its long or system name, null when there is no such object. */
+    String getTableType(String schemaName, String tableName) throws SQLException {
+        return prepareQueryAndMap(GET_TABLE_TYPE,
+                call -> {
+                    call.setString(1, schemaName);
+                    call.setString(2, tableName);
+                    call.setString(3, tableName);
+                },
+                singleResultMapper(rs -> rs.getString(1).trim(), (String) null,
+                        String.format("no entry in qsys2.systables for %s.%s", schemaName, tableName)));
     }
 
     public String getRealDatabaseName() {
