@@ -43,9 +43,7 @@ import io.debezium.util.Metronome;
  * </p>
  */
 public class As400StreamingChangeEventSource implements StreamingChangeEventSource<As400Partition, As400OffsetContext> {
-    private static final String NO_TRANSACTION_ID = "00000000000000000000";
-    private long connectionTime = -1;
-    private final long MIN_DISCONNECT_TIME_MS = 30000;
+
     private static final int TRANSACTION_MAP_WARN_SIZE = 50_000;
     private static final int MAX_RETRIES = 20;
 
