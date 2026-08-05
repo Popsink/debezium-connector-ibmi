@@ -16,6 +16,7 @@ import java.time.Instant;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.Optional;
+import java.util.TimeZone;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.slf4j.Logger;
@@ -72,11 +73,23 @@ public class RetrieveJournal {
     public RetrieveJournal(RetrieveConfig config, JournalInfoRetrieval journalRetrieval) {
         this.config = config;
         firstHeaderDecoder = new FirstHeaderDecoder(config.textFactory());
-        entryHeaderDecoder = new EntryHeaderDecoder(config.textFactory());
+        entryHeaderDecoder = new EntryHeaderDecoder(config.textFactory(), systemTimeZone(config));
         builder = new ParameterListBuilder(config.textFactory());
         journalReceivers = new ReceiverPagination(journalRetrieval, config.maxServerSideEntries(), config.journalInfo());
 
         builder.withJournal(config.journalInfo().journalName(), config.journalInfo().journalLibrary());
+    }
+
+    // the *DTS journal entry timestamp is decoded assuming GMT even though the IBM i TOD clock is set to the
+    // system's local time; the correction needs the real system time zone, falling back to no correction if unreachable
+    private static TimeZone systemTimeZone(RetrieveConfig config) {
+        try {
+            return config.as400().connection().getTimeZone();
+        }
+        catch (final Exception e) {
+            log.error("failed to fetch AS400 system time zone, journal entry timestamps may be off by a fixed offset", e);
+            return TimeZone.getTimeZone("GMT");
+        }
     }
 
     /**

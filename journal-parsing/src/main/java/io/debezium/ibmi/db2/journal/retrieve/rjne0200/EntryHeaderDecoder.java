@@ -10,6 +10,7 @@ import java.lang.reflect.Method;
 import java.math.BigInteger;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.TimeZone;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,13 +33,17 @@ public class EntryHeaderDecoder {
     private final AS400Structure structure;
     private final XaTransactionDecoder txDecoder;
     private final ReceiverNameDecoder nameDecoder;
+    private final TimeZone systemTimeZone;
     private static String[] EMPTY = { "", "" };
     private static final Logger log = LoggerFactory.getLogger(EntryHeaderDecoder.class);
 
-    public EntryHeaderDecoder(As400TextFactory textFactory) {
+    public EntryHeaderDecoder(As400TextFactory textFactory, TimeZone systemTimeZone) {
         txDecoder = new XaTransactionDecoder(textFactory);
         nameDecoder = new ReceiverNameDecoder(textFactory);
+        this.systemTimeZone = systemTimeZone;
         ArrayList<AS400DataType> dataTypes = new ArrayList<AS400DataType>();
+        // *DTS values are decoded by jt400 assuming GMT, but the underlying IBM i TOD clock is set to
+        // the system's local wall-clock time
         AS400Timestamp timeType = new AS400Timestamp();
 
         try {
@@ -136,10 +141,18 @@ public class EntryHeaderDecoder {
                     "Offsets too big for data, these are used as offsets into the buffer the data is in, they should never be this big nextEntryOffset " + nextEntryOffset
                             + ", nullEntryOffset " + nullEntryOffset);
         }
-        Instant time = (timestamp == null) ? Instant.ofEpochSecond(0) : timestamp.toInstant();
+        Instant time = toCorrectedInstant(timestamp);
         return new EntryHeader(nextEntryOffset.intValue(), nullEntryOffset.intValue(), entrySpecificDataOffset, sequenceNumber, systemSequenceNumber,
                 time, journalCode, entryType, objectName, commitCycle, endOffset, pointerHandle, receiver[0], receiver[1], relativeRecordNumber);
 
+    }
+
+    private Instant toCorrectedInstant(java.sql.Timestamp timestamp) {
+        if (timestamp == null) {
+            return Instant.ofEpochSecond(0);
+        }
+        final Instant raw = timestamp.toInstant();
+        return raw.minusMillis(systemTimeZone.getOffset(raw.toEpochMilli()));
     }
 
 }
