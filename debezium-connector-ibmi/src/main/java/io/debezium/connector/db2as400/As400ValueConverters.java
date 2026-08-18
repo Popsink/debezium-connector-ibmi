@@ -5,13 +5,18 @@
  */
 package io.debezium.connector.db2as400;
 
+import java.sql.Blob;
+import java.sql.Clob;
+import java.sql.SQLException;
 import java.sql.SQLXML;
+import java.sql.Types;
 import java.time.ZoneOffset;
 
 import org.apache.kafka.connect.data.Field;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.config.CommonConnectorConfig.BinaryHandlingMode;
 import io.debezium.jdbc.JdbcValueConverters;
 import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.relational.Column;
@@ -23,6 +28,7 @@ import io.debezium.relational.Column;
 public class As400ValueConverters extends JdbcValueConverters {
     private static final Logger log = LoggerFactory.getLogger(As400ValueConverters.class);
     private final As400ConnectorConfig config;
+    private static final byte[] EMPTY_BYTES = new byte[0];
 
     public As400ValueConverters(DecimalMode decimalMode, As400ConnectorConfig config) {
         super(decimalMode, TemporalPrecisionMode.ADAPTIVE, ZoneOffset.UTC, null, null, null);
@@ -34,7 +40,16 @@ public class As400ValueConverters extends JdbcValueConverters {
         if (data == null) {
             return super.convertString(column, fieldDefn, data);
         }
-        if (!(data instanceof SQLXML)) {
+        if (data instanceof final Clob clob) {
+            // snapshots read CLOB columns over JDBC, where jt400 hands back a Clob; the base converter
+            // would deliver its toString(), i.e. the object's identity. Streaming has no Clob to
+            // materialise, the journal decoder produces the text itself.
+            data = materialise(column, clob);
+        }
+        // an xml column is left alone, which is what trim.non.xml.charsequence.field.mode says. A
+        // snapshot reads it as a SQLXML, but the journal decoder produces the document as a String, so
+        // the column's own type is what decides - not the class of the value
+        if (!(data instanceof SQLXML) && !isXml(column)) {
             String str = data.toString();
             Pair fixed = removeBadCharacters(str);
             if (fixed.modified) {
@@ -45,6 +60,58 @@ public class As400ValueConverters extends JdbcValueConverters {
             return super.convertString(column, fieldDefn, config.getCharSequenceTrimMode().strip(fixed.value));
         }
         return super.convertString(column, fieldDefn, data);
+    }
+
+    private static boolean isXml(Column column) {
+        return column != null && column.jdbcType() == Types.SQLXML;
+    }
+
+    @Override
+    protected Object convertBinary(Column column, Field fieldDefn, Object data, BinaryHandlingMode mode) {
+        if (data instanceof final Blob blob) {
+            // as for CLOB columns above: a snapshot reads a Blob, which the base converter only reports
+            // as an unexpected type. Streaming decodes the bytes out of the journal itself.
+            data = materialise(column, blob);
+        }
+        return super.convertBinary(column, fieldDefn, data, mode);
+    }
+
+    /**
+     * Reads a BLOB into bytes, or leaves the value alone if it cannot be read - the base converter then
+     * reports the type it could not handle, rather than this failing the whole snapshot.
+     */
+    private static Object materialise(Column column, Blob blob) {
+        try {
+            final long length = blob.length();
+            if (length > Integer.MAX_VALUE) {
+                log.error("blob column {} is {} bytes, too long to read into an array", column.name(), length);
+                return blob;
+            }
+            return (length == 0) ? EMPTY_BYTES : blob.getBytes(1, (int) length);
+        }
+        catch (final SQLException e) {
+            log.error("failed to read blob column {}", column.name(), e);
+            return blob;
+        }
+    }
+
+    /**
+     * Reads a CLOB into a String, or leaves the value alone if it cannot be read - the base converter
+     * then reports the type it could not handle, rather than this failing the whole snapshot.
+     */
+    private static Object materialise(Column column, Clob clob) {
+        try {
+            final long length = clob.length();
+            if (length > Integer.MAX_VALUE) {
+                log.error("clob column {} is {} characters, too long to read into a string", column.name(), length);
+                return clob;
+            }
+            return (length == 0) ? "" : clob.getSubString(1, (int) length);
+        }
+        catch (final SQLException e) {
+            log.error("failed to read clob column {}", column.name(), e);
+            return clob;
+        }
     }
 
     public static Pair removeBadCharacters(String rawString) {

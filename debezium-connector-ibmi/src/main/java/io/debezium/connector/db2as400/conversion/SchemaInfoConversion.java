@@ -56,8 +56,13 @@ public class SchemaInfoConversion {
         TableId id = table.id();
         List<AS400DataType> as400structure = new ArrayList<>();
         if (table != null && table.columns() != null) {
+            // the columns are in record order, so their widths so far are the offset of the next one -
+            // which a lob column needs to know to work out its own width
+            int recordOffset = 0;
             for (Column c : table.columns()) {
-                AS400DataType as400dt = fileDecoder.toDataType(id.schema(), id.table(), c.name(), c.typeName(), c.length(), c.scale().orElse(0));
+                AS400DataType as400dt = fileDecoder.toDataType(id.schema(), id.table(), c.name(), c.typeName(), c.length(), c.scale().orElse(0),
+                        recordOffset);
+                recordOffset += as400dt.getByteLength();
                 as400structure.add(as400dt);
             }
         }

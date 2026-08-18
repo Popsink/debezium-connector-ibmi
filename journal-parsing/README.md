@@ -126,7 +126,72 @@ Can only decode the journal data if the table structure is currently the same
 [Unable to decode table structure changes](https://ibm-power-systems.ideas.ibm.com/ideas/IBMI-I-3211) as they are not documented D.CG or table creation D.CT
 however we can detect what table changed
 
-Currently unable to capture clob/blob/xml the memory pointer supplied is not accessible with the current mechanism to fetch the journal data
+## Large objects
+
+CLOB, DBCLOB, BLOB and XML columns all work the same way.
+
+A journal entry never carries the data of a lob column. The record image holds a descriptor instead -
+alignment padding, a byte of system information, the 4 byte length of the data, 8 reserved bytes and a
+16 byte pointer to it - the data itself living in the journal receiver. The padding is whatever puts
+the pointer on a 16 byte boundary, so the column occupies `padding + 29` bytes and how many depends on
+where in the record it starts. That pointer
+[cannot be passed to another job, nor stored to use later](https://www.ibm.com/docs/en/i/7.5?topic=entries-working-pointers-journal),
+and can only be dereferenced by ILE code running in the job that called `QjoRetrieveJournalEntries`,
+so it is of no use to us.
+
+`AS400Lob` therefore decodes the descriptor only, which is what keeps the columns after a lob column
+reading at the right offset, and the data itself is fetched by re-reading the entry with
+`QSYS2.DISPLAY_JOURNAL` (`JournalLobFetcher`): that runs on the IBM i, in the job that owns the
+pointers, so it resolves them and appends the lob data after the record image, one segment per lob
+column separated by 16 `Q` bytes (`x'D8'`), a separator being written even for a column that is null
+or empty. Verified against a live journal: for `(ID INT, HEAD CHAR(5), BODY CLOB(1M), TAIL CHAR(2))`
+the record image is 50 bytes with `BODY` padded by 10 so its pointer lands on 32, and an update's
+before image carries the value as it was, which re-reading the row could not give.
+
+A blob's segment is used as it is; the others are decoded through the column's own CCSID, which for an
+XML column is usually 1208 (UTF-8) rather than the EBCDIC of the rest of the record.
+
+Three details of the layout are not what the documentation says, and each one cost a wrong decode until
+a live entry showed it:
+
+* the byte in front of the length is documented as `x'00'`, but a column holding double byte text
+  carries `x'01'` there - it describes the data rather than being reserved, so it cannot be used to
+  recognise a descriptor
+* the length counts in whatever unit the column's length is declared in, so it needs scaling by
+  `character_octet_length / length` to give bytes: a no-op for a CLOB or for XML (an XML column in CCSID
+  1208 reported 41 for a 40 character document with one two byte character), 2 for the graphic and
+  Unicode CCSIDs of a DBCLOB (11 characters for 22 bytes of data)
+* the driver reports a DBCLOB whose CCSID is a Unicode one as **`NCLOB`**, not `DBCLOB`, so both names
+  have to be recognised or the table fails with `Unsupported type`
+
+## Pointer handles are counted, not deleted one at a time
+
+An entry whose data is only reachable through a pointer - one for a file with a lob column, or one
+whose entry specific data runs past 32766 bytes - also carries a pointer handle owning that
+allocation. We never follow the pointer, but the allocation still has to be released: the API doc is
+explicit that "if the handles are not deleted, the maximum number allowed can be reached, which will
+prevent further retrieval of journal entries".
+
+`QjoDeletePointerHandle` takes one handle per call, so returning them individually costs a round trip
+per entry - 31 ms over a wide area link, 31 seconds for a thousand entry buffer, and paid even when
+the lob data is never read. The same doc offers the bulk alternative: "the pointer handles will be
+implicitly deleted when the process that requested the journal entries is ended". So `PointerHandles`
+only counts them, and the connector replaces its connection once the budget is spent, so that the next
+retrieve runs in a different host server job and the old one's handles go with it. That costs about
+1.1 seconds including authentication - 0.02 ms an entry at the default threshold, against 31 ms an
+entry for deleting them one by one.
+
+Note it has to be the connection object, not just its service. QZRCSRVS are prestart jobs:
+`disconnectService` returns one to a pool and the same object reconnects straight back into it with
+the handles intact, where a new object lands on a different job with a fresh handle space. Nothing is
+cancelled or ended on the system either way.
+
+The budget resets when a retrieve reports a different job rather than when the disconnect is issued.
+The job also ends for reasons the connector never initiates - the watchdog cancelling a hung retrieve,
+a dropped connection reconnecting - and deriving the reset from the job identity covers all of them,
+while leaving a disconnect that did not take effect visible as handles that keep accumulating.
+`JournalLobIT` checks that recycling really does yield a different job: QZRCSRVS are prestart jobs, so
+the same one coming back would mean nothing was freed.
 
 
 When the library is pointing to the wrong journal, it can be fixed with:

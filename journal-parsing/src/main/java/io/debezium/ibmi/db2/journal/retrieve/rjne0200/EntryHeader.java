@@ -138,6 +138,17 @@ public class EntryHeader {
         return nullValueOffest;
     }
 
+    /**
+     * @return the handle owning this entry's pointer to data held outside the entry, or 0 when it has
+     *         none. Non-zero also means the entry's table has a lob column, which is what the decoder
+     *         uses to tell that there is lob data to read back. The allocation behind it lives until
+     *         the job ends, so it is counted rather than released one at a time - see
+     *         {@link io.debezium.ibmi.db2.journal.retrieve.PointerHandles}
+     */
+    public long getPointerHandle() {
+        return pointerHandle;
+    }
+
     public boolean hasReceiver() {
         return !receiver.isEmpty();
     }

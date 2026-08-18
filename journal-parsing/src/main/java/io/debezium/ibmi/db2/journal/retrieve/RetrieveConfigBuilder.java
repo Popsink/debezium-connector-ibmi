@@ -30,6 +30,7 @@ public class RetrieveConfigBuilder {
     private JournalCode[] filterCodes = new JournalCode[]{};
     private List<FileFilter> includeFiles = Collections.<FileFilter> emptyList();
     private int maxServerSideEntries = RetrieveConfig.DEFAULT_MAX_SERVER_SIDE_ENTRIES;
+    private long pointerHandleThreshold = PointerHandles.DEFAULT_THRESHOLD;
     private boolean filtering;
 
     public RetrieveConfigBuilder() {
@@ -105,6 +106,14 @@ public class RetrieveConfigBuilder {
         return this;
     }
 
+    /** How many pointer handles may accumulate before the connection is replaced to free them. */
+    public RetrieveConfigBuilder withPointerHandleThreshold(Long pointerHandleThreshold) {
+        if (pointerHandleThreshold != null && pointerHandleThreshold.longValue() > 0) {
+            this.pointerHandleThreshold = pointerHandleThreshold.longValue();
+        }
+        return this;
+    }
+
     public RetrieveConfigBuilder withMaxServerSideEntries(Integer maxServerSideEntries) {
         if (maxServerSideEntries != null) {
             this.maxServerSideEntries = maxServerSideEntries.intValue();
@@ -113,6 +122,7 @@ public class RetrieveConfigBuilder {
     }
 
     public RetrieveConfig build() {
-        return new RetrieveConfig(as400, textFactory, journalInfo, journalBufferSize, filtering, filterCodes, includeFiles, maxServerSideEntries, dumpFolder);
+        return new RetrieveConfig(as400, textFactory, journalInfo, journalBufferSize, filtering, filterCodes, includeFiles, maxServerSideEntries, dumpFolder,
+                pointerHandleThreshold);
     }
 }
