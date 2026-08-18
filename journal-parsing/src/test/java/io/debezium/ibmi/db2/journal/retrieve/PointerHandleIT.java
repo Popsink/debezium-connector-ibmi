@@ -128,8 +128,8 @@ class PointerHandleIT {
         rj.retrieveJournal(position);
         final Duration retrieveTook = Duration.between(retrieveStart, Instant.now());
 
-        // the walk decodes locally and deletes one handle per entry over the wire, so its cost is the
-        // deletes: what a connector pays on top of the single retrieve above
+        // the walk only decodes locally, so its cost is what a connector pays on top of the single
+        // retrieve above - the handles are given back by cycling the job, not per entry
         final List<Long> handles = new ArrayList<>();
         int ours = 0;
         final Instant walkStart = Instant.now();
@@ -150,56 +150,17 @@ class PointerHandleIT {
         log.info("entries for {}.{}: {}, of which pointer bearing: {}", schema, TABLE, ours, handles.size());
         log.info("distinct handle values: {}", distinct.size());
         log.info("handles: {}", handles);
-        log.info("failures reported by PointerHandles: {}", rj.pointerHandleFailures());
+        log.info("handles counted by PointerHandles: {}", rj.pointerHandles().outstanding());
         log.info("one retrieveJournal call: {} ms", retrieveTook.toMillis());
-        log.info("walking {} entries (one delete each): {} ms, {} ms per entry", ours, walkTook.toMillis(),
+        log.info("walking {} entries: {} ms, {} ms per entry", ours, walkTook.toMillis(),
                 ours == 0 ? 0 : walkTook.toMillis() / (double) ours);
-        log.info("extrapolated to a 1000 entry buffer: {} ms of deletes",
-                handles.isEmpty() ? 0 : walkTook.toMillis() * 1000 / handles.size());
 
         final int seen = ours;
         assertTrue(seen >= ROWS, () -> "expected at least the " + ROWS + " inserts, got " + seen);
         assertEquals(seen, handles.size(),
                 "every entry of a table with a lob column should carry a pointer handle");
-        assertEquals(0, rj.pointerHandleFailures(), "every handle should have been given back cleanly");
         assertEquals(handles.size(), distinct.size(),
                 "handles repeat within one retrieve - the deletes can be deduped to one per distinct handle");
-    }
-
-    /**
-     * What makes a repeated handle detectable rather than silent: the API rejects a handle it has already
-     * freed, so a shared handle would be showing up in {@code pointerHandleFailures} today. Deleting one
-     * the retrieve above has already given back must be counted as a failure.
-     */
-    @Test
-    void deletingAHandleTwiceIsReportedAsAFailure() throws Exception {
-        final JournalInfoRetrieval journalInfoRetrieval = new JournalInfoRetrieval(textFactory, 0, 0, 1000);
-        final JournalInfo journal = journalInfoRetrieval.getJournal(as400Connect.connection(), schema, TABLE);
-        final JournalPosition current = journalInfoRetrieval.getCurrentPosition(as400Connect.connection(), journal);
-        final JournalProcessedPosition position = new JournalProcessedPosition(current, Instant.now(), true);
-
-        insert(ROWS + 1);
-
-        final RetrieveConfig config = new RetrieveConfigBuilder().withAs400(as400Connect)
-                .withTextFactory(textFactory)
-                .withJournalInfo(journal)
-                .build();
-        final RetrieveJournal rj = new RetrieveJournal(config, journalInfoRetrieval);
-        rj.retrieveJournal(position);
-
-        long handle = 0;
-        while (rj.nextEntry() && handle == 0) {
-            if (TABLE.equals(rj.getEntryHeader().getFile().trim())) {
-                handle = rj.getEntryHeader().getPointerHandle();
-            }
-        }
-        assertTrue(handle != 0, "no pointer bearing entry to re-delete");
-
-        // the retrieve has already given this one back, so asking again must be refused
-        final PointerHandles handles = new PointerHandles(as400Connect);
-        handles.delete(handle);
-        log.info("re-deleting handle {} reported {} failure(s)", handle, handles.failures());
-        assertEquals(1, handles.failures(), "deleting an already deleted handle should be reported");
     }
 
     /**
