@@ -31,6 +31,7 @@ import io.debezium.ibmi.db2.journal.retrieve.JournalInfoRetrieval;
 import io.debezium.ibmi.db2.journal.retrieve.JournalInfoRetrieval.ResolvedJournal;
 import io.debezium.ibmi.db2.journal.retrieve.JournalPosition;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
+import io.debezium.ibmi.db2.journal.retrieve.PointerHandles;
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalState;
 import io.debezium.ibmi.db2.journal.retrieve.RetrieveConfig;
 import io.debezium.ibmi.db2.journal.retrieve.RetrieveConfigBuilder;
@@ -83,6 +84,7 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
                     .withMaxServerSideEntries(config.getMaxServerSideEntries())
                     .withServerFiltering(!transactionMgt)
                     .withIncludeFiles(resolved.includes()).withDumpFolder(config.diagnosticsFolder())
+                    .withPointerHandleThreshold(config.getPointerHandleThreshold())
                     .build();
             retrieveJournal = new RetrieveJournal(rconfig, journalInfoRetrieval);
         }
@@ -104,19 +106,30 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
 
     @Override
     public void close() {
+        if (as400 != null) {
+            log.info("Disconnecting");
+            if (retrieveJournal != null) {
+                // only meaningful while a retrieve is in flight; between polls there is nothing to cancel
+                retrieveJournal.cancelJob();
+            }
+        }
+        dropConnection();
+    }
+
+    /**
+     * Gives up the connection object. {@link #connection()} builds a fresh one the next time it is
+     * asked, which is what lands us on a different host server job - see
+     * {@link #freePointerHandlesIfDue()}.
+     */
+    private void dropConnection() {
         try {
             if (as400 != null) {
-                log.info("Disconnecting");
-                if (retrieveJournal != null) {
-                    retrieveJournal.cancelJob();
-                }
                 this.as400.disconnectAllServices();
             }
         }
         catch (final Exception e) {
             log.debug("Problem closing connection", e);
         }
-
         this.as400 = null;
     }
 
@@ -200,6 +213,11 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
         return as400;
     }
 
+    /** Empty when the journal could not be resolved at startup. */
+    public Optional<JournalInfo> getJournalInfo() {
+        return Optional.ofNullable(journalInfo);
+    }
+
     public JournalPosition getCurrentPosition() throws RpcException {
         try {
             final JournalPosition position = journalInfoRetrieval.getCurrentPosition(connection(), journalInfo);
@@ -243,12 +261,56 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
                 offsetCtx.setPosition(retrieveJournal.getPosition());
 
             }
+            // between polls, with the batch dispatched and the position committed: the only safe moment
+            // to swap the connection, which a retrieve in flight would be using
+            freePointerHandlesIfDue();
             return state;
         }
         catch (LostJournalException e) {
             // this is bad, we've probably lost data; the caller applies the configured recovery strategy
             logLostJournal(position);
             throw e;
+        }
+    }
+
+    /**
+     * Frees the pointer handles the retrieves have accumulated, by replacing the connection so that the
+     * next retrieve runs in a different host server job.
+     *
+     * <p>
+     * Entries of a table with a LOB column each come back owning an allocation that is only released
+     * when the handle is deleted or the job ends. Deleting them individually costs a round trip an
+     * entry - 31 ms measured over a wide area link, so 31 seconds for a thousand entry buffer, paid
+     * even when the LOB data is never read. Landing on a new job frees all of them at once, for about
+     * 1.1 seconds including authentication - 0.02 ms an entry at the default threshold.
+     * </p>
+     *
+     * <p>
+     * {@link #connection()} re-establishes everything transparently; only the journal retrieve API's
+     * own job-scoped state is affected, and it keeps none across calls.
+     * </p>
+     */
+    private void freePointerHandlesIfDue() {
+        final PointerHandles handles = retrieveJournal.pointerHandles();
+        if (!handles.shouldCycle()) {
+            return;
+        }
+        try {
+            log.info("freeing {} outstanding journal pointer handles by replacing the connection",
+                    handles.outstanding());
+            // dropping the AS400 object, not just disconnecting its service. QZRCSRVS are prestart
+            // jobs: disconnecting returns one to a pool and the same object reconnects straight back
+            // into it, handles intact, where a new object lands on a different job with a fresh handle
+            // space. connection() builds one the next time it is asked.
+            dropConnection();
+            // the budget clears itself once a retrieve reports a different job, so a recycle that did
+            // not take effect shows up as handles that keep accumulating rather than a count silently
+            // zeroed on an assumption
+        }
+        catch (final Exception e) {
+            // not fatal: the handles stay outstanding and the next poll tries again. It only becomes a
+            // problem if it keeps failing all the way to the API's own maximum.
+            log.warn("could not replace the connection to free {} pointer handles", handles.outstanding(), e);
         }
     }
 

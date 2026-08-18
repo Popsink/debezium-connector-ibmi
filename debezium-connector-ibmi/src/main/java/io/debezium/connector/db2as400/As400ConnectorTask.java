@@ -30,6 +30,7 @@ import io.debezium.connector.db2as400.metrics.As400StreamingChangeEventSourceMet
 import io.debezium.document.DocumentReader;
 import io.debezium.ibmi.db2.journal.retrieve.FileFilter;
 import io.debezium.ibmi.db2.journal.retrieve.JournalInfoRetrieval;
+import io.debezium.ibmi.db2.journal.retrieve.JournalLobFetcher;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.jdbc.DefaultMainConnectionProvidingConnectionFactory;
 import io.debezium.jdbc.MainConnectionProvidingConnectionFactory;
@@ -151,6 +152,19 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
 
         this.rpcConnection = new As400RpcConnection(connectorConfig, streamingMetrics,
                 shortIncludes, cacheWait);
+
+        // the journal is only resolved once the rpc connection is up, and lob data can only be read
+        // back out of the journal it was written to
+        if (connectorConfig.isLobFetchEnabled()) {
+            rpcConnection.getJournalInfo().ifPresentOrElse(
+                    journalInfo -> schema.getFileDecoder()
+                            .setLobFetcher(new JournalLobFetcher(jdbcConnection, journalInfo)),
+                    // without this the only clue is the decoder's own warning, which points at the
+                    // lob.fetch setting - the one thing that is not the problem here
+                    () -> LOGGER.warn("lob.fetch is enabled but the journal could not be resolved, so lob "
+                            + "columns will stream as null. The lob.fetch setting is not the cause; see "
+                            + "the earlier failure to resolve the journal for {}", connectorConfig.getSchema()));
+        }
 
         // Detect and recover from a stored position whose receiver has been pruned, before Debezium
         // core turns an unavailable position into a generic crash-loop.

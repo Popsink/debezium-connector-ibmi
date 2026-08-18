@@ -12,10 +12,13 @@ import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -35,10 +38,11 @@ import com.ibm.as400.access.AS400Timestamp;
 import com.ibm.as400.access.AS400ZonedDecimal;
 
 import io.debezium.ibmi.db2.journal.data.types.AS400Boolean;
+import io.debezium.ibmi.db2.journal.data.types.AS400Lob;
 import io.debezium.ibmi.db2.journal.data.types.AS400VarBin;
 import io.debezium.ibmi.db2.journal.data.types.AS400VarChar;
-import io.debezium.ibmi.db2.journal.data.types.AS400Xml;
 import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
+import io.debezium.ibmi.db2.journal.retrieve.JournalLobFetcher.LobSegment;
 import io.debezium.ibmi.db2.journal.retrieve.SchemaCacheIF.Structure;
 import io.debezium.ibmi.db2.journal.retrieve.SchemaCacheIF.TableInfo;
 import io.debezium.ibmi.db2.journal.retrieve.rjne0200.EntryHeader;
@@ -48,7 +52,6 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
     private final AS400Float8 as400Float8 = new AS400Float8();
     private final AS400Float4 as400Float4 = new AS400Float4();
     private final AS400Timestamp as400Timestamp = new AS400Timestamp();
-    private final AS400Xml as400Xml = new AS400Xml();
     private final AS400Bin8 as400Bin8 = new AS400Bin8();
     private final AS400Bin4 as400Bin4 = new AS400Bin4();
     private final AS400Bin2 as400Bin2 = new AS400Bin2();
@@ -67,6 +70,13 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
     private final BytesPerChar octetLengthCache;
     private final DateTimeFormatCache dateTimeFormatCache;
     private final As400TextFactory textFactory;
+    /** Only known once the journal has been resolved, and null when lob fetching is turned off. */
+    private JournalLobFetcher lobFetcher;
+    /** Both hold the tables already logged about, so a per-entry problem is reported once, not per row. */
+    private final Set<String> lobsUnfetchedLogged = ConcurrentHashMap.newKeySet();
+    private final Set<String> recordLengthLogged = ConcurrentHashMap.newKeySet();
+    private final Set<String> lobSplitLogged = ConcurrentHashMap.newKeySet();
+    private final Set<String> descriptorLogged = ConcurrentHashMap.newKeySet();
 
     public JdbcFileDecoder(Connect<Connection, SQLException> con, String database, SchemaCacheIF schemaCache,
                            As400TextFactory textFactory, int fromCcsid, int toCcsid) {
@@ -81,6 +91,14 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
         dateTimeFormatCache = new DateTimeFormatCache(con);
     }
 
+    /**
+     * Sets how LOB columns are read. The journal entry only carries a pointer to the LOB data that
+     * cannot be followed from here, so without a fetcher LOB columns decode as null.
+     */
+    public void setLobFetcher(JournalLobFetcher lobFetcher) {
+        this.lobFetcher = lobFetcher;
+    }
+
     /*
      * https://www.ibm.com/support/knowledgecenter/ssw_ibm_i_74/apis/QJORJRNE.htm
      * This journal entry's entry specific data Offset Type Field Dec Hex 0 0
@@ -89,6 +107,7 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
      */
     private final AS400Text lengthDecoder;
     private static final Object[] EMPTY = new Object[]{};
+    private static final byte[] EMPTY_BYTES = new byte[0];
 
     @Override
     public Object[] decodeFile(EntryHeader entryHeader, byte[] data, int offset, boolean[] isNull) throws Exception {
@@ -99,8 +118,13 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
                     offset + entryHeader.getEntrySpecificDataOffset());
             final int length = Integer.parseInt(lengthStr);
             if (length > 0) {
+                final List<LobField> lobFields = new ArrayList<>();
                 final Object[] os = decodeEntry(tableInfo.getAs400Structure(), data,
-                        offset + entryHeader.getEntrySpecificDataOffset() + ENTRY_SPECIFIC_DATA_OFFSET, isNull);
+                        offset + entryHeader.getEntrySpecificDataOffset() + ENTRY_SPECIFIC_DATA_OFFSET, isNull,
+                        lobFields);
+                if (!lobFields.isEmpty()) {
+                    resolveLobs(entryHeader, tableInfo, os, lobFields, length);
+                }
                 return os;
             }
             else {
@@ -120,18 +144,175 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
      * which would otherwise throw and abort the whole record.
      */
     public Object[] decodeEntry(AS400Structure entryDetailStructure, byte[] data, int offset, boolean[] isNull) {
+        return decodeEntry(entryDetailStructure, data, offset, isNull, new ArrayList<>());
+    }
+
+    /**
+     * @param lobFields collects the LOB columns found, in column order, for
+     *                  {@link #resolveLobs} to fill in - their value is never in the record image
+     */
+    public Object[] decodeEntry(AS400Structure entryDetailStructure, byte[] data, int offset, boolean[] isNull,
+                                List<LobField> lobFields) {
         final AS400DataType[] members = entryDetailStructure.getMembers();
         final Object[] result = new Object[members.length];
         int fieldOffset = offset;
         for (int i = 0; i < members.length; i++) {
             final AS400DataType member = members[i];
             final boolean fieldIsNull = isNull != null && i < isNull.length && isNull[i];
-            if (!fieldIsNull) {
+            if (member instanceof final AS400Lob lob) {
+                if (lob.getRecordOffset() != fieldOffset - offset) {
+                    // its width was worked out from that offset, so everything after it is now adrift.
+                    // Detail only: the format is the same for every entry of the table, and resolveLobs
+                    // reports the mismatch once for it.
+                    log.debug("lob column {} was built for record offset {} but is being read at {}, the record "
+                            + "format does not match the journal entry", i, lob.getRecordOffset(), fieldOffset - offset);
+                }
+                // a null column's descriptor holds no length, and reading one is pointless anyway
+                final int dataLength = fieldIsNull ? AS400Lob.UNKNOWN_LENGTH : lob.dataLength(data, fieldOffset);
+                lobFields.add(new LobField(i, lob, fieldIsNull, dataLength));
+            }
+            else if (!fieldIsNull) {
                 result[i] = member.toObject(data, fieldOffset);
             }
             fieldOffset += member.getByteLength();
         }
         return result;
+    }
+
+    /**
+     * A LOB column of a decoded record, whose value has still to be fetched.
+     *
+     * @param dataLength what its descriptor says it holds, or {@link AS400Lob#UNKNOWN_LENGTH} when that
+     *                   could not be read - as it never is for a null column
+     */
+    public record LobField(int index, AS400Lob lob, boolean isNull, int dataLength) {
+
+        boolean isKnown() {
+            return dataLength != AS400Lob.UNKNOWN_LENGTH;
+        }
+
+        boolean isEmpty() {
+            return dataLength == 0;
+        }
+
+        /** Bytes this column contributes to the data appended to the journal entry. */
+        int appendedByteLength() {
+            return (isNull || !isKnown()) ? 0 : lob.byteLengthOf(dataLength);
+        }
+    }
+
+    /**
+     * Fills in the LOB columns of a decoded record. A null LOB stays null and an empty one needs no
+     * fetching; anything else is re-read from the journal, which is the only place the data can be had
+     * from - see {@link JournalLobFetcher}. Without a fetcher configured, or when the fetch fails, the
+     * column is left null rather than guessed at.
+     *
+     * @param recordLength the entry's own length of its record image, which is where the lob data the
+     *                     fetcher returns is appended
+     */
+    private void resolveLobs(EntryHeader entryHeader, TableInfo tableInfo, Object[] result, List<LobField> lobFields,
+                             int recordLength) {
+        // the driver's own total, which is the sum of the column widths - no alignment between them
+        final int formatLength = tableInfo.getAs400Structure().getByteLength();
+        if (formatLength != recordLength && firstTimeFor(recordLengthLogged, entryHeader)) {
+            // the entry says how long its record image is; the columns adding up to something else means
+            // the format is out of step with it, and the values decoded from it are suspect
+            log.warn("the record format of {}.{} is {} bytes but the journal entry's record image is {}",
+                    entryHeader.getLibrary(), entryHeader.getFile(), formatLength, recordLength);
+        }
+
+        // check every descriptor before setting anything: the appended segments are sized from the
+        // descriptors, so one that could not be read makes every segment after it guesswork. Bailing out
+        // half way through the assignment below would leave the columns before the bad one filled in and
+        // the ones after it null, which is an ordering accident rather than a decision.
+        for (final LobField lobField : lobFields) {
+            if (!lobField.isNull() && !lobField.isKnown()) {
+                // the descriptor is where it is because of the record format, so this fails the same way
+                // for every entry of the table - reported once rather than once a row
+                if (firstTimeFor(descriptorLogged, entryHeader)) {
+                    log.error("unreadable lob descriptor for column {} of {}.{}, so its lob columns will "
+                            + "stream as null. Turn on debug for AS400Lob to see what was read where",
+                            columnName(tableInfo, lobField.index()), entryHeader.getLibrary(),
+                            entryHeader.getFile());
+                }
+                return;
+            }
+        }
+
+        boolean anyToFetch = false;
+        for (final LobField lobField : lobFields) {
+            if (lobField.isNull()) {
+                continue;
+            }
+            // an empty lob is empty according to its own descriptor, so it needs nothing fetched
+            if (lobField.isEmpty()) {
+                result[lobField.index()] = lobField.lob().isBinary() ? EMPTY_BYTES : "";
+            }
+            else {
+                anyToFetch = true;
+            }
+        }
+        if (!anyToFetch) {
+            return;
+        }
+        if (lobFetcher == null) {
+            logLobsUnfetched(entryHeader);
+            return;
+        }
+
+        final int[] byteLengths = lobFields.stream().mapToInt(LobField::appendedByteLength).toArray();
+        lobFetcher.entryData(entryHeader)
+                .ifPresent(entryData -> {
+                    final List<LobSegment> segments = JournalLobFetcher.splitLobs(entryData, recordLength, byteLengths);
+                    if (segments.isEmpty() && firstTimeFor(lobSplitLogged, entryHeader)) {
+                        // a misread descriptor is a property of the record format, so it fails for every
+                        // entry of the table; reported once rather than once a row. Turn on debug for
+                        // JournalLobFetcher to see which segment and which lengths did not fit.
+                        log.error("the lob data of {}.{} could not be split into its columns, so they will "
+                                + "stream as null. The record format is out of step with the journal "
+                                + "entry - see the record length warning for this table",
+                                entryHeader.getLibrary(), entryHeader.getFile());
+                    }
+                    for (int i = 0; i < segments.size(); i++) {
+                        final LobField lobField = lobFields.get(i);
+                        if (!lobField.isNull() && !lobField.isEmpty()) {
+                            result[lobField.index()] = decodeLob(lobField.lob(), entryData, segments.get(i));
+                        }
+                    }
+                });
+    }
+
+    /**
+     * A blob's data is bytes; everything else is text in the column's own CCSID. Both read the segment
+     * straight out of the entry data - only a blob has to copy, because its value is handed on as the
+     * array itself and must not keep the whole entry, lob columns and all, reachable behind it.
+     */
+    Object decodeLob(AS400Lob lob, byte[] entryData, LobSegment segment) {
+        final int offset = segment.offset();
+        final int length = segment.length();
+        if (lob.isBinary()) {
+            return Arrays.copyOfRange(entryData, offset, offset + length);
+        }
+        if (length == 0) {
+            return "";
+        }
+        return textFactory.text(length, lob.getCcsid()).toObject(entryData, offset);
+    }
+
+    private static String columnName(TableInfo tableInfo, int index) {
+        final List<Structure> structure = tableInfo.getStructure();
+        return (index < structure.size()) ? structure.get(index).getName() : String.valueOf(index);
+    }
+
+    private void logLobsUnfetched(EntryHeader entryHeader) {
+        if (firstTimeFor(lobsUnfetchedLogged, entryHeader)) {
+            log.warn("lob data is not being fetched, the lob columns of {}.{} will be null - see the {} setting",
+                    entryHeader.getLibrary(), entryHeader.getFile(), "lob.fetch");
+        }
+    }
+
+    private static boolean firstTimeFor(Set<String> logged, EntryHeader entryHeader) {
+        return logged.add(String.format("%s.%s", entryHeader.getLibrary(), entryHeader.getFile()));
     }
 
     public static String getDatabaseName(Connection con) throws SQLException {
@@ -176,6 +357,7 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
             final String databaseCatalog = null;
             final List<AS400DataType> as400structure = new ArrayList<>();
             final List<Structure> jdbcStructure = new ArrayList<>();
+            int recordOffset = 0;
 
             final Connection con = jdbcConnect.connection();
             final DatabaseMetaData metadata = con.getMetaData();
@@ -197,7 +379,11 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
                     jdbcStructure
                             .add(new Structure(name, type, jdcbType, length, precision, optional,
                                     position, autoInc));
-                    final AS400DataType dataType = toDataType(schema, longTableName, name, type, length, precision);
+                    // the columns are read in record order, so their widths so far are the offset of the
+                    // next one - which a lob column needs to know to work out its own width
+                    final AS400DataType dataType = toDataType(schema, longTableName, name, type, length, precision,
+                            recordOffset);
+                    recordOffset += dataType.getByteLength();
 
                     as400structure.add(dataType);
                     octetLengthCache.add(schema, longTableName, name, length, octectLength);
@@ -315,6 +501,15 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
 
     public AS400DataType toDataType(String schema, String table, String columnName, String type, int length,
                                     Integer precision) {
+        return toDataType(schema, table, columnName, type, length, precision, 0);
+    }
+
+    /**
+     * @param recordOffset the widths of the columns in front of this one, needed only by LOB columns:
+     *                     their own width depends on where they start, see {@link AS400Lob}
+     */
+    public AS400DataType toDataType(String schema, String table, String columnName, String type, int length,
+                                    Integer precision, int recordOffset) {
         switch (type) {
             case "BOOLEAN":
                 return as400Boolean;
@@ -372,10 +567,15 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
                 return new AS400ByteArray(length);
             case "VARBINARY":
                 return new AS400VarBin(length);
+            case "CLOB":
+            case "DBCLOB":
+                // a dbclob whose ccsid is a Unicode one is reported as an nclob
+            case "NCLOB":
+            case "BLOB":
             case "XML":
-                return as400Xml;
-            // case "CLOB":
-            // return new AS400Clob(as400);
+                // the record image holds a descriptor, never the data itself - see AS400Lob
+                return new AS400Lob(type, ccsidOrUnknown(ccsidCache.getCcsid(schema, table, columnName)),
+                        octetLengthCache.getBytesPerChar(schema, table, columnName), recordOffset);
             default:
                 final Optional<Integer> varLength = bitDataLengthFromRegex(type, length, VAR_BIT_DATA);
                 if (varLength.isPresent()) {

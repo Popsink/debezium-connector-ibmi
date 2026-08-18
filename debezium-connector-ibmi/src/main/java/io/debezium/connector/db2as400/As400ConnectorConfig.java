@@ -27,6 +27,7 @@ import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
 import io.debezium.connector.SourceInfoStructMaker;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
+import io.debezium.ibmi.db2.journal.retrieve.PointerHandles;
 import io.debezium.ibmi.db2.journal.retrieve.RetrieveConfig;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.relational.ColumnFilterMode;
@@ -162,6 +163,33 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
             "handle commit/rollback lifecycle",
             "event submission is delayed until a commit or rollback event. This requires relaxing a filter in AS400 RMI call, it may increase the load on the connector",
             DEFAULT_TRANSACTION_MGMT_ENABLED);
+
+    public static final boolean DEFAULT_LOB_FETCH = false;
+
+    public static final Field LOB_FETCH = Field.create("lob.fetch",
+            "fetch the data of lob columns",
+            "A journal entry carries no CLOB, DBCLOB, BLOB or XML data, only a pointer into the journal "
+                    + "receiver that can only be followed on the IBM i itself, so the values are read back with "
+                    + "QSYS2.DISPLAY_JOURNAL. Entries are fetched a run at a time rather than one by one, so the "
+                    + "first lob entry of a batch pays for the ones behind it. Turn this off to skip the reads "
+                    + "entirely, in which case lob columns stream as null, no extra query is made at all, and "
+                    + "every other column of the table is unaffected. Snapshots read lob columns over JDBC "
+                    + "either way.",
+            DEFAULT_LOB_FETCH);
+
+    public static final long DEFAULT_POINTER_HANDLE_THRESHOLD = PointerHandles.DEFAULT_THRESHOLD;
+
+    public static final Field POINTER_HANDLE_THRESHOLD = Field.create("journal.pointer.handle.threshold",
+            "pointer handles held before the connection is replaced",
+            "Every journal entry of a table with a lob column comes back owning an allocation on the IBM i "
+                    + "that is only released when the handle is deleted or the job that made the request ends. "
+                    + "Deleting them one at a time costs a round trip per entry; instead they are counted and "
+                    + "freed together once this many have accumulated by replacing the connection, so that the "
+                    + "next retrieve runs in a different host server job. Nothing is cancelled or ended on "
+                    + "the system: the connection is simply re-established, transparently. Lower it on a "
+                    + "system with a constrained job storage limit, raise it to replace the connection less "
+                    + "often.",
+            DEFAULT_POINTER_HANDLE_THRESHOLD);
 
     public static final Field TOPIC_NAMING_STRATEGY = Field.create("topic.naming.strategy")
             .withDisplayName("Topic naming strategy class")
@@ -389,6 +417,14 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
         return config.getBoolean(TRANSACTION_MGMT_ENABLED);
     }
 
+    public boolean isLobFetchEnabled() {
+        return config.getBoolean(LOB_FETCH);
+    }
+
+    public Long getPointerHandleThreshold() {
+        return config.getLong(POINTER_HANDLE_THRESHOLD);
+    }
+
     public JournalProcessedPosition getOffset() {
         final String receiver = config.getString(As400OffsetContext.RECEIVER);
         final String lib = config.getString(As400OffsetContext.RECEIVER_LIBRARY);
@@ -427,7 +463,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
             MAX_SERVER_SIDE_ENTRIES, TOPIC_NAMING_STRATEGY, FROM_CCSID, TO_CCSID, SECURE,
             DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
             UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
-            ERRORS_TOLERANCE);
+            ERRORS_TOLERANCE, LOB_FETCH, POINTER_HANDLE_THRESHOLD);
 
     public static ConfigDef configDef() {
         final ConfigDef c = RelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
@@ -436,7 +472,9 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                         HOSTNAME, USER, PASSWORD, SCHEMA, BUFFER_SIZE,
                         SOCKET_TIMEOUT, FROM_CCSID, TO_CCSID, SECURE,
                         DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
-                        UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT)
+                        UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
+                        LOB_FETCH,
+                        POINTER_HANDLE_THRESHOLD)
                 .connector(
                         SCHEMA_NAME_ADJUSTMENT_MODE)
                 .events(

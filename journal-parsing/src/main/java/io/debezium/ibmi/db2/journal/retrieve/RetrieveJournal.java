@@ -59,6 +59,7 @@ public class RetrieveJournal {
     private final SimpleDateFormat dateFormatter = new SimpleDateFormat("yyMMdd-hhmm");
     private final ReceiverPagination journalReceivers;
     private final ParameterListBuilder builder;
+    private final PointerHandles pointerHandles;
 
     RetrieveConfig config;
     private byte[] outputData = null;
@@ -75,6 +76,7 @@ public class RetrieveJournal {
         firstHeaderDecoder = new FirstHeaderDecoder(config.textFactory());
         entryHeaderDecoder = new EntryHeaderDecoder(config.textFactory(), systemTimeZone(config));
         builder = new ParameterListBuilder(config.textFactory());
+        pointerHandles = new PointerHandles(config.pointerHandleThreshold());
         journalReceivers = new ReceiverPagination(journalRetrieval, config.maxServerSideEntries(), config.journalInfo());
 
         builder.withJournal(config.journalInfo().journalName(), config.journalInfo().journalLibrary());
@@ -252,7 +254,12 @@ public class RetrieveJournal {
         spc.setProcedureName("QjoRetrieveJournalEntries");
         spc.setAlignOn16Bytes(true);
         spc.setReturnValueFormat(ServiceProgramCall.RETURN_INTEGER);
-        ibmiJob.set(spc.getServerJob()); // capture so we can asynchronously cancel it
+        final Job serverJob = spc.getServerJob();
+        ibmiJob.set(serverJob); // capture so we can asynchronously cancel it
+        // handles belong to this job; if it is not the one that allocated the outstanding ones they
+        // died with their own job and the budget starts again
+        pointerHandles.observeJob(serverJob == null ? null
+                : serverJob.getName() + '/' + serverJob.getUser() + '/' + serverJob.getNumber());
         boolean success;
         try {
             success = spc.run();
@@ -381,7 +388,7 @@ public class RetrieveJournal {
         if (offset < 0) {
             if (header.size() > 0) {
                 offset = header.offset();
-                entryHeader = entryHeaderDecoder.decode(outputData, offset);
+                entryHeader = decodeEntryHeader(offset);
                 if (alreadyProcessed(position, entryHeader)) {
                     log.debug("skipping already seen entry {} {}", position, entryHeader);
                     return nextEntry();
@@ -397,7 +404,7 @@ public class RetrieveJournal {
             final long nextOffset = entryHeader.getNextEntryOffset();
             if (nextOffset > 0) {
                 offset += (int) nextOffset;
-                entryHeader = entryHeaderDecoder.decode(outputData, offset);
+                entryHeader = decodeEntryHeader(offset);
                 updatePosition(position, entryHeader);
                 return true;
             }
@@ -405,6 +412,23 @@ public class RetrieveJournal {
             updateOffsetFromContinuation();
             return false;
         }
+    }
+
+    /**
+     * Decodes an entry header and notes any pointer handle it came with. The entry's data is already
+     * copied into our own buffer and the lob data behind the pointer is read back separately, so the
+     * handle itself is of no further use - but the allocation behind it lives until the job ends, so
+     * it is counted towards the budget that decides when to end it. See {@link PointerHandles}.
+     */
+    private EntryHeader decodeEntryHeader(int atOffset) {
+        final EntryHeader decoded = entryHeaderDecoder.decode(outputData, atOffset);
+        pointerHandles.record(decoded.getPointerHandle());
+        return decoded;
+    }
+
+    /** The pointer handle budget, which the caller drains between polls by replacing the connection. */
+    public PointerHandles pointerHandles() {
+        return pointerHandles;
     }
 
     private void updateOffsetFromContinuation() {

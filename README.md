@@ -46,7 +46,19 @@ REPLICATION_FACTOR=3
 * TODO integrate with exit program to prevent journal loss https://github.com/jhc-systems/debezium-ibmi-exitpgm
 * Limited support for table changes - the journal entries for table changes are not documented so rely on fetching table structure at runtime and refetching when table change detected
 * No support for remote journals and fail over
-* No support for clobs/xml and similar large text/blobs
+* CLOB, DBCLOB, BLOB and XML columns are captured, but a journal entry carries no lob data - only a
+  pointer into the journal receiver that can only be followed on the IBM i itself - so the values are
+  read back with `QSYS2.DISPLAY_JOURNAL`. Entries are read a run at a time, so the first lob entry of
+  a batch pays for the ones behind it rather than each costing a query of its own. Set
+  `lob.fetch=false` to skip the reads entirely: lob columns then stream as null, no extra query is
+  made, and the rest of the table is unaffected.
+* Every journal entry of a table with a lob column also arrives owning a pointer handle on the IBM i,
+  whether or not the lob data is read. Handles are only released when the job that requested them
+  ends, and returning them individually would cost a round trip per entry, so they are counted and
+  freed together once `journal.pointer.handle.threshold` (default 50000) have accumulated, by
+  replacing the connection so that the next retrieve runs in a different host server job. Nothing on
+  the system is cancelled or ended - the connection is simply re-established, transparently. Lower it
+  on a system with a constrained job storage limit.
 
 # Problems
 
