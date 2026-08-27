@@ -21,6 +21,7 @@ import java.util.TreeSet;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -214,10 +215,13 @@ public class JournalInfoRetrieval {
         final Set<JournalInfo> jis = new HashSet<>();
         final Set<String> libraries = new TreeSet<>();
         final List<FileFilter> journaled = new ArrayList<>();
+        final Map<JournalInfo, List<String>> tablesByJournal = new HashMap<>();
         for (final FileFilter f : includes) {
             libraries.add(f.schema());
             try {
-                jis.add(getJournal(as400, f.schema(), f.table()));
+                final JournalInfo ji = getJournal(as400, f.schema(), f.table());
+                jis.add(ji);
+                tablesByJournal.computeIfAbsent(ji, k -> new ArrayList<>()).add(f.schema() + "." + f.table());
                 journaled.add(f);
             }
             catch (final Exception e) {
@@ -232,11 +236,18 @@ public class JournalInfoRetrieval {
             }
         }
         if (jis.size() > 1) {
+            log.debug("tables span more than one journal, full breakdown of tables by journal: {}", tablesByJournal);
+            final String breakdown = tablesByJournal.entrySet().stream()
+                    .map(e -> String.format("%s/%s: %d tables (%s%s)",
+                            e.getKey().journalLibrary(), e.getKey().journalName(), e.getValue().size(),
+                            String.join(", ", e.getValue().subList(0, Math.min(5, e.getValue().size()))),
+                            e.getValue().size() > 5 ? ", ..." : ""))
+                    .collect(Collectors.joining("; "));
             throw new IllegalStateException(String.format(
                     "tables span more than one journal, which is not supported: a single connector must "
                             + "capture tables that all journal to the same journal. Libraries requested: %s; "
-                            + "distinct journals found: %s",
-                    libraries, jis));
+                            + "tables by journal : %s",
+                    libraries, breakdown));
         }
         if (jis.isEmpty()) {
             throw new IllegalStateException(String.format(

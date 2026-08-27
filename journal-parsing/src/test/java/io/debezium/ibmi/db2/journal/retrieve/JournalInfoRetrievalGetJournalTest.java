@@ -115,9 +115,12 @@ class JournalInfoRetrievalGetJournalTest {
                 () -> retrieval.getJournal(as400, "LIB1",
                         List.of(new FileFilter("LIB1", "T1"), new FileFilter("LIB2", "T2"))));
 
-        // Then the failure clearly names the multi-journal situation and the libraries involved
+        // Then the failure clearly names the multi-journal situation, the libraries involved
+        // and which tables resolved to which journal
         assertTrue(ex.getMessage().contains("more than one journal"), ex.getMessage());
         assertTrue(ex.getMessage().contains("LIB1"), ex.getMessage());
         assertTrue(ex.getMessage().contains("LIB2"), ex.getMessage());
+        assertTrue(ex.getMessage().contains("LIB1.T1"), ex.getMessage());
+        assertTrue(ex.getMessage().contains("LIB2.T2"), ex.getMessage());
     }
 }
