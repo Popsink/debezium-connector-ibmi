@@ -10,6 +10,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -167,7 +168,37 @@ public class As400SnapshotChangeEventSource
         for (final String schema : connectorConfig.getCaptureSchemas()) {
             tables.addAll(jdbcConnection.readTableNames(databaseName, schema, null, new String[]{ "TABLE" }));
         }
+        if (connectorConfig.skipUncapturableTables()) {
+            dropMemberlessFiles(tables);
+        }
         return tables;
+    }
+
+    /**
+     * A memberless physical file fails any SQL access with {@code SQL0204} and would abort the snapshot of
+     * every other table; under {@code errors.tolerance=all} it is dropped instead.
+     */
+    private void dropMemberlessFiles(Set<TableId> tables) {
+        final Set<String> schemas = tables.stream().map(TableId::schema).collect(Collectors.toSet());
+        for (final String schema : schemas) {
+            final Set<String> withMembers;
+            try {
+                withMembers = jdbcConnection.tablesWithMembers(schema);
+            }
+            catch (final SQLException e) {
+                log.error("failed to list the tables of {} with members, keeping them all in the snapshot", schema, e);
+                continue;
+            }
+            final Iterator<TableId> iterator = tables.iterator();
+            while (iterator.hasNext()) {
+                final TableId tableId = iterator.next();
+                if (schema.equals(tableId.schema()) && !withMembers.contains(tableId.table().toUpperCase())) {
+                    log.error("errors.tolerance=all: dropping {} from the snapshot, the physical file has no member "
+                            + "- nothing will be captured for it", tableId);
+                    iterator.remove();
+                }
+            }
+        }
     }
 
     @Override
@@ -289,6 +320,22 @@ public class As400SnapshotChangeEventSource
         }
         String fullTableName = String.format("%s.%s", tableId.schema(), table);
         return snapshotterService.getSnapshotQuery().snapshotQuery(fullTableName, columns);
+    }
+
+    @Override
+    protected Long rowCountForTableChunked(TableId tableId) throws SQLException {
+        try {
+            return super.rowCountForTableChunked(tableId);
+        }
+        catch (SQLException e) {
+            final String hint = switch (e.getErrorCode()) {
+                case -204 -> " (SQL0204: the physical file may have no member, or the table was dropped after discovery)";
+                case -551, -552 -> " (SQL0551/SQL0552: the connecting user profile is not authorized to the table)";
+                case -913 -> " (SQL0913: the object is locked - a save or reorganize may be running)";
+                default -> "";
+            };
+            throw new SQLException("Failed to count rows for table " + tableId + hint, e.getSQLState(), e.getErrorCode(), e);
+        }
     }
 
     @Override
