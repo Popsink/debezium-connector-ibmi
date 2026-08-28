@@ -15,6 +15,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -66,6 +67,11 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
             select trim(table_type) from qsys2.systables
             where upper(system_table_schema)=upper(?)
             AND (upper(table_name)=upper(?) OR upper(replace(system_table_name, '"', ''))=upper(?))
+            """;
+    /** One row per member; both names returned, matching as loose as {@link #GET_TABLE_TYPE} because a miss can drop the table. */
+    private static final String TABLES_WITH_MEMBERS = """
+            select distinct upper(table_name), upper(replace(system_table_name, '"', ''))
+            from qsys2.syspartitionstat where upper(system_table_schema)=upper(?)
             """;
     private static final String GET_INDEXES = """
             SELECT c.column_name FROM qsys.QADBKATR k
@@ -215,6 +221,20 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
                 },
                 singleResultMapper(rs -> rs.getString(1).trim(), (String) null,
                         String.format("no entry in qsys2.systables for %s.%s", schemaName, tableName)));
+    }
+
+    /** Upper-cased long and system names of every file in the schema that still has a member; a file without one fails any SQL access with {@code SQL0204}. */
+    public Set<String> tablesWithMembers(String schemaName) throws SQLException {
+        return prepareQueryAndMap(TABLES_WITH_MEMBERS,
+                call -> call.setString(1, schemaName),
+                rs -> {
+                    final Set<String> names = new HashSet<>();
+                    while (rs.next()) {
+                        names.add(rs.getString(1).trim());
+                        names.add(rs.getString(2).trim());
+                    }
+                    return names;
+                });
     }
 
     public String getRealDatabaseName() {
