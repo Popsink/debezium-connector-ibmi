@@ -7,6 +7,7 @@ package io.debezium.ibmi.db2.journal.retrieve;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -212,6 +213,114 @@ public class JdbcFileDecoderTest {
         assertEquals("ABC", result[0]);
         assertEquals(0, new BigDecimal(123).compareTo((BigDecimal) result[1]));
         assertEquals("ZZ", result[2]);
+    }
+
+    /**
+     * The gap #9's isNull skip left open, and the whole point of issue #52: a blank-filled numeric that the
+     * journal does <em>not</em> flag null - a non-null-capable column that was never initialised, i.e. the
+     * ordinary legacy pattern - used to reach jt400 and throw, which aborted the entry and dropped the whole
+     * row. It must now cost that one column and nothing else.
+     */
+    @Test
+    public void testDecodeEntryNullsABlankPackedDecimalThatIsNotFlaggedNull() {
+        final AS400Structure structure = threeFieldStructure();
+        final byte[] data = structure.toBytes(new Object[]{ "ABC", new BigDecimal(123), "ZZ" });
+        blankFill(data, 3, 6); // the DECIMAL(5,0), untouched by the indicator array below
+
+        final List<JdbcFileDecoder.UndecodableField> undecodable = new ArrayList<>();
+        final Object[] result = DECODER.decodeEntry(structure, data, 0, new boolean[]{ false, false, false },
+                new ArrayList<>(), undecodable);
+
+        assertNull(result[1]);
+        // and, the part that was being lost, every other column of the row is intact
+        assertEquals("ABC", result[0]);
+        assertEquals("ZZ", result[2]);
+        assertEquals(1, undecodable.size());
+        assertEquals(1, undecodable.get(0).index());
+        // blank-filled, so it was never offered to the driver and there is nothing to attribute
+        assertNull(undecodable.get(0).cause());
+    }
+
+    @Test
+    public void testDecodeEntryNullsABlankZonedDecimalThatIsNotFlaggedNull() {
+        // [CHAR(3), ZONED(5,0), CHAR(2)] -> 3 + 5 + 2 = 10 bytes
+        final AS400Structure structure = new AS400Structure(
+                new AS400DataType[]{ new AS400Text(3), new AS400ZonedDecimal(5, 0), new AS400Text(2) });
+        final byte[] data = structure.toBytes(new Object[]{ "ABC", new BigDecimal(123), "ZZ" });
+        blankFill(data, 3, 8);
+
+        final List<JdbcFileDecoder.UndecodableField> undecodable = new ArrayList<>();
+        final Object[] result = DECODER.decodeEntry(structure, data, 0, null, new ArrayList<>(), undecodable);
+
+        assertNull(result[1]);
+        assertEquals("ABC", result[0]);
+        assertEquals("ZZ", result[2]);
+        assertEquals(1, undecodable.size());
+    }
+
+    /**
+     * The backstop for bytes that are not blank but that the driver still rejects - the NumberFormatException
+     * on a bad nibble that issue #52 was filed on. Same outcome: one null column, not a dropped row.
+     */
+    @Test
+    public void testDecodeEntryNullsAPackedDecimalTheDriverRejects() {
+        final AS400Structure structure = threeFieldStructure();
+        final byte[] data = structure.toBytes(new Object[]{ "ABC", new BigDecimal(123), "ZZ" });
+        data[4] = 0x4A; // a non-blank, invalid nibble pair in the middle of the DECIMAL(5,0)
+
+        final List<JdbcFileDecoder.UndecodableField> undecodable = new ArrayList<>();
+        final Object[] result = DECODER.decodeEntry(structure, data, 0, null, new ArrayList<>(), undecodable);
+
+        assertNull(result[1]);
+        assertEquals("ABC", result[0]);
+        assertEquals("ZZ", result[2]);
+        assertEquals(1, undecodable.size());
+        // this one did come from the driver, so it is attributable
+        assertNotNull(undecodable.get(0).cause());
+    }
+
+    /**
+     * A blank value is the legacy "no value", so it must not be confused with a real zero, which is what
+     * silently defaulting the column would have produced.
+     */
+    @Test
+    public void testDecodeEntryStillReadsARealZero() {
+        final AS400Structure structure = threeFieldStructure();
+        final byte[] data = structure.toBytes(new Object[]{ "ABC", BigDecimal.ZERO, "ZZ" });
+
+        final List<JdbcFileDecoder.UndecodableField> undecodable = new ArrayList<>();
+        final Object[] result = DECODER.decodeEntry(structure, data, 0, null, new ArrayList<>(), undecodable);
+
+        assertEquals(0, BigDecimal.ZERO.compareTo((BigDecimal) result[1]));
+        assertEquals(0, undecodable.size());
+    }
+
+    /** A blank CHAR column is a blank string, not a missing value: only decimals get this treatment. */
+    @Test
+    public void testDecodeEntryLeavesBlankTextAlone() {
+        final AS400Structure structure = threeFieldStructure();
+        final byte[] data = structure.toBytes(new Object[]{ "ABC", new BigDecimal(123), "ZZ" });
+        blankFill(data, 0, 3);
+
+        final List<JdbcFileDecoder.UndecodableField> undecodable = new ArrayList<>();
+        final Object[] result = DECODER.decodeEntry(structure, data, 0, null, new ArrayList<>(), undecodable);
+
+        assertEquals("   ", result[0]);
+        assertEquals(0, undecodable.size());
+    }
+
+    /**
+     * A record image that does not match the format is a different problem: tolerating it per field would
+     * hand plausible garbage downstream, so it must still abort the entry, where the streaming loop logs it
+     * with an offset and an RRN to attribute it (issue #31).
+     */
+    @Test
+    public void testDecodeEntryStillFailsOnATruncatedRecord() {
+        final AS400Structure structure = threeFieldStructure();
+        final byte[] data = new byte[structure.getByteLength() - 3];
+
+        assertThrows(RuntimeException.class,
+                () -> DECODER.decodeEntry(structure, data, 0, null, new ArrayList<>(), new ArrayList<>()));
     }
 
     private static final int LOB_RECORD_OFFSET = 5;

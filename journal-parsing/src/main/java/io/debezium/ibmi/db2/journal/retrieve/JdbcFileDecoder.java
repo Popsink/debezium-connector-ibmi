@@ -19,6 +19,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -36,6 +37,7 @@ import com.ibm.as400.access.AS400Text;
 import com.ibm.as400.access.AS400Time;
 import com.ibm.as400.access.AS400Timestamp;
 import com.ibm.as400.access.AS400ZonedDecimal;
+import com.ibm.as400.access.ExtendedIllegalArgumentException;
 
 import io.debezium.ibmi.db2.journal.data.types.AS400Boolean;
 import io.debezium.ibmi.db2.journal.data.types.AS400Lob;
@@ -106,6 +108,8 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
      * Entry specific data
      */
     private final AS400Text lengthDecoder;
+    /** Rows seen per undecodable (library.file.column), to keep the warning from repeating per row. */
+    private final Map<String, AtomicLong> undecodableColumnCounts = new ConcurrentHashMap<>();
     private static final Object[] EMPTY = new Object[]{};
     private static final byte[] EMPTY_BYTES = new byte[0];
 
@@ -119,11 +123,16 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
             final int length = Integer.parseInt(lengthStr);
             if (length > 0) {
                 final List<LobField> lobFields = new ArrayList<>();
+                final List<UndecodableField> undecodable = new ArrayList<>();
                 final Object[] os = decodeEntry(tableInfo.getAs400Structure(), data,
                         offset + entryHeader.getEntrySpecificDataOffset() + ENTRY_SPECIFIC_DATA_OFFSET, isNull,
-                        lobFields);
+                        lobFields, undecodable);
                 if (!lobFields.isEmpty()) {
                     resolveLobs(entryHeader, tableInfo, os, lobFields, length);
+                }
+                if (!undecodable.isEmpty()) {
+                    // reported here rather than in decodeEntry, which knows the types but not the column names
+                    reportUndecodable(entryHeader, tableInfo, undecodable);
                 }
                 return os;
             }
@@ -147,12 +156,19 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
         return decodeEntry(entryDetailStructure, data, offset, isNull, new ArrayList<>());
     }
 
-    /**
-     * @param lobFields collects the LOB columns found, in column order, for
-     *                  {@link #resolveLobs} to fill in - their value is never in the record image
-     */
     public Object[] decodeEntry(AS400Structure entryDetailStructure, byte[] data, int offset, boolean[] isNull,
                                 List<LobField> lobFields) {
+        return decodeEntry(entryDetailStructure, data, offset, isNull, lobFields, new ArrayList<>());
+    }
+
+    /**
+     * @param lobFields   collects the LOB columns found, in column order, for
+     *                    {@link #resolveLobs} to fill in - their value is never in the record image
+     * @param undecodable collects the columns left null because their bytes could not be decoded, for the
+     *                    caller to report against the column names it knows
+     */
+    public Object[] decodeEntry(AS400Structure entryDetailStructure, byte[] data, int offset, boolean[] isNull,
+                                List<LobField> lobFields, List<UndecodableField> undecodable) {
         final AS400DataType[] members = entryDetailStructure.getMembers();
         final Object[] result = new Object[members.length];
         int fieldOffset = offset;
@@ -172,11 +188,103 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
                 lobFields.add(new LobField(i, lob, fieldIsNull, dataLength));
             }
             else if (!fieldIsNull) {
-                result[i] = member.toObject(data, fieldOffset);
+                if (isBlankFilledDecimal(member, data, fieldOffset)) {
+                    // a 0x40-filled numeric is how an uninitialised value is held in an old physical file,
+                    // not corruption, and the journal does not flag it null because the column is not
+                    // null-capable. Left null rather than handed to jt400, which would throw
+                    undecodable.add(new UndecodableField(i, member, null));
+                }
+                else {
+                    try {
+                        result[i] = member.toObject(data, fieldOffset);
+                    }
+                    catch (final NumberFormatException | ExtendedIllegalArgumentException e) {
+                        // one strict-typed column must not cost the whole record. The offset comes from
+                        // getByteLength(), not from the decode, so every field after this one stays
+                        // aligned; anything the driver rejects for other reasons (a record image that
+                        // does not match the format, say) still aborts the entry, because tolerating
+                        // that would produce plausible garbage instead of an attributable failure
+                        undecodable.add(new UndecodableField(i, member, e));
+                    }
+                }
             }
             fieldOffset += member.getByteLength();
         }
         return result;
+    }
+
+    /**
+     * A column left null because its bytes could not be decoded.
+     *
+     * @param cause what the driver threw, or {@code null} when the field was blank-filled and so was never
+     *              offered to it
+     */
+    public record UndecodableField(int index, AS400DataType type, RuntimeException cause) {
+    }
+
+    /** EBCDIC space, what an uninitialised fixed-width field is filled with. */
+    private static final byte EBCDIC_BLANK = 0x40;
+
+    /**
+     * Whether a zoned or packed decimal field holds nothing but EBCDIC blanks, the legacy encoding for "no
+     * value" in physical files old enough to predate null-capable columns. Cheaper than letting jt400 throw,
+     * and it separates the expected case from a genuinely corrupt one in the log.
+     */
+    private static boolean isBlankFilledDecimal(AS400DataType member, byte[] data, int offset) {
+        if (!(member instanceof AS400PackedDecimal) && !(member instanceof AS400ZonedDecimal)) {
+            return false;
+        }
+        final int end = offset + member.getByteLength();
+        if (offset < 0 || end > data.length) {
+            // truncated: let the driver report it, the record image does not match the format
+            return false;
+        }
+        for (int at = offset; at < end; at++) {
+            if (data[at] != EBCDIC_BLANK) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Warns about columns that decoded to null, once per (table, column) and then on each power of ten, so a
+     * column that fails on every row of a hot table states the problem and its running total without
+     * drowning the log - the pre-existing behaviour was one line per row, at 24 an hour on the deployment in
+     * issue #52.
+     */
+    private void reportUndecodable(EntryHeader entryHeader, TableInfo tableInfo, List<UndecodableField> fields) {
+        final List<Structure> columns = tableInfo.getStructure();
+        for (final UndecodableField field : fields) {
+            final String column = field.index() < columns.size()
+                    ? columns.get(field.index()).getName()
+                    : "#" + field.index();
+            final String key = String.format("%s.%s.%s", entryHeader.getLibrary(), entryHeader.getFile(), column);
+            final long seen = undecodableColumnCounts.computeIfAbsent(key, k -> new AtomicLong()).incrementAndGet();
+            if (!isFirstOrPowerOfTen(seen)) {
+                continue;
+            }
+            if (field.cause() == null) {
+                log.warn("column {} of {}.{} is blank-filled and not flagged null, read as null instead of "
+                        + "failing the record ({} rows so far)", column, entryHeader.getLibrary(),
+                        entryHeader.getFile(), seen);
+            }
+            else {
+                log.warn("column {} of {}.{} could not be decoded as {}, read as null instead of failing the "
+                        + "record ({} rows so far)", column, entryHeader.getLibrary(), entryHeader.getFile(),
+                        field.type().getClass().getSimpleName(), seen, field.cause());
+            }
+        }
+    }
+
+    /** 1, 10, 100, ...: enough to state the magnitude of a column that fails on every row, without a line per row. */
+    private static boolean isFirstOrPowerOfTen(long count) {
+        for (long at = 1; at > 0 && at <= count; at *= 10) {
+            if (at == count) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
