@@ -236,8 +236,11 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
             streamingMetrics.setJournalOffset(currentReceiver.getOffset());
             streamingMetrics.setJournalBehind(behind);
             streamingMetrics.setLastProcessedMs(position.getTimeOfLastProcessed().toEpochMilli());
-            log.info("Current position diagnostics last call {}, header {}, behind {}, currentReceiver", state, retrieveJournal.getFirstHeader(), behind,
-                    currentReceiver);
+            log.info(
+                    "Current position diagnostics last call {}, parked on receiver {} at offset {}, journal attached to receiver {} at offset {}, behind {}, header {}",
+                    state, position.getReceiver(), position.getOffset(),
+                    currentReceiver.getReceiver(), currentReceiver.getOffset(), behind,
+                    retrieveJournal.getFirstHeader());
         }
     }
 
