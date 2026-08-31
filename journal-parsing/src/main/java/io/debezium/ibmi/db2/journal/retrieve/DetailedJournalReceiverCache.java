@@ -38,7 +38,7 @@ public class DetailedJournalReceiverCache {
         String key = toKey(receiverInfo);
         DetailedJournalReceiver dr = cached.get(key);
         if (dr.info() == null || dr.info().status() == null) {
-            log.warn("null in receiver info", dr);
+            log.warn("null in receiver info {}", dr);
         }
         if (receiverInfo.status() != null && dr.info() != null && !receiverInfo.status().equals(dr.info().status())) {
             dr = dr.withStatus(receiverInfo.status());
