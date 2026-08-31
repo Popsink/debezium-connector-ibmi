@@ -46,6 +46,8 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
 
     private static final int TRANSACTION_MAP_WARN_SIZE = 50_000;
     private static final int MAX_RETRIES = 20;
+    /** Retry backoff grows from {@code poll.interval.ms} up to this multiple of it, then stays there. */
+    private static final long MAX_RETRY_BACKOFF_MULTIPLIER = 8;
 
     private static final Logger log = LoggerFactory.getLogger(As400StreamingChangeEventSource.class);
 
@@ -169,7 +171,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         // streaming: data is already lost, so apply the configured recovery strategy rather
                         // than silently skipping on
                         applyUnavailablePositionRecovery(offsetContext, e);
-                        retries = pauseBeforeRetry(retries, offsetContext, e, metronome);
+                        retries = pauseBeforeRetry(retries, offsetContext, e);
                     }
                     catch (final FatalException e) {
                         throw new DebeziumException("Unable to process offset " + offsetContext.getPosition(), e);
@@ -178,7 +180,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         if (context.isRunning()) {
                             log.error("Interrupted processing offset {} retry {}", offsetContext.getPosition(), retries);
                             closeAndReconnect();
-                            retries = pauseBeforeRetry(retries, offsetContext, e, metronome);
+                            retries = pauseBeforeRetry(retries, offsetContext, e);
                         }
                     }
                     catch (IOException | SQLNonTransientConnectionException e) { // SQLNonTransientConnectionException
@@ -187,12 +189,12 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         log.error("Connection failed offset {} retry {}", offsetContext.getPosition(), retries, e);
                         closeAndReconnect();
 
-                        retries = pauseBeforeRetry(retries, offsetContext, e, metronome);
+                        retries = pauseBeforeRetry(retries, offsetContext, e);
                     }
                     catch (final Exception e) {
                         log.error("Failed to process offset {} retry {}", offsetContext.getPosition(), retries, e);
 
-                        retries = pauseBeforeRetry(retries, offsetContext, e, metronome);
+                        retries = pauseBeforeRetry(retries, offsetContext, e);
                     }
                 }
                 catch (final InterruptedException e) { // handle InterruptedException during the exception handling
@@ -240,22 +242,46 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
     }
 
     /**
-     * Waits out the poll interval before the next attempt, giving up once the same failure has been retried
-     * {@link #MAX_RETRIES} times so a permanently broken stream fails the connector instead of retrying
-     * forever. A lost connection is retriable, so failing here restarts the connector, see
-     * {@link As400ErrorHandler}.
+     * Waits out an exponentially growing backoff before the next attempt, giving up once the same failure
+     * has been retried {@link #MAX_RETRIES} times so a permanently broken stream fails the connector
+     * instead of retrying forever. A lost connection is retriable, so failing here restarts the connector,
+     * see {@link As400ErrorHandler}.
+     * <p>
+     * The wait is deliberately not taken from the streaming loop's {@link Metronome}. That one advances its
+     * tick by exactly one period per {@code pause()} call rather than by the wall clock, and the healthy
+     * path never calls it - {@code Success} and {@code MoreDataAvailable} both fall straight through - so by
+     * the time a failure burst starts its tick is behind by roughly the whole time spent streaming and every
+     * {@code pause()} returns immediately. Sharing it inverted the intent: the busier the connector, the
+     * less backoff it got, and 20 attempts could be spent in under 3 seconds.
      *
      * @return the number of retries attempted so far
      */
-    private static int pauseBeforeRetry(int retries, As400OffsetContext offsetContext, Exception e, Metronome metronome)
+    private int pauseBeforeRetry(int retries, As400OffsetContext offsetContext, Exception e)
             throws InterruptedException {
         final int attempted = retries + 1;
         if (attempted >= MAX_RETRIES) {
             throw new DebeziumException(
                     String.format("Failed to process offset %s after %d retries", offsetContext.getPosition(), attempted), e);
         }
-        metronome.pause();
+        final Duration backoff = retryBackoff(retries);
+        log.info("Retrying offset {} in {}ms, attempt {}/{}", offsetContext.getPosition(), backoff.toMillis(), attempted,
+                MAX_RETRIES);
+        // a Metronome of its own, created here, so this first and only pause() really waits the whole backoff
+        Metronome.sleeper(backoff, clock).pause();
         return attempted;
+    }
+
+    /**
+     * {@code pollInterval * 2^retries}, capped at {@link #MAX_RETRY_BACKOFF_MULTIPLIER} times the poll
+     * interval so the wait stays proportional to how often the connector was asked to poll. The whole
+     * {@link #MAX_RETRIES} budget spans 135 poll intervals: about 68s at the 500ms default, about 4.5
+     * minutes at {@code poll.interval.ms=2000} - rather than the 2.7 seconds it took while the streaming
+     * metronome was shared.
+     */
+    Duration retryBackoff(int retries) {
+        // 1L << 30 already dwarfs the cap; clamping the shift keeps it out of overflow territory
+        final long multiplier = Math.min(1L << Math.min(retries, 30), MAX_RETRY_BACKOFF_MULTIPLIER);
+        return pollInterval.multipliedBy(multiplier);
     }
 
     public void closeAndReconnect() {
