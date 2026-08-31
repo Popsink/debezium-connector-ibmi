@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
@@ -201,6 +202,28 @@ public class As400SnapshotChangeEventSource
         }
     }
 
+    /**
+     * Names the {@code table.include.list} entries that matched no table on the source.
+     * <p>
+     * They are skipped by design - #33 settled that the include list is an allow list and that a table
+     * missing from the source must not block startup - but the skip left no trace anywhere, not even at
+     * DEBUG. On a connector configured for ~41 tables across two schemas only ~30 ever appeared in the
+     * "Adding table" lines and the rest showed up in neither direction, so the only way to tell "never
+     * captured because it does not exist" from "captured fine" was to diff the configured list against the
+     * log by hand. Nothing about which tables are captured changes here.
+     */
+    private void logUnresolvedIncludeListEntries(Set<TableId> capturedTables) {
+        final Map<String, Predicate<TableId>> matchers = connectorConfig.getTableIncludeListMatchers();
+        final List<String> unresolved = matchers.entrySet().stream()
+                .filter(entry -> capturedTables.stream().noneMatch(entry.getValue()))
+                .map(Map.Entry::getKey)
+                .toList();
+        if (!unresolved.isEmpty()) {
+            log.info("{} of the {} table.include.list entries matched no table on the source and will not be "
+                    + "captured: {}", unresolved.size(), matchers.size(), String.join(", ", unresolved));
+        }
+    }
+
     @Override
     protected void lockTablesForSchemaSnapshot(ChangeEventSourceContext sourceContext,
                                                RelationalSnapshotContext<As400Partition, As400OffsetContext> snapshotContext)
@@ -259,6 +282,8 @@ public class As400SnapshotChangeEventSource
             throws Exception {
         final Set<String> schemas = snapshotContext.capturedTables.stream().map(TableId::schema)
                 .collect(Collectors.toSet());
+
+        logUnresolvedIncludeListEntries(snapshotContext.capturedTables);
 
         // reading info only for the schemas we're interested in as per the set of
         // captured tables;
