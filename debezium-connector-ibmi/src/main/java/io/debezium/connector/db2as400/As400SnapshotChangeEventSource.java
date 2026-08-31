@@ -277,10 +277,17 @@ public class As400SnapshotChangeEventSource
                     connectorConfig.getTableFilters().eligibleDataCollectionFilter(), null, false);
 
             try {
-                jdbcConnection.getAllSystemNames(schema);
+                // scoped to this schema's captured tables for the same reason as the read above: the
+                // mapping is only ever consulted for those, and fetching the whole library's worth cost
+                // tens of seconds of round trips on every start
+                final Set<String> capturedInSchema = snapshotContext.capturedTables.stream()
+                        .filter(id -> schema.equals(id.schema()))
+                        .map(TableId::table)
+                        .collect(Collectors.toSet());
+                jdbcConnection.getAllSystemNames(schema, capturedInSchema);
             }
             catch (final Exception e) {
-                log.warn("failure fetching table names", e);
+                log.warn("failure fetching table names for schema {}", schema, e);
             }
         }
 

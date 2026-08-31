@@ -13,6 +13,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -54,7 +55,18 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
 
     private static final String GET_DATABASE_NAME = "values ( CURRENT_SERVER )";
     private static final String GET_SYSTEM_TABLE_NAME = "select trim(system_table_name) from qsys2.systables where system_table_schema=? AND table_name=?";
-    private static final String GET_ALL_SYSTEM_TABLE_NAME = "select trim(system_table_name), trim(table_name) from qsys2.systables where system_table_schema=?";
+    /**
+     * Matches on either name, as loosely as {@link #GET_TABLE_TYPE}: the captured set may name a table by
+     * its long or its system name, and {@code SYSTEM_TABLE_NAME} comes back delimited when it is not an
+     * ordinary identifier. The placeholder list is bound twice, once per column.
+     */
+    private static final String GET_SYSTEM_TABLE_NAMES = """
+            select trim(system_table_name), trim(table_name) from qsys2.systables
+            where system_table_schema=?
+            and (upper(table_name) in (%1$s) or upper(replace(system_table_name, '"', '')) in (%1$s))
+            """;
+    /** Table names per {@code IN} list, two bind parameters each, so a whole-library include list stays inside any statement limit. */
+    private static final int SYSTEM_NAME_BATCH_SIZE = 500;
 
     private static final String GET_TABLE_NAME = "select trim(table_name) from qsys2.systables where system_table_schema=? AND system_table_name=?";
     /**
@@ -328,10 +340,38 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
         return columnsByTable;
     }
 
-    public void getAllSystemNames(String schemaName) throws SQLException, InterruptedException {
-        prepareQueryWithBlockingConsumer(GET_ALL_SYSTEM_TABLE_NAME, call -> {
-            call.setString(1, schemaName);
-        },
+    /**
+     * Warms the long-name/system-name caches for the given tables of a schema, in one round trip per batch
+     * rather than the one-per-table lookups {@link #getSystemName} and {@link #getLongName} would otherwise
+     * each make on a cache miss.
+     * <p>
+     * Scoped to the tables asked for, not to the whole schema. Only captured tables are ever looked up
+     * afterwards, so fetching a mapping for every table in the library made schema discovery scale with the
+     * size of the source rather than with {@code table.include.list} - hundreds of rows and tens of seconds
+     * on every connector start on a long-lived IBM i system, undoing the scoping the column read before it
+     * already applies. A table missing from the result is not an error: it resolves lazily on first use.
+     */
+    public void getAllSystemNames(String schemaName, Collection<String> tableNames) throws SQLException, InterruptedException {
+        final List<String> names = tableNames.stream().map(String::toUpperCase).distinct().toList();
+        int fetched = 0;
+        for (int from = 0; from < names.size(); from += SYSTEM_NAME_BATCH_SIZE) {
+            fetched += fetchSystemNames(schemaName, names.subList(from, Math.min(from + SYSTEM_NAME_BATCH_SIZE, names.size())));
+        }
+        log.info("fetched {} name mappings for the {} captured tables of schema {}", fetched, names.size(), schemaName);
+    }
+
+    private int fetchSystemNames(String schemaName, List<String> tableNames) throws SQLException, InterruptedException {
+        final String placeholders = tableNames.stream().map(n -> "?").collect(Collectors.joining(", "));
+        // the blocking consumer returns nothing, so the row count comes back in a holder
+        final int[] fetched = { 0 };
+        prepareQueryWithBlockingConsumer(String.format(GET_SYSTEM_TABLE_NAMES, placeholders),
+                call -> {
+                    call.setString(1, schemaName);
+                    for (int i = 0; i < tableNames.size(); i++) {
+                        call.setString(i + 2, tableNames.get(i));
+                        call.setString(i + 2 + tableNames.size(), tableNames.get(i));
+                    }
+                },
                 rs -> {
                     while (rs.next()) {
                         final String systemName = rs.getString(1);
@@ -340,10 +380,10 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
                         longToSystemTableName.put(longKey, Optional.of(systemName));
                         final String shortKey = String.format("%s.%s", schemaName, systemName);
                         systemToLongTableName.put(shortKey, tableName);
-
+                        fetched[0]++;
                     }
                 });
-        log.info("fetched {} long names", longToSystemTableName.size());
+        return fetched[0];
     }
 
     public Optional<String> getSystemName(String schemaName, String longTableName) {
