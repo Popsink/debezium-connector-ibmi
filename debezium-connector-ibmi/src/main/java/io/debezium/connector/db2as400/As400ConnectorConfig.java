@@ -7,9 +7,12 @@ package io.debezium.connector.db2as400;
 
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -33,6 +36,7 @@ import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.relational.ColumnFilterMode;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.RelationalTableFilters;
+import io.debezium.relational.Selectors;
 import io.debezium.relational.Selectors.TableIdToStringMapper;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables.TableFilter;
@@ -252,6 +256,32 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
     /** The raw {@code table.include.list} as supplied (e.g. {@code PYP31."$SCHAR"}), for the journal path. */
     public String getRawTableIncludeList() {
         return config.getString(TABLE_INCLUDE_LIST);
+    }
+
+    /**
+     * Every {@code table.include.list} entry paired with the predicate the table filters apply on its
+     * behalf, so a caller can tell which entries matched nothing on the source. Built with the same builder
+     * and the same {@link #tableToString} mapper as {@link #getTableFilters()}, so an entry that matches
+     * nothing here matches nothing there either.
+     * <p>
+     * Keyed by the entry as configured rather than by its normalized form: the regex-escaped version is an
+     * implementation detail, the configured one is what an operator can act on.
+     */
+    public Map<String, Predicate<TableId>> getTableIncludeListMatchers() {
+        final String includeList = getRawTableIncludeList();
+        if (includeList == null || includeList.isBlank()) {
+            return Map.of();
+        }
+        final Map<String, Predicate<TableId>> matchers = new LinkedHashMap<>();
+        for (final String raw : includeList.split(",")) {
+            final String entry = raw.trim();
+            if (!entry.isEmpty()) {
+                matchers.put(entry, Selectors.tableSelector()
+                        .includeTables(normalizeTablePattern(entry), tableToString)
+                        .build());
+            }
+        }
+        return matchers;
     }
 
     /** Escapes AS400 table names with regex metacharacters so they match as literals. */
