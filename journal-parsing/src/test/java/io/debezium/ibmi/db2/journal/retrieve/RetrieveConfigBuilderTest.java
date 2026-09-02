@@ -41,4 +41,11 @@ class RetrieveConfigBuilderTest {
         assertEquals(PointerHandles.DEFAULT_THRESHOLD,
                 new RetrieveConfigBuilder().withPointerHandleThreshold(-5L).build().pointerHandleThreshold());
     }
+
+    /** Prefetch is on unless the connector says otherwise; a value dropped here would silently disable it. */
+    @Test
+    void prefetchIsOnByDefaultAndCanBeSwitchedOff() {
+        assertEquals(true, new RetrieveConfigBuilder().build().prefetch());
+        assertEquals(false, new RetrieveConfigBuilder().withPrefetch(false).build().prefetch());
+    }
 }

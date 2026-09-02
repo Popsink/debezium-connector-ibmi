@@ -13,4 +13,10 @@ public interface As400ChangeEventSourceMetricsMXBean extends StreamingChangeEven
     long getJournalOffset();
 
     long getLastProcessedMs();
+
+    /**
+     * How many consecutive diagnostics samples saw the journal lag grow while every call came back with a
+     * full buffer - see {@code CatchUpTrend}. Zero while the connector is keeping up or gaining ground.
+     */
+    int getJournalBehindGrowthSamples();
 }

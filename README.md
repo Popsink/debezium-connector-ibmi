@@ -170,6 +170,34 @@ side.
 > `errors.tolerance` is the same property name and the same `none`/`all` values as Kafka Connect's own,
 > which governs converter/transform/producer errors; the setting is shared and the intent is the same.
 
+## Catching up
+
+The journal is read a block at a time with `QjoRetrieveJournalEntries`; a call takes longer the more
+bytes it returns (about 3 MB/s on a good link, under 300 KB/s seen in production).
+
+* `buffer.size` (default 131072): bytes one call may return. A block that comes back full
+  (`MORE_DATA_NEW_OFFSET` in the diagnostics) means the buffer, not the journal, ran out.
+* `max.journal.timeout` (default 60000 ms): how long the streaming thread may go without progress,
+  which bounds one call. A buffer that cannot be filled within it never delivers, so raise the two
+  together (16 MiB at 300 KB/s needs about 60 s; give it 120 s).
+* `journal.prefetch` (default true): the call for the next block is issued in the background while the
+  current one is decoded and dispatched, hiding the round trip behind the processing for a second
+  buffer's worth of heap.
+
+The `Current position diagnostics` line, every five minutes, shows for the last block `rpc` (the call),
+`waited` (how long the streaming thread actually stood still) and `consumed` (walking and dispatching
+the previous block). `waited` close to `rpc` means the read is wire bound; `consumed` dominating means
+the pipeline works and the downstream is the limit. The same line times a `small call` (all round
+trip) and derives the `link rate` and the bytes `in flight per round trip`: a low rate with tens of KB
+in flight over a long round trip is a TCP window, not a slow network. An IBM i ships with 64 KiB
+buffers (`CHGTCPA TCPSNDBUF`/`TCPRCVBUF`), about 320 KB/s at 200 ms whatever `buffer.size` is; raise
+them on the host.
+
+When the lag (`behind`, `JournalBehind`) has grown for three consecutive samples with a full buffer
+every call, the connector logs `CANNOT CATCH UP` at WARN and exposes the count as
+`JournalBehindGrowthSamples`: it reads as fast as the buffer and link allow and the journal still
+grows faster, so it will drift out of the retained receivers (see "Journals deleted").
+
 ## Memory
 
 Recommended minimum memory 1GB

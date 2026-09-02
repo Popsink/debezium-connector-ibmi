@@ -17,6 +17,8 @@ import java.util.Arrays;
 import java.util.Date;
 import java.util.Optional;
 import java.util.TimeZone;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.slf4j.Logger;
@@ -45,6 +47,12 @@ import io.debezium.ibmi.db2.journal.retrieve.rjne0200.OffsetStatus;
 /**
  * based on the work of Stanley Vong see
  * https://www.ibm.com/docs/en/i/7.5?topic=ssw_ibm_i_75/apis/QJORJRNE.html
+ *
+ * <p>
+ * When a call comes back with the buffer full the server has said where the rest starts, so the call
+ * for the next block is issued on a background thread while the caller walks this one. A block is only
+ * installed on the caller's thread and at most one call is ever in flight.
+ * </p>
  */
 public class RetrieveJournal {
     private static final Logger log = LoggerFactory.getLogger(RetrieveJournal.class);
@@ -70,9 +78,22 @@ public class RetrieveJournal {
     private MoreData moreData = null;
     private long totalTransferred = 0;
     private AtomicReference<Job> ibmiJob = new AtomicReference<>();
+    private final BlockFetcher fetcher;
+    /** the call for the next block, null when there is none */
+    private volatile Prefetch prefetch;
+    /** a background call whose block is no longer wanted but may still be running */
+    private volatile Prefetch discarded;
+    private volatile long lastRpcMs;
+    private long lastWaitMs;
 
     public RetrieveJournal(RetrieveConfig config, JournalInfoRetrieval journalRetrieval) {
+        this(config, journalRetrieval, null);
+    }
+
+    /** @param fetcher stands in for the real call in tests */
+    RetrieveJournal(RetrieveConfig config, JournalInfoRetrieval journalRetrieval, BlockFetcher fetcher) {
         this.config = config;
+        this.fetcher = fetcher == null ? this::fetch : fetcher;
         firstHeaderDecoder = new FirstHeaderDecoder(config.textFactory());
         entryHeaderDecoder = new EntryHeaderDecoder(config.textFactory(), systemTimeZone(config));
         builder = new ParameterListBuilder(config.textFactory());
@@ -108,6 +129,43 @@ public class RetrieveJournal {
      *                   to capture this and log an error as we may have missed data
      */
     public RetrievalState retrieveJournal(JournalProcessedPosition previousPosition) throws Exception {
+        final Prefetch pending = prefetch;
+        prefetch = null;
+        if (pending != null) {
+            if (previousPosition.equals(pending.from())) {
+                final long started = System.nanoTime();
+                try {
+                    final Block block = pending.task().get();
+                    lastWaitMs = elapsedMs(started);
+                    log.debug("using the prefetched block {} after waiting {}ms", pending.range(), lastWaitMs);
+                    return install(block, previousPosition);
+                }
+                catch (InterruptedException e) {
+                    // still running: the next fetch must wait for it
+                    discarded = pending;
+                    throw e;
+                }
+                catch (ExecutionException e) {
+                    lastWaitMs = elapsedMs(started);
+                    final Throwable cause = e.getCause();
+                    if (cause instanceof LostJournalException) {
+                        // as for the synchronous continuation: a stale range is not data loss
+                        log.warn("prefetch of the range {} failed, recalculating the range", pending.range(), cause);
+                    }
+                    else if (cause instanceof Exception ex) {
+                        throw ex;
+                    }
+                    else {
+                        throw e;
+                    }
+                }
+            }
+            else {
+                log.debug("position {} is not the prefetched continuation {}, discarding the prefetched block",
+                        previousPosition, pending.from());
+                pending.discard();
+            }
+        }
 
         final Optional<PositionRange> continuationOpt = continuationRange(moreData, previousPosition);
         // one hop only: a range we declined, finished or failed on is never reused later
@@ -187,6 +245,11 @@ public class RetrieveJournal {
     }
 
     public void cancelJob() {
+        final Prefetch pending = prefetch;
+        prefetch = null;
+        if (pending != null) {
+            discarded = pending;
+        }
         Job job = ibmiJob.get();
         if (job == null) {
             log.debug("No job to cancel");
@@ -234,11 +297,29 @@ public class RetrieveJournal {
             return RetrievalState.NotCalled;
         }
 
+        awaitDiscarded();
+        final long started = System.nanoTime();
+        final Block block = fetcher.fetch(config.as400().connection(), previousPosition, range);
+        lastWaitMs = elapsedMs(started);
+        return install(block, previousPosition);
+    }
+
+    /** One {@code QjoRetrieveJournalEntries} call, replaceable in tests. */
+    interface BlockFetcher {
+        Block fetch(AS400 as400, JournalProcessedPosition from, PositionRange range) throws Exception;
+    }
+
+    /** What one call brought back; {@code job} is the host server job that ran it. */
+    record Block(byte[] outputData, FirstHeader header, JournalProcessedPosition end, PositionRange range, String job) {
+    }
+
+    /** Runs the call. Touches none of the block being read; {@code as400} is resolved by the caller. */
+    Block fetch(AS400 as400, JournalProcessedPosition from, PositionRange range) throws Exception {
         // TODO end could be optional for filtering or use same mechanism as non
         // filtering?
         final JournalProcessedPosition end = new JournalProcessedPosition(range.end(), Instant.EPOCH, true);
 
-        final ServiceProgramCall spc = new ServiceProgramCall(config.as400().connection());
+        final ServiceProgramCall spc = new ServiceProgramCall(as400);
         spc.getServerJob().setLoggingLevel(0);
         builder.init();
         builder.withBufferLenth(config.journalBufferSize());
@@ -255,45 +336,132 @@ public class RetrieveJournal {
         spc.setAlignOn16Bytes(true);
         spc.setReturnValueFormat(ServiceProgramCall.RETURN_INTEGER);
         final Job serverJob = spc.getServerJob();
+        final String job = serverJob == null ? null
+                : serverJob.getName() + '/' + serverJob.getUser() + '/' + serverJob.getNumber();
         ibmiJob.set(serverJob); // capture so we can asynchronously cancel it
-        // handles belong to this job; if it is not the one that allocated the outstanding ones they
-        // died with their own job and the budget starts again
-        pointerHandles.observeJob(serverJob == null ? null
-                : serverJob.getName() + '/' + serverJob.getUser() + '/' + serverJob.getNumber());
+        final long started = System.nanoTime();
         boolean success;
         try {
             success = spc.run();
         }
         finally {
             ibmiJob.set(null); // job finished
+            lastRpcMs = elapsedMs(started);
         }
         if (success) {
-            outputData = parameters[0].getOutputData();
-            header = firstHeaderDecoder.decode(outputData, end);
-            totalTransferred += header.totalBytes();
-            log.debug("retrieve from {} to {} header {}", range.start(), range.end(), header);
-            offset = -1;
-            if (header.status() == OffsetStatus.MORE_DATA_NEW_OFFSET && header.offset() == 0) {
-                log.error("buffer too small need to skip this entry {}", previousPosition);
-                this.position.setPosition(header.nextPosition());
-            }
-            if (!hasData()) {
-                this.position.setPosition(end);
-            }
+            final byte[] data = parameters[0].getOutputData();
+            return new Block(data, firstHeaderDecoder.decode(data, end), end, range, job);
         }
-        else {
-            log.debug("retrieve from {} to {} status {}", range.start(), range.end(), success);
-            return reThrowIfFatal(previousPosition, spc, end, builder);
-        }
-        moreData = moreDataAfter(header, range);
-        if (moreData != null) {
-            return RetrievalState.MoreDataAvailable;
-        }
-        return RetrievalState.Success;
+        log.debug("retrieve from {} to {} status {}", range.start(), range.end(), success);
+        return reThrowIfFatal(from, spc, end, range, job);
     }
 
-    private RetrievalState reThrowIfFatal(JournalProcessedPosition retrievePosition, final ServiceProgramCall spc,
-                                          JournalProcessedPosition latestJournalPosition, final ParameterListBuilder builder)
+    /** Makes the block the one being read and starts fetching the rest of its range, if any. */
+    private RetrievalState install(Block block, JournalProcessedPosition previousPosition) throws IOException {
+        this.offset = -1;
+        this.entryHeader = null;
+        this.position = new JournalProcessedPosition(previousPosition);
+        this.moreData = null;
+        this.outputData = block.outputData();
+        this.header = block.header();
+        // handles belong to this job; if it is not the one that allocated the outstanding ones they
+        // died with their own job and the budget starts again
+        pointerHandles.observeJob(block.job());
+        totalTransferred += header.totalBytes();
+        log.debug("retrieve from {} to {} header {}", block.range().start(), block.range().end(), header);
+        if (header.status() == OffsetStatus.MORE_DATA_NEW_OFFSET && header.offset() == 0) {
+            log.error("buffer too small need to skip this entry {}", previousPosition);
+            this.position.setPosition(header.nextPosition());
+        }
+        if (!hasData()) {
+            this.position.setPosition(block.end());
+        }
+        final MoreData more = moreDataAfter(header, block.range());
+        if (more == null) {
+            return RetrievalState.Success;
+        }
+        if (shouldPrefetch()) {
+            armPrefetch(more);
+        }
+        else {
+            moreData = more;
+        }
+        return RetrievalState.MoreDataAvailable;
+    }
+
+    /** Not while the pointer handle budget is spent: the connection is about to be replaced. */
+    private boolean shouldPrefetch() {
+        return config.prefetch() && !pointerHandles.shouldCycle();
+    }
+
+    private void armPrefetch(MoreData more) throws IOException {
+        final JournalProcessedPosition from = more.continuation();
+        final Optional<PositionRange> rangeOpt = continuationRange(more, from);
+        if (rangeOpt.isEmpty()) {
+            moreData = more;
+            return;
+        }
+        // resolved on the caller's thread, the holder is not thread safe
+        final AS400 as400 = config.as400().connection();
+        final PositionRange range = rangeOpt.get();
+        log.debug("prefetching the rest of the range {}", range);
+        prefetch = Prefetch.start(fetcher, as400, from, range);
+    }
+
+    /** A background call never overlaps with a foreground one. */
+    private void awaitDiscarded() throws InterruptedException {
+        final Prefetch leftover = discarded;
+        if (leftover != null) {
+            leftover.discard();
+            discarded = null;
+        }
+    }
+
+    /** The connection must not be replaced while this is true. */
+    public boolean prefetchInFlight() {
+        final Prefetch pending = prefetch;
+        return pending != null && !pending.task().isDone();
+    }
+
+    /** What the last call took on the wire. */
+    public long lastRpcMs() {
+        return lastRpcMs;
+    }
+
+    /** How long the caller stood still for the last block; the difference with {@link #lastRpcMs()} was hidden. */
+    public long lastWaitMs() {
+        return lastWaitMs;
+    }
+
+    private static long elapsedMs(long startedNanos) {
+        return (System.nanoTime() - startedNanos) / 1_000_000;
+    }
+
+    /** The call for the next block, on a thread of its own. */
+    record Prefetch(JournalProcessedPosition from, PositionRange range, FutureTask<Block> task) {
+
+        static Prefetch start(BlockFetcher fetcher, AS400 as400, JournalProcessedPosition from, PositionRange range) {
+            final FutureTask<Block> task = new FutureTask<>(() -> fetcher.fetch(as400, from, range));
+            // a thread per block: nothing to shut down on reconnect or restart
+            final Thread thread = new Thread(task, "journal-prefetch");
+            thread.setDaemon(true);
+            thread.start();
+            return new Prefetch(from, range, task);
+        }
+
+        /** Waits for the call and drops its block; killing the job would take the shared connection with it. */
+        void discard() throws InterruptedException {
+            try {
+                task.get();
+            }
+            catch (ExecutionException e) {
+                log.debug("discarded prefetch of {} had failed", range, e.getCause());
+            }
+        }
+    }
+
+    private Block reThrowIfFatal(JournalProcessedPosition retrievePosition, final ServiceProgramCall spc,
+                                 JournalProcessedPosition latestJournalPosition, PositionRange range, String job)
             throws LostJournalException, FatalException {
         for (final AS400Message id : spc.getMessageList()) {
             final String idt = id.getID();
@@ -326,9 +494,8 @@ public class RetrieveJournal {
                     log.debug("Normal when filtering, call failed position {} parameters {} no data received: {}", retrievePosition, builder,
                             id.getText());
                     // if we're filtering we get no continuation offset just an error
-                    header = new FirstHeader(0, 0, 0, OffsetStatus.NO_DATA, latestJournalPosition);
-                    this.position.setPosition(latestJournalPosition);
-                    return RetrievalState.Success;
+                    return new Block(new byte[0], new FirstHeader(0, 0, 0, OffsetStatus.NO_DATA, latestJournalPosition),
+                            latestJournalPosition, range, job);
                 }
                 default:
                     log.error("Call failed position {} parameters {} with error code {} message {}", retrievePosition, idt,
