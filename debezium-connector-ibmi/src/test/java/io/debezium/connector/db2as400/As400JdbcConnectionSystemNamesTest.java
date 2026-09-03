@@ -15,17 +15,23 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
+import java.lang.reflect.Field;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import io.debezium.jdbc.JdbcConnection.BlockingResultSetConsumer;
@@ -38,6 +44,8 @@ import io.debezium.jdbc.JdbcConnection.StatementPreparer;
  * {@code table.include.list} - 462 and 722 rows for ~41 captured tables on the deployment in issue #50,
  * about 25s of round trips on every connector start.
  *
+ * <p>Since issue #71 the same query also carries the table type, for {@code shortIncludes} at task start.
+ *
  * <p>The query is executed through {@code prepareQueryWithBlockingConsumer}, which is stubbed here to
  * capture the statement text and the bound parameters; {@link As400JdbcConnection}'s constructor resolves
  * the real database name eagerly and would otherwise need a live AS400.
@@ -48,7 +56,18 @@ class As400JdbcConnectionSystemNamesTest {
     private final List<String> statements = new ArrayList<>();
     private final List<Map<Integer, String>> boundParameters = new ArrayList<>();
 
-    private void captureQueries() throws Exception {
+    /** {@code CALLS_REAL_METHODS} skips the constructor, so the cache maps are null. */
+    @BeforeEach
+    void giveTheMockItsCaches() throws Exception {
+        for (final String name : List.of("systemToLongTableName", "longToSystemTableName", "tableTypeByUpperName")) {
+            final Field field = As400JdbcConnection.class.getDeclaredField(name);
+            field.setAccessible(true);
+            field.set(connection, new HashMap<>());
+        }
+    }
+
+    /** Records the statement and its parameters, answering with the given {@code (system name, long name, type)} rows. */
+    private void captureQueries(String[]... rows) throws Exception {
         doAnswer(invocation -> {
             statements.add(invocation.getArgument(0));
             final Map<Integer, String> bound = new LinkedHashMap<>();
@@ -57,11 +76,18 @@ class As400JdbcConnectionSystemNamesTest {
                     .when(statement).setString(anyInt(), anyString());
             invocation.getArgument(1, StatementPreparer.class).accept(statement);
             boundParameters.add(bound);
-            // an empty result set: every mapping then resolves lazily, which is the documented fallback
-            final ResultSet resultSet = mock(ResultSet.class);
-            invocation.getArgument(2, BlockingResultSetConsumer.class).accept(resultSet);
+            invocation.getArgument(2, BlockingResultSetConsumer.class).accept(resultSetOf(rows));
             return connection;
         }).when(connection).prepareQueryWithBlockingConsumer(anyString(), any(), any());
+    }
+
+    private static ResultSet resultSetOf(String[]... rows) throws Exception {
+        final ResultSet resultSet = mock(ResultSet.class);
+        final Iterator<String[]> remaining = Arrays.asList(rows).iterator();
+        final String[][] current = { null };
+        doAnswer(next -> remaining.hasNext() && (current[0] = remaining.next()) != null).when(resultSet).next();
+        doAnswer(get -> current[0][get.getArgument(0, Integer.class) - 1]).when(resultSet).getString(anyInt());
+        return resultSet;
     }
 
     @Test
@@ -135,5 +161,32 @@ class As400JdbcConnectionSystemNamesTest {
 
         assertThat(statements.get(0)).contains("upper(table_name) in (?)");
         assertThat(boundParameters.get(0).values()).containsExactly("MYLIB", "ORDERS", "ORDERS");
+    }
+
+    @Test
+    void theTableTypeComesBackWithTheNamesAndAnswersTheTypeLookupWithoutARoundTrip() throws Exception {
+        captureQueries(new String[]{ "ORDERS", "ORDERS", "T" }, new String[]{ "\"Vue10002\"", "Vue1", "V" });
+
+        connection.getAllSystemNames("MYLIB", Set.of("ORDERS", "VUE1"));
+
+        assertThat(statements.get(0)).contains("trim(table_type)");
+        // by either name, in any case, as the per-table query matches
+        assertThat(connection.getTableType("mylib", "orders")).isEqualTo("T");
+        assertThat(connection.getTableType("MYLIB", "VUE10002")).isEqualTo("V");
+        assertThat(connection.getSystemName("MYLIB", "ORDERS")).isEqualTo(Optional.of("ORDERS"));
+        verify(connection, never()).prepareQueryAndMap(anyString(), any(), any());
+    }
+
+    /** The snapshot asks again after task start did; only what is still unresolved is queried, so a missing table is never cached as missing. */
+    @Test
+    void tablesAlreadyResolvedAreNotAskedAboutAgain() throws Exception {
+        captureQueries(new String[]{ "ORDERS", "ORDERS", "T" });
+        connection.getAllSystemNames("MYLIB", Set.of("ORDERS", "GONE"));
+
+        connection.getAllSystemNames("MYLIB", Set.of("ORDERS"));
+        connection.getAllSystemNames("MYLIB", Set.of("ORDERS", "GONE", "NEW"));
+
+        assertThat(statements).hasSize(2);
+        assertThat(boundParameters.get(1).values()).containsExactlyInAnyOrder("MYLIB", "GONE", "NEW", "GONE", "NEW");
     }
 }
