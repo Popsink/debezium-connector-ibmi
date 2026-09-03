@@ -34,6 +34,11 @@ public class As400ChangeEventSourceFactory implements ChangeEventSourceFactory<A
     private final Clock clock;
     private final As400DatabaseSchema schema;
     private final SnapshotterService snapshotterService;
+    /**
+     * Shared by the snapshot and streaming sources: the streaming side's watchdog needs to know whether a
+     * snapshot is actually running to tell a legitimate blocking-snapshot pause from a wedged one (#74).
+     */
+    private final SnapshotActivity snapshotActivity = new SnapshotActivity();
 
     public As400ChangeEventSourceFactory(As400ConnectorConfig configuration, As400ConnectorConfig snapshotConfig,
                                          As400RpcConnection rpcConnection,
@@ -79,12 +84,12 @@ public class As400ChangeEventSourceFactory implements ChangeEventSourceFactory<A
                                                                                                       SnapshotProgressListener<As400Partition> snapshotProgressListener,
                                                                                                       NotificationService<As400Partition, As400OffsetContext> notificationService) {
         return new As400SnapshotChangeEventSource(snapshotConfig, rpcConnection, jdbcConnectionFactory, schema,
-                dispatcher, clock, snapshotProgressListener, notificationService, snapshotterService);
+                dispatcher, clock, snapshotProgressListener, notificationService, snapshotterService, snapshotActivity);
     }
 
     @Override
     public StreamingChangeEventSource<As400Partition, As400OffsetContext> getStreamingChangeEventSource() {
         return new As400StreamingChangeEventSource(configuration, rpcConnection, jdbcConnectionFactory.mainConnection(),
-                dispatcher, errorHandler, clock, schema);
+                dispatcher, errorHandler, clock, schema, snapshotActivity);
     }
 }

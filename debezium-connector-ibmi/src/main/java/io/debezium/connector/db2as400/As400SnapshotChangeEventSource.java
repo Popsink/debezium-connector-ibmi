@@ -51,13 +51,14 @@ public class As400SnapshotChangeEventSource
     private final As400RpcConnection rpcConnection;
     private final As400DatabaseSchema schema;
     protected final SnapshotterService snapshotterService;
+    private final SnapshotActivity snapshotActivity;
 
     public As400SnapshotChangeEventSource(As400ConnectorConfig connectorConfig, As400RpcConnection rpcConnection,
                                           MainConnectionProvidingConnectionFactory<As400JdbcConnection> jdbcConnectionFactory,
                                           As400DatabaseSchema schema, EventDispatcher<As400Partition, TableId> dispatcher, Clock clock,
                                           SnapshotProgressListener<As400Partition> snapshotProgressListener,
                                           NotificationService<As400Partition, As400OffsetContext> notificationService,
-                                          SnapshotterService snapshotterService) {
+                                          SnapshotterService snapshotterService, SnapshotActivity snapshotActivity) {
 
         super(connectorConfig, jdbcConnectionFactory, schema, dispatcher, clock, snapshotProgressListener,
                 notificationService, snapshotterService);
@@ -67,14 +68,27 @@ public class As400SnapshotChangeEventSource
         this.jdbcConnection = jdbcConnectionFactory.mainConnection();
         this.schema = schema;
         this.snapshotterService = snapshotterService;
+        this.snapshotActivity = snapshotActivity;
     }
 
+    /**
+     * Publishes "a snapshot is running" for the whole duration of the snapshot, so the streaming side's
+     * {@link WatchDog} can tell a streaming thread legitimately paused for an ad-hoc blocking snapshot
+     * from one paused on a coordinator pause flag that leaked (issue #74). This has to span the whole
+     * call: the preparation phase before the first row is exported took nearly four minutes in the
+     * reported incident, and it is just as legitimate as the export itself.
+     */
     @Override
     public SnapshotResult<As400OffsetContext> execute(ChangeEventSourceContext context, As400Partition partition,
                                                       As400OffsetContext previousOffset, SnapshottingTask snapshottingTask)
             throws InterruptedException {
-
-        return super.execute(context, partition, previousOffset, snapshottingTask);
+        snapshotActivity.snapshotStarted();
+        try {
+            return super.execute(context, partition, previousOffset, snapshottingTask);
+        }
+        finally {
+            snapshotActivity.snapshotFinished();
+        }
     }
 
     /**

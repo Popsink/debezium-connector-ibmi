@@ -103,7 +103,7 @@ class As400StreamingChangeEventSourceRetryBackoffTest {
         @SuppressWarnings("unchecked")
         final EventDispatcher<As400Partition, TableId> dispatcher = mock(EventDispatcher.class);
         return new As400StreamingChangeEventSource(config, dataConnection, jdbcConnection, dispatcher,
-                mock(ErrorHandler.class), Clock.SYSTEM, mock(As400DatabaseSchema.class));
+                mock(ErrorHandler.class), Clock.SYSTEM, mock(As400DatabaseSchema.class), new SnapshotActivity());
     }
 
     @Test

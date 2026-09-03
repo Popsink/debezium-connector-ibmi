@@ -24,17 +24,23 @@ import org.slf4j.LoggerFactory;
  * {@code wait} ms, otherwise the streaming thread is interrupted. This unsticks interruptible
  * waits (a full queue, a metronome pause); blocked socket reads are bounded separately by the
  * connection's SO_TIMEOUT. Original behaviour, unchanged.</li>
- * <li><b>Blocking-snapshot handshake convergence (issue #27).</b> An ad-hoc blocking snapshot is a
+ * <li><b>Blocking-snapshot handshake liveness (issues #27, #74).</b> An ad-hoc blocking snapshot is a
  * cooperative handshake: the coordinator flips {@code context.isPaused()}, the streaming thread must
- * acknowledge by pausing, and resume once the coordinator flips it back. The streaming thread's view
- * ({@link #pause()}/{@link #resume()}) staying out of sync with the coordinator's for more than
- * {@code pauseTimeout} ms means the handshake is wedged — a requested pause was never honored, or a
- * finished snapshot never resumed streaming — while the connector still reports live. No in-place
- * rescue is attempted: an interrupt cannot reliably resync the handshake (it does not unblock jt400
- * socket I/O, and where it lands it terminates the streaming loop anyway) and cannot unstick the
- * coordinator-side waits at all. Instead the task is failed with an {@link IOException}, which
- * Debezium's {@code ErrorHandler} classifies as retriable, so the task restarts itself (bounded by
- * {@code errors.max.retries}) — the one remedy that clears both wedge directions.</li>
+ * acknowledge by pausing, and resume once the coordinator flips it back. Three states are wedges:
+ * <ul>
+ * <li>the coordinator asked for a pause the streaming thread has not honored,</li>
+ * <li>the coordinator resumed but the streaming thread is still paused,</li>
+ * <li>both sides agree on "paused" while no snapshot is running - the direction that made issue #74
+ * invisible, since a stale pause flag looks exactly like a healthy pause to a checker that only
+ * compares the two views against each other.</li>
+ * </ul>
+ * Any of them lasting longer than {@code pauseTimeout} means the connector has stopped streaming
+ * while still reporting live. No in-place rescue is attempted: an interrupt cannot reliably resync
+ * the handshake (it does not unblock jt400 socket I/O, and where it lands it terminates the
+ * streaming loop anyway) and cannot unstick the coordinator-side waits at all. Instead the task is
+ * failed with an {@link IOException}, which Debezium's {@code ErrorHandler} classifies as retriable,
+ * so the task restarts itself (bounded by {@code errors.max.retries}) - the one remedy that clears
+ * every wedge direction.</li>
  * </ol>
  */
 public class WatchDog {
@@ -44,30 +50,36 @@ public class WatchDog {
     private final long wait;
     private final long pauseTimeout;
     private final BooleanSupplier pausePending;
+    private final BooleanSupplier snapshotRunning;
     private final Consumer<Throwable> onWedged;
 
     private volatile long lastSeen = System.currentTimeMillis();
     private volatile boolean paused = false;
     // handshake state, touched only by the single scheduled checker thread
-    private long desyncSince = 0;
+    private long wedgedSince = 0;
     private boolean wedgeReported = false;
     private ScheduledExecutorService executor;
 
     /**
-     * @param notify       the streaming thread to interrupt when journal activity stalls
-     * @param wait         staleness threshold for {@link #alive()} (ms)
-     * @param pauseTimeout how long the streaming thread's paused view may stay out of sync with the
-     *                     coordinator's blocking-snapshot pause before the task is failed (ms)
-     * @param pausePending the coordinator's view of the blocking-snapshot pause, typically
-     *                     {@code context::isPaused}
-     * @param onWedged     invoked with a retriable exception when the handshake is wedged; typically
-     *                     the connector's {@code ErrorHandler::setProducerThrowable}
+     * @param notify          the streaming thread to interrupt when journal activity stalls
+     * @param wait            staleness threshold for {@link #alive()} (ms)
+     * @param pauseTimeout    how long the blocking-snapshot handshake may stay in a state that is not
+     *                        making progress before the task is failed (ms)
+     * @param pausePending    the coordinator's view of the blocking-snapshot pause, typically
+     *                        {@code context::isPaused}
+     * @param snapshotRunning whether a snapshot is currently running, typically
+     *                        {@code snapshotActivity::isSnapshotRunning}; the pause is only legitimate
+     *                        while this is true
+     * @param onWedged        invoked with a retriable exception when the handshake is wedged; typically
+     *                        the connector's {@code ErrorHandler::setProducerThrowable}
      */
-    public WatchDog(Thread notify, long wait, long pauseTimeout, BooleanSupplier pausePending, Consumer<Throwable> onWedged) {
+    public WatchDog(Thread notify, long wait, long pauseTimeout, BooleanSupplier pausePending, BooleanSupplier snapshotRunning,
+                    Consumer<Throwable> onWedged) {
         this.notify = notify;
         this.wait = wait;
         this.pauseTimeout = pauseTimeout;
         this.pausePending = pausePending;
+        this.snapshotRunning = snapshotRunning;
         this.onWedged = onWedged;
     }
 
@@ -102,38 +114,54 @@ public class WatchDog {
     private void doCheck() {
         final long now = System.currentTimeMillis();
         // invariant 1: journal activity while streaming. Also applies while a pause is pending but not
-        // yet honored — unsticking a stalled thread lets it reach the pause handshake.
+        // yet honored - unsticking a stalled thread lets it reach the pause handshake.
         if (!paused && now - lastSeen > wait) {
             log.warn("No update since {} interrupting streaming thread {}", new Date(lastSeen), notify.getName());
             // grant a full window before interrupting again, whatever the tick
             lastSeen = now;
             notify.interrupt();
         }
-        // invariant 2: the paused view must converge with the coordinator within pauseTimeout. A
-        // short-lived mismatch is normal (the handshake is reached between journal entries); only a
-        // persistent one is a wedge.
-        final boolean coordinatorPaused = pausePending.getAsBoolean();
-        if (paused == coordinatorPaused) {
-            desyncSince = 0;
+        // invariant 2: the handshake must keep making progress. Every state below is transient in a
+        // healthy connector (a pause is acknowledged between journal entries, a snapshot starts right
+        // after the acknowledgement); only one that persists past pauseTimeout is a wedge.
+        final String direction = wedgeDirection();
+        if (direction == null) {
+            wedgedSince = 0;
             wedgeReported = false;
             return;
         }
-        if (desyncSince == 0) {
-            desyncSince = now;
+        if (wedgedSince == 0) {
+            wedgedSince = now;
             return;
         }
-        if (!wedgeReported && now - desyncSince > pauseTimeout) {
+        if (!wedgeReported && now - wedgedSince > pauseTimeout) {
             wedgeReported = true;
-            final String direction = coordinatorPaused
-                    ? "pause requested but streaming thread has not paused"
-                    : "blocking snapshot finished but streaming thread has not resumed";
             log.error("Blocking-snapshot handshake wedged for {}ms ({}); failing the task so it restarts "
-                    + "instead of stalling silently while reporting live (thread {}, issue #27)",
-                    now - desyncSince, direction, notify.getName());
+                    + "instead of stalling silently while reporting live (thread {}, issues #27/#74)",
+                    now - wedgedSince, direction, notify.getName());
             // IOException is classified retriable by Debezium's ErrorHandler: the task restarts itself
             onWedged.accept(new IOException(
-                    "Blocking-snapshot handshake wedged: " + direction + " for over " + pauseTimeout + "ms (issue #27)"));
+                    "Blocking-snapshot handshake wedged: " + direction + " for over " + pauseTimeout + "ms (issues #27/#74)"));
         }
+    }
+
+    /**
+     * @return a description of the handshake state the streaming thread is stuck in, or {@code null}
+     *         when the handshake is in a state it can legitimately stay in
+     */
+    private String wedgeDirection() {
+        final boolean coordinatorPaused = pausePending.getAsBoolean();
+        if (paused != coordinatorPaused) {
+            return coordinatorPaused
+                    ? "pause requested but streaming thread has not paused"
+                    : "blocking snapshot finished but streaming thread has not resumed";
+        }
+        if (paused && !snapshotRunning.getAsBoolean()) {
+            // issue #74: the coordinator's pause flag leaked. Both views read "paused" forever, so
+            // comparing them detects nothing; only "nothing is being snapshotted" gives it away.
+            return "streaming paused but no snapshot is running";
+        }
+        return null;
     }
 
     public void alive() {
