@@ -31,6 +31,27 @@ public class Diagnostics {
         }
     }
 
+    /** Cap on the record image bytes {@link #hex} puts in a log line. */
+    public static final int MAX_LOGGED_RECORD_BYTES = 4096;
+
+    /** Contiguous lowercase hex of {@code data[offset, offset + length)}, at most {@code maxBytes} bytes. Clamps, never throws. */
+    public static String hex(byte[] data, int offset, int length, int maxBytes) {
+        if (data == null || length <= 0 || offset < 0 || offset >= data.length) {
+            return "";
+        }
+        final int available = Math.min(length, data.length - offset);
+        final int shown = Math.min(available, Math.max(0, maxBytes));
+        final StringBuilder sb = new StringBuilder(shown * 2 + 40);
+        for (int i = 0; i < shown; i++) {
+            sb.append(Character.forDigit((data[offset + i] >> 4) & 0xf, 16));
+            sb.append(Character.forDigit(data[offset + i] & 0xf, 16));
+        }
+        if (shown < available) {
+            sb.append(" ...(truncated, ").append(available).append(" bytes total)");
+        }
+        return sb.toString();
+    }
+
     public static String binAsHex(byte[] data, int offset, int length) {
         // byte[] bdata = Arrays.copyOfRange(data, offset, offset + length);
         StringBuilder sb = new StringBuilder();

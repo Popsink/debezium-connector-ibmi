@@ -44,6 +44,7 @@ import io.debezium.ibmi.db2.journal.data.types.AS400Lob;
 import io.debezium.ibmi.db2.journal.data.types.AS400VarBin;
 import io.debezium.ibmi.db2.journal.data.types.AS400VarChar;
 import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
+import io.debezium.ibmi.db2.journal.data.types.Diagnostics;
 import io.debezium.ibmi.db2.journal.retrieve.JournalLobFetcher.LobSegment;
 import io.debezium.ibmi.db2.journal.retrieve.SchemaCacheIF.Structure;
 import io.debezium.ibmi.db2.journal.retrieve.SchemaCacheIF.TableInfo;
@@ -124,15 +125,16 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
             if (length > 0) {
                 final List<LobField> lobFields = new ArrayList<>();
                 final List<UndecodableField> undecodable = new ArrayList<>();
-                final Object[] os = decodeEntry(tableInfo.getAs400Structure(), data,
-                        offset + entryHeader.getEntrySpecificDataOffset() + ENTRY_SPECIFIC_DATA_OFFSET, isNull,
+                final int recordStart = offset + entryHeader.getEntrySpecificDataOffset() + ENTRY_SPECIFIC_DATA_OFFSET;
+                final Object[] os = decodeEntry(tableInfo.getAs400Structure(), data, recordStart, isNull,
                         lobFields, undecodable);
                 if (!lobFields.isEmpty()) {
                     resolveLobs(entryHeader, tableInfo, os, lobFields, length);
                 }
                 if (!undecodable.isEmpty()) {
                     // reported here rather than in decodeEntry, which knows the types but not the column names
-                    reportUndecodable(entryHeader, tableInfo, undecodable);
+                    reportUndecodable(entryHeader, tableInfo, undecodable,
+                            Diagnostics.hex(data, recordStart, length, Diagnostics.MAX_LOGGED_RECORD_BYTES));
                 }
                 return os;
             }
@@ -253,7 +255,8 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
      * drowning the log - the pre-existing behaviour was one line per row, at 24 an hour on the deployment in
      * issue #52.
      */
-    private void reportUndecodable(EntryHeader entryHeader, TableInfo tableInfo, List<UndecodableField> fields) {
+    private void reportUndecodable(EntryHeader entryHeader, TableInfo tableInfo, List<UndecodableField> fields,
+                                   String recordImageHex) {
         final List<Structure> columns = tableInfo.getStructure();
         for (final UndecodableField field : fields) {
             final String column = field.index() < columns.size()
@@ -266,13 +269,15 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
             }
             if (field.cause() == null) {
                 log.warn("column {} of {}.{} is blank-filled and not flagged null, read as null instead of "
-                        + "failing the record ({} rows so far)", column, entryHeader.getLibrary(),
-                        entryHeader.getFile(), seen);
+                        + "failing the record ({} rows so far), RRN {} record image (hex) {}", column,
+                        entryHeader.getLibrary(), entryHeader.getFile(), seen, entryHeader.getRelativeRecordNumber(),
+                        recordImageHex);
             }
             else {
                 log.warn("column {} of {}.{} could not be decoded as {}, read as null instead of failing the "
-                        + "record ({} rows so far)", column, entryHeader.getLibrary(), entryHeader.getFile(),
-                        field.type().getClass().getSimpleName(), seen, field.cause());
+                        + "record ({} rows so far), RRN {} record image (hex) {}", column, entryHeader.getLibrary(),
+                        entryHeader.getFile(), field.type().getClass().getSimpleName(), seen,
+                        entryHeader.getRelativeRecordNumber(), recordImageHex, field.cause());
             }
         }
     }
