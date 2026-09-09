@@ -34,11 +34,14 @@ import io.debezium.ibmi.db2.journal.retrieve.Connect;
 import io.debezium.ibmi.db2.journal.retrieve.FileFilter;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.jdbc.JdbcConnection;
+import io.debezium.pipeline.source.snapshot.incremental.ChunkQueryBuilder;
 import io.debezium.relational.Column;
 import io.debezium.relational.ColumnEditor;
+import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables.ColumnNameFilter;
 import io.debezium.relational.Tables.TableFilter;
+import io.debezium.spi.schema.DataCollectionId;
 
 public class As400JdbcConnection extends JdbcConnection implements Connect<Connection, SQLException> {
     private static final Logger log = LoggerFactory.getLogger(As400JdbcConnection.class);
@@ -536,6 +539,11 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
     public String buildSelectWithRowLimits(TableId tableId, int limit, String projection,
                                            Optional<String> condition, Optional<String> additionalCondition, String orderBy,
                                            Optional<String> tableAlias) {
+        if (projection.equals(rrnExpression(tableId)) && condition.isEmpty() && additionalCondition.isEmpty()) {
+            // Max-key probe of an RRN-chunked blocking snapshot: the highest slot in use is the row count
+            // plus the deleted-record count, read from the catalog instead of walking the file backwards.
+            return rrnSlotCountQuery(tableId);
+        }
         // DB2 for i: hint an index-driven, first-n-rows plan so each incremental chunk
         // avoids materialising/sorting the whole table.
         return super.buildSelectWithRowLimits(tableId, limit, projection, condition,
@@ -544,6 +552,11 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
 
     @Override
     public String buildSelectPrimaryKeyBoundaries(TableId tableId, long size, String projection, String orderBy) {
+        if (projection.equals(rrnExpression(tableId))) {
+            // RRN-chunked table: record slots are dense, so the boundary at position n is RRN n itself.
+            // No table access at all, where the probe below walks n rows or index entries per boundary.
+            return "SELECT CAST(" + size + " AS BIGINT) FROM SYSIBM.SYSDUMMY1";
+        }
         // DB2 for i: the blocking-snapshot chunk boundary probe orders by the chunk key (often
         // unindexed) with a large OFFSET. Without a hint the Predictive Query Governor estimates a
         // full sort and can reject the query with SQL0666 on large tables (issue #21). The probe
@@ -551,6 +564,55 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
         // first-row plan and keeps the estimate under QQRYTIMLMT. Mirrors the buildSelectWithRowLimits
         // hint used for incremental chunks above.
         return super.buildSelectPrimaryKeyBoundaries(tableId, size, projection, orderBy) + " OPTIMIZE FOR 1 ROW";
+    }
+
+    @Override
+    public String quoteIdentifier(String name) {
+        // The RRN chunk key is an expression, not a column, and must reach the SQL unquoted.
+        return isRrnExpression(name) ? name : super.quoteIdentifier(name);
+    }
+
+    /**
+     * The table reference the snapshot select puts in its FROM clause: schema unquoted, table quoted only
+     * when it is not a plain SQL identifier (e.g. {@code $SCHAR}).
+     */
+    public static String snapshotTableName(TableId tableId) {
+        String table = tableId.table();
+        if (!table.matches("[A-Za-z_][A-Za-z0-9_]*")) {
+            table = "\"" + table + "\"";
+        }
+        return tableId.schema() + "." + table;
+    }
+
+    /**
+     * The relative record number of a row, usable as a chunk key. DB2 for i resolves the table designator
+     * against the exposed name of the table reference, and accepts the qualified name whether the FROM
+     * clause spelled it quoted or not.
+     */
+    public static String rrnExpression(TableId tableId) {
+        return "RRN(" + snapshotTableName(tableId) + ")";
+    }
+
+    static boolean isRrnExpression(String name) {
+        return name.startsWith("RRN(") && name.endsWith(")");
+    }
+
+    /**
+     * Highest relative record number in use, i.e. rows plus deleted slots summed over the members, from
+     * the catalog. Zero-cost where {@code COUNT(1)} or {@code MAX(RRN(t))} would read the whole file.
+     */
+    public static String rrnSlotCountQuery(TableId tableId) {
+        return "SELECT SUM(NUMBER_ROWS + NUMBER_DELETED_ROWS) FROM QSYS2.SYSPARTITIONSTAT WHERE SYSTEM_TABLE_SCHEMA = '"
+                + tableId.schema().replace("'", "''") + "' AND TABLE_NAME = '" + tableId.table().replace("'", "''") + "'";
+    }
+
+    /**
+     * Lets an incremental snapshot signal chunk on the relative record number with
+     * {@code "surrogate-key": "RRN"}, the way the Oracle connector does with ROWID.
+     */
+    @Override
+    public <T extends DataCollectionId> ChunkQueryBuilder<T> chunkQueryBuilder(RelationalDatabaseConnectorConfig connectorConfig) {
+        return new As400RrnChunkQueryBuilder<>(connectorConfig, this);
     }
 
     // Quote qualified name to handle special chars in table name

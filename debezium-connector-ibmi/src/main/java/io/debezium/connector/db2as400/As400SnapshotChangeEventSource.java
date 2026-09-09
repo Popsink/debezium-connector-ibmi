@@ -8,6 +8,7 @@ package io.debezium.connector.db2as400;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.sql.Types;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Iterator;
@@ -32,6 +33,7 @@ import io.debezium.pipeline.notification.NotificationService;
 import io.debezium.pipeline.source.SnapshottingTask;
 import io.debezium.pipeline.source.spi.SnapshotProgressListener;
 import io.debezium.pipeline.spi.SnapshotResult;
+import io.debezium.relational.Column;
 import io.debezium.relational.RelationalSnapshotChangeEventSource;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
@@ -345,18 +347,18 @@ public class As400SnapshotChangeEventSource
     protected Optional<String> getSnapshotSelect(
                                                  RelationalSnapshotContext<As400Partition, As400OffsetContext> snapshotContext, TableId tableId,
                                                  List<String> columns) {
-        String table = tableId.table();
-        // quote names that aren't plain SQL identifiers (e.g. $SCHAR)
-        if (!table.matches("[A-Za-z_][A-Za-z0-9_]*")) {
-            table = "\"" + table + "\"";
-        }
-        String fullTableName = String.format("%s.%s", tableId.schema(), table);
-        return snapshotterService.getSnapshotQuery().snapshotQuery(fullTableName, columns);
+        return snapshotterService.getSnapshotQuery().snapshotQuery(As400JdbcConnection.snapshotTableName(tableId), columns);
     }
 
     @Override
     protected Long rowCountForTableChunked(TableId tableId) throws SQLException {
         try {
+            final Table table = schema.tableFor(tableId);
+            if (table != null && chunkByRrn(table)) {
+                log.info("Table '{}' is chunked by relative record number ({} key column(s), snapshot.chunk.key.mode={})",
+                        tableId, super.getKeyColumnsForChunking(table).size(), connectorConfig.getSnapshotChunkKeyMode().getValue());
+                return jdbcConnection.queryAndMap(As400JdbcConnection.rrnSlotCountQuery(tableId), rs -> rs.next() ? rs.getLong(1) : 0L);
+            }
             return super.rowCountForTableChunked(tableId);
         }
         catch (SQLException e) {
@@ -368,6 +370,38 @@ public class As400SnapshotChangeEventSource
             };
             throw new SQLException("Failed to count rows for table " + tableId + hint, e.getSQLState(), e.getErrorCode(), e);
         }
+    }
+
+    /**
+     * Chunk on the relative record number instead of the key where the key would be slow: core probes
+     * each boundary with an {@code ORDER BY key OFFSET n} that walks the index up to n, then reads each
+     * chunk in key order, a random page read per row on an arrival-sequence file; a composite key also
+     * yields a cascading-OR predicate the optimizer tends to answer with a table scan and sort per chunk.
+     * RRN boundaries are arithmetic over the catalog slot count and each chunk is a sequential scan.
+     */
+    @Override
+    protected List<Column> getKeyColumnsForChunking(Table table) {
+        return chunkByRrn(table) ? List.of(rrnColumn(table)) : super.getKeyColumnsForChunking(table);
+    }
+
+    private boolean chunkByRrn(Table table) {
+        return switch (connectorConfig.getSnapshotChunkKeyMode()) {
+            case KEY -> false;
+            case RRN -> true;
+            case AUTO -> super.getKeyColumnsForChunking(table).size() != 1;
+        };
+    }
+
+    private static Column rrnColumn(Table table) {
+        return Column.editor()
+                .name(As400JdbcConnection.rrnExpression(table.id()))
+                .jdbcType(Types.DECIMAL)
+                .type("DECIMAL")
+                .length(15)
+                .scale(0)
+                .optional(false)
+                .position(table.columns().size() + 1)
+                .create();
     }
 
     @Override

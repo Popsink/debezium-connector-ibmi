@@ -156,6 +156,24 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                     + "restarted) to avoid a silent wedge.",
             DEFAULT_BLOCKING_SNAPSHOT_PAUSE_TIMEOUT);
 
+    /**
+     * Chunk key of a parallel blocking snapshot. Debezium chunks on the table key, which on DB2 for i
+     * means an OFFSET probe walking the index once per boundary and a key-ordered read per chunk; a
+     * composite key also yields a cascading-OR predicate the optimizer tends to turn into a table scan
+     * plus sort, once per chunk. RRN ranges cost nothing to compute and read in arrival sequence.
+     */
+    public static final Field SNAPSHOT_CHUNK_KEY_MODE = Field.create("snapshot.chunk.key.mode")
+            .withDisplayName("Chunk key of a parallel (snapshot.max.threads > 1) blocking snapshot")
+            .withEnum(SnapshotChunkKeyMode.class, SnapshotChunkKeyMode.AUTO)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("How a table is split into chunks when snapshot.max.threads or its multiplier is above 1. "
+                    + "'key' chunks on the primary key, keyed access path or first unique index (Debezium's stock "
+                    + "behaviour): one index-walking OFFSET probe per boundary and a key-ordered read per chunk, and a "
+                    + "table without any key is read as a single chunk. 'rrn' chunks on the relative record number: "
+                    + "boundaries come from the catalog without touching the table and each chunk is a sequential "
+                    + "arrival-sequence read, keyless tables included. 'auto' (default) uses the key when it is a "
+                    + "single column and RRN otherwise (composite key or no key).");
+
     public static final long DEFAULT_CACHE_ADDITIONAL_DELAY = 5000;
 
     public static final Field JOURNAL_CACHE_ADDITIONAL_DELAY = Field.create("journal.additional.delay", "additional delay when journal caching is enabled",
@@ -328,6 +346,10 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
 
     public UnavailablePositionRecovery getUnavailablePositionRecovery() {
         return unavailablePositionRecovery;
+    }
+
+    public SnapshotChunkKeyMode getSnapshotChunkKeyMode() {
+        return SnapshotChunkKeyMode.parse(config.getString(SNAPSHOT_CHUNK_KEY_MODE), SNAPSHOT_CHUNK_KEY_MODE.defaultValueAsString());
     }
 
     /**
@@ -503,7 +525,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                         SOCKET_TIMEOUT, FROM_CCSID, TO_CCSID, SECURE,
                         DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
                         UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
-                        LOB_FETCH,
+                        SNAPSHOT_CHUNK_KEY_MODE, LOB_FETCH,
                         POINTER_HANDLE_THRESHOLD)
                 .connector(
                         SCHEMA_NAME_ADJUSTMENT_MODE)
@@ -671,6 +693,53 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
 
         public static UnavailablePositionRecovery parse(String value, String defaultValue) {
             UnavailablePositionRecovery mode = parse(value);
+            if (mode == null && defaultValue != null) {
+                mode = parse(defaultValue);
+            }
+            return mode;
+        }
+    }
+
+    /**
+     * Which column a parallel blocking snapshot chunks a table on. See {@link #SNAPSHOT_CHUNK_KEY_MODE}.
+     */
+    public enum SnapshotChunkKeyMode implements EnumeratedValue {
+
+        /** Single-column key: chunk on it. Composite key or no key: chunk on the relative record number. */
+        AUTO("auto"),
+
+        /** Debezium's stock behaviour: chunk on the key, single chunk when there is none. */
+        KEY("key"),
+
+        /** Always chunk on the relative record number. */
+        RRN("rrn");
+
+        private final String value;
+
+        SnapshotChunkKeyMode(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        public static SnapshotChunkKeyMode parse(String value) {
+            if (value == null) {
+                return null;
+            }
+            value = value.trim();
+            for (SnapshotChunkKeyMode option : SnapshotChunkKeyMode.values()) {
+                if (option.getValue().equalsIgnoreCase(value)) {
+                    return option;
+                }
+            }
+            return null;
+        }
+
+        public static SnapshotChunkKeyMode parse(String value, String defaultValue) {
+            SnapshotChunkKeyMode mode = parse(value);
             if (mode == null && defaultValue != null) {
                 mode = parse(defaultValue);
             }
