@@ -83,7 +83,10 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
      * A field for the size of buffer for fetching journal entries default 65535 (should not be smaller)
      */
     public static final Field BUFFER_SIZE = Field.create("buffer.size", "journal buffer size",
-            "size of buffer for fetching journal entries default 131072 (should not be smaller)", "131072");
+            "size of buffer for fetching journal entries default 131072 (should not be smaller). A call takes "
+                    + "longer the bigger it is, so raise max.journal.timeout with it; with journal.prefetch two buffers "
+                    + "can be live at once.",
+            "131072");
 
     /**
      * keep alive flag, should the driver use a secure connection defaults to false
@@ -135,7 +138,9 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
      * Maximum number of journal entries to process server side
      */
     public static final Field MAX_RETRIEVAL_TIMEOUT = Field.create("max.journal.timeout", "max time to fetch the journal entries",
-            "Maximum time to fetch the journal entries in ms", DEFAULT_MAX_JOURNAL_TIMEOUT);
+            "Maximum time in ms the streaming thread may go without progress, which bounds one journal call: "
+                    + "raise it together with buffer.size.",
+            DEFAULT_MAX_JOURNAL_TIMEOUT);
 
     public static final long DEFAULT_BLOCKING_SNAPSHOT_PAUSE_TIMEOUT = 120000;
     /**
@@ -194,6 +199,14 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                     + "system with a constrained job storage limit, raise it to replace the connection less "
                     + "often.",
             DEFAULT_POINTER_HANDLE_THRESHOLD);
+
+    public static final boolean DEFAULT_JOURNAL_PREFETCH = true;
+
+    public static final Field JOURNAL_PREFETCH = Field.create("journal.prefetch",
+            "fetch the next journal block while the current one is dispatched",
+            "Fetch the next block of journal entries in the background while the current one is decoded and "
+                    + "dispatched, at the cost of a second buffer of buffer.size bytes. Set to false to read one block at a time.",
+            DEFAULT_JOURNAL_PREFETCH);
 
     public static final Field TOPIC_NAMING_STRATEGY = Field.create("topic.naming.strategy")
             .withDisplayName("Topic naming strategy class")
@@ -455,6 +468,10 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
         return config.getLong(POINTER_HANDLE_THRESHOLD);
     }
 
+    public boolean isJournalPrefetchEnabled() {
+        return config.getBoolean(JOURNAL_PREFETCH);
+    }
+
     public JournalProcessedPosition getOffset() {
         final String receiver = config.getString(As400OffsetContext.RECEIVER);
         final String lib = config.getString(As400OffsetContext.RECEIVER_LIBRARY);
@@ -493,7 +510,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
             MAX_SERVER_SIDE_ENTRIES, TOPIC_NAMING_STRATEGY, FROM_CCSID, TO_CCSID, SECURE,
             DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
             UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
-            ERRORS_TOLERANCE, LOB_FETCH, POINTER_HANDLE_THRESHOLD);
+            ERRORS_TOLERANCE, LOB_FETCH, POINTER_HANDLE_THRESHOLD, JOURNAL_PREFETCH);
 
     public static ConfigDef configDef() {
         final ConfigDef c = RelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
@@ -504,7 +521,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                         DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
                         UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
                         LOB_FETCH,
-                        POINTER_HANDLE_THRESHOLD)
+                        POINTER_HANDLE_THRESHOLD, JOURNAL_PREFETCH)
                 .connector(
                         SCHEMA_NAME_ADJUSTMENT_MODE)
                 .events(

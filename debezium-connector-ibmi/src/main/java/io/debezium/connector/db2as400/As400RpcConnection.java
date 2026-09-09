@@ -39,6 +39,7 @@ import io.debezium.ibmi.db2.journal.retrieve.RetrieveJournal;
 import io.debezium.ibmi.db2.journal.retrieve.exception.JournalReceiverNotFoundException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
 import io.debezium.ibmi.db2.journal.retrieve.rjne0200.EntryHeader;
+import io.debezium.ibmi.db2.journal.retrieve.rjne0200.FirstHeader;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.DetailedJournalReceiver;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.JournalReceiverInfo;
 import io.debezium.pipeline.source.spi.ChangeEventSource.ChangeEventSourceContext;
@@ -55,6 +56,9 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
     private AS400 as400;
     private static SocketProperties socketProperties = new SocketProperties();
     private final LogLimmiting periodic = new LogLimmiting(5 * 60 * 1000l);
+    private final CatchUpTrend catchUpTrend = new CatchUpTrend();
+    /** walking and dispatching the previous block, the part a prefetch hides */
+    private long lastConsumedMs;
     private final JournalInfoRetrieval journalInfoRetrieval;
     private final As400TextFactory textFactory;
 
@@ -85,6 +89,7 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
                     .withServerFiltering(!transactionMgt)
                     .withIncludeFiles(resolved.includes()).withDumpFolder(config.diagnosticsFolder())
                     .withPointerHandleThreshold(config.getPointerHandleThreshold())
+                    .withPrefetch(config.isJournalPrefetchEnabled())
                     .build();
             retrieveJournal = new RetrieveJournal(rconfig, journalInfoRetrieval);
         }
@@ -241,6 +246,7 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
             watchDog.alive();
 
             if (state.hasData()) {
+                final long started = System.nanoTime();
                 // Also break out when an ad-hoc blocking snapshot has been requested (context.isPaused()).
                 // Over a large shared journal a single block can hold a huge run of entries that are mostly
                 // filtered out; draining it fully keeps refreshing the watchdog (alive() below) yet never
@@ -259,7 +265,7 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
 
                 // note that getPosition returns the current position or the next continuation offset after the current block
                 offsetCtx.setPosition(retrieveJournal.getPosition());
-
+                lastConsumedMs = (System.nanoTime() - started) / 1_000_000;
             }
             // between polls, with the batch dispatched and the position committed: the only safe moment
             // to swap the connection, which a retrieve in flight would be using
@@ -295,6 +301,11 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
         if (!handles.shouldCycle()) {
             return;
         }
+        if (retrieveJournal.prefetchInFlight()) {
+            // no new prefetch starts while the budget is spent, so the next poll can replace it
+            log.debug("deferring the replacement of the connection, a journal retrieve is in flight");
+            return;
+        }
         try {
             log.info("freeing {} outstanding journal pointer handles by replacing the connection",
                     handles.outstanding());
@@ -326,14 +337,45 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
 
     private void logOffsets(JournalProcessedPosition position, RetrievalState state) throws IOException, Exception {
         if (periodic.shouldLogRateLimted("offsets")) {
+            // moves almost no data: the cost of a round trip
+            final long smallCallStarted = System.nanoTime();
             final JournalPosition currentReceiver = getCurrentPosition();
+            final long smallCallMs = (System.nanoTime() - smallCallStarted) / 1_000_000;
             final BigInteger behind = currentReceiver.getOffset().subtract(position.getOffset());
             streamingMetrics.setJournalOffset(currentReceiver.getOffset());
             streamingMetrics.setJournalBehind(behind);
             streamingMetrics.setLastProcessedMs(position.getTimeOfLastProcessed().toEpochMilli());
-            log.info("Current position diagnostics last call {}, header {}, behind {}, currentReceiver", state, retrieveJournal.getFirstHeader(), behind,
-                    currentReceiver);
+            final boolean bufferFull = state == RetrievalState.MoreDataAvailable;
+            final int growthSamples = catchUpTrend.record(behind, bufferFull);
+            streamingMetrics.setJournalBehindGrowthSamples(growthSamples);
+            final FirstHeader header = retrieveJournal.getFirstHeader();
+            log.info("Current position diagnostics last call {}, header {}, behind {}, current receiver {}, "
+                    + "last block rpc {}ms waited {}ms consumed {}ms, small call {}ms, {}, lag growth samples {}", state,
+                    header, behind, currentReceiver, retrieveJournal.lastRpcMs(), retrieveJournal.lastWaitMs(), lastConsumedMs,
+                    smallCallMs, describeLink(header == null ? 0 : header.totalBytes(), retrieveJournal.lastRpcMs(), smallCallMs),
+                    growthSamples);
+            if (growthSamples >= CatchUpTrend.WARN_AFTER) {
+                log.warn("CANNOT CATCH UP: lag grew for {} consecutive samples (now {} behind) with a full {} byte buffer "
+                        + "every call; the journal grows faster than this connection reads it and the position will fall out "
+                        + "of the retained receivers (issue #30). Check the link rate above, raise buffer.size with "
+                        + "max.journal.timeout, or retain receivers for longer.", growthSamples, behind, config.getJournalBufferSize());
+            }
         }
+    }
+
+    /**
+     * Rate the transfer sustained, net of one round trip, and the bytes that fit in a round trip at that
+     * rate. A low rate with tens of KB in flight over a long round trip is a TCP window (an IBM i ships
+     * with 64 KiB, {@code CHGTCPA TCPSNDBUF}), which no buffer size or prefetch gets past.
+     */
+    static String describeLink(long blockBytes, long blockMs, long roundTripMs) {
+        final long transferMs = blockMs - roundTripMs;
+        if (blockBytes <= 0 || transferMs <= 0) {
+            return "link rate n/a";
+        }
+        final long bytesPerSecond = blockBytes * 1000 / transferMs;
+        final long inFlight = bytesPerSecond * roundTripMs / 1000;
+        return String.format("link rate %d KB/s, %d KB in flight per round trip", bytesPerSecond / 1024, inFlight / 1024);
     }
 
     public interface BlockingReceiverConsumer {

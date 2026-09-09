@@ -32,6 +32,7 @@ public class RetrieveConfigBuilder {
     private int maxServerSideEntries = RetrieveConfig.DEFAULT_MAX_SERVER_SIDE_ENTRIES;
     private long pointerHandleThreshold = PointerHandles.DEFAULT_THRESHOLD;
     private boolean filtering;
+    private boolean prefetch = true;
 
     public RetrieveConfigBuilder() {
     }
@@ -121,8 +122,17 @@ public class RetrieveConfigBuilder {
         return this;
     }
 
+    /**
+     * Whether to fetch the next block of the journal while the current one is being read - see
+     * {@link RetrieveJournal}. On by default; off falls back to one retrieve at a time.
+     */
+    public RetrieveConfigBuilder withPrefetch(boolean prefetch) {
+        this.prefetch = prefetch;
+        return this;
+    }
+
     public RetrieveConfig build() {
         return new RetrieveConfig(as400, textFactory, journalInfo, journalBufferSize, filtering, filterCodes, includeFiles, maxServerSideEntries, dumpFolder,
-                pointerHandleThreshold);
+                pointerHandleThreshold, prefetch);
     }
 }
