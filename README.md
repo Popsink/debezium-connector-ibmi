@@ -41,6 +41,32 @@ PARTITIONS=3
 REPLICATION_FACTOR=3
 ```
 
+## Parallel snapshot chunking
+
+With `snapshot.max.threads` above 1, Debezium splits each table into chunks and reads them in
+parallel. Out of the box the chunk key is the primary key, failing that the physical file's keyed
+access path, failing that the first unique index. Each chunk boundary is then located with an
+`ORDER BY key OFFSET n` probe that walks the index up to the boundary, and each chunk is read in key
+order, which on a large arrival-sequence file is a random page read per row. A composite key adds a
+cascading-OR predicate the optimizer tends to answer with a table scan and sort per chunk. A table
+with no key at all is read as a single chunk.
+
+`snapshot.chunk.key.mode` chooses the chunk key instead:
+
+| value | behaviour |
+|---|---|
+| `auto` (default) | single-column key: chunk on it; composite key or no key: chunk on the relative record number |
+| `key` | Debezium's stock behaviour |
+| `rrn` | always chunk on the relative record number |
+
+RRN chunking takes the number of record slots (rows plus deleted records) from
+`QSYS2.SYSPARTITIONSTAT`, splits that range evenly without any query against the table, and reads
+each chunk with `WHERE RRN(table) >= ? AND RRN(table) < ? ORDER BY RRN(table)`, a sequential scan of
+that slot range. Chunks are even in slots rather than rows, so a file carrying many deleted records
+gets uneven chunks until it is reorganised. The Kafka record key is not affected.
+
+An incremental snapshot can chunk on RRN as well: send the signal with `"surrogate-key": "RRN"`.
+
 # Limitations
 
 * TODO integrate with exit program to prevent journal loss https://github.com/jhc-systems/debezium-ibmi-exitpgm
