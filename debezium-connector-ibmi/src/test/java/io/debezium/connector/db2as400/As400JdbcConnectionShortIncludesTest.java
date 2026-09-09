@@ -6,16 +6,22 @@
 package io.debezium.connector.db2as400;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 
 import java.sql.SQLException;
 import java.util.List;
 import java.util.Optional;
 
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 
 import io.debezium.ibmi.db2.journal.retrieve.FileFilter;
 
@@ -24,12 +30,19 @@ import io.debezium.ibmi.db2.journal.retrieve.FileFilter;
  * from the SQL catalog without an RPC call: a table that does not exist is always dropped (Debezium
  * ignores include-list entries with no matching table), an SQL view only with {@code errors.tolerance=all}.
  *
+ * <p>Also covers the per-schema catalog prefetch that runs before the per-table lookups (issue #71).</p>
+ *
  * <p>Exercised through a {@code CALLS_REAL_METHODS} mock — {@link As400JdbcConnection}'s constructor
  * eagerly resolves the real database name and would otherwise require a live AS400.</p>
  */
 public class As400JdbcConnectionShortIncludesTest {
 
     private final As400JdbcConnection connection = mock(As400JdbcConnection.class, CALLS_REAL_METHODS);
+
+    @BeforeEach
+    void thePrefetchReturnsNothing() throws Exception {
+        doNothing().when(connection).getAllSystemNames(anyString(), any());
+    }
 
     @Test
     void tolerant_mode_skips_missing_tables_and_views() throws Exception {
@@ -74,5 +87,27 @@ public class As400JdbcConnectionShortIncludesTest {
         // Then the table that does not exist is dropped as Debezium drops it everywhere else, while the view
         // is kept and fails later, loudly, when its journal is resolved
         assertThat(includes).containsExactly(new FileFilter("LIB1", "T1"), new FileFilter("LIB1", "VUE10002"));
+    }
+
+    @Test
+    void the_include_list_is_prefetched_once_per_schema_before_any_per_table_lookup() throws Exception {
+        doReturn("T").when(connection).getTableType(anyString(), anyString());
+        doReturn(Optional.of("X")).when(connection).getSystemName(anyString(), anyString());
+
+        connection.shortIncludes("LIB1", "LIB1.T1,T2,LIB2.T3,LIB1.\"T4\"", false);
+
+        final InOrder order = inOrder(connection);
+        order.verify(connection).getAllSystemNames("LIB1", List.of("T1", "T2", "T4"));
+        order.verify(connection).getAllSystemNames("LIB2", List.of("T3"));
+        order.verify(connection).getTableType("LIB1", "T1");
+    }
+
+    @Test
+    void a_failed_prefetch_falls_back_to_the_per_table_lookups() throws Exception {
+        doThrow(new SQLException("catalog unavailable")).when(connection).getAllSystemNames(anyString(), any());
+        doReturn("T").when(connection).getTableType("LIB1", "T1");
+        doReturn(Optional.of("T1")).when(connection).getSystemName("LIB1", "T1");
+
+        assertThat(connection.shortIncludes("LIB1", "LIB1.T1", false)).containsExactly(new FileFilter("LIB1", "T1"));
     }
 }
