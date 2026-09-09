@@ -24,6 +24,7 @@ import io.debezium.DebeziumException;
 import io.debezium.connector.db2as400.As400ConnectorConfig.UnavailablePositionRecovery;
 import io.debezium.connector.db2as400.As400RpcConnection.BlockingReceiverConsumer;
 import io.debezium.data.Envelope.Operation;
+import io.debezium.ibmi.db2.journal.data.types.Diagnostics;
 import io.debezium.ibmi.db2.journal.retrieve.JournalEntryType;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.ibmi.db2.journal.retrieve.exception.FatalException;
@@ -534,10 +535,12 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                 throw e;
             }
             catch (final Exception e) {
+                // same line as the throwable, so the dead-letter record carries the row bytes
                 log.error("Failed to process record at offset = " + eheader.getSequenceNumber() + "  in table = " + longName +
                         " at RRN = " + eheader.getRelativeRecordNumber() + " [journalCode = " + eheader.getJournalCode() + ", journalEntryType = "
                         + eheader.getJournalEntryType() + "], " +
-                        "skipping and dumping diagnostics if enabled ...", e);
+                        "skipping and dumping diagnostics if enabled ... record image (hex) = "
+                        + r.currentRecordImageHex(Diagnostics.MAX_LOGGED_RECORD_BYTES), e);
             }
         };
     }
