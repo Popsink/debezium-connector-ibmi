@@ -32,6 +32,7 @@ import com.ibm.as400.access.ProgramParameter;
 import com.ibm.as400.access.SecureAS400;
 import com.ibm.as400.access.ServiceProgramCall;
 
+import io.debezium.ibmi.db2.journal.data.types.Diagnostics;
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalCriteria.JournalCode;
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalCriteria.JournalEntryType;
 import io.debezium.ibmi.db2.journal.retrieve.exception.FatalException;
@@ -636,6 +637,15 @@ public class RetrieveJournal {
 
     public int getOffset() {
         return offset;
+    }
+
+    /** The current entry's record image as hex, capped at {@code maxBytes}; "" without a current entry. */
+    public String currentRecordImageHex(int maxBytes) {
+        if (entryHeader == null || outputData == null) {
+            return "";
+        }
+        final int start = offset + entryHeader.getEntrySpecificDataOffset() + JournalEntryDeocder.ENTRY_SPECIFIC_DATA_OFFSET;
+        return Diagnostics.hex(outputData, start, entryHeader.getLength() - JournalEntryDeocder.ENTRY_SPECIFIC_DATA_OFFSET, maxBytes);
     }
 
     public <T> T decode(JournalEntryDeocder<T> decoder) throws Exception {

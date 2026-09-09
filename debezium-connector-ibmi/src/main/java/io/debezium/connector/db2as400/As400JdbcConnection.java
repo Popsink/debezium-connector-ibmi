@@ -17,6 +17,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -58,10 +59,11 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
     /**
      * Matches on either name, as loosely as {@link #GET_TABLE_TYPE}: the captured set may name a table by
      * its long or its system name, and {@code SYSTEM_TABLE_NAME} comes back delimited when it is not an
-     * ordinary identifier. The placeholder list is bound twice, once per column.
+     * ordinary identifier. The placeholder list is bound twice, once per column. The type comes along so the
+     * same round trip also answers {@link #getTableType}.
      */
     private static final String GET_SYSTEM_TABLE_NAMES = """
-            select trim(system_table_name), trim(table_name) from qsys2.systables
+            select trim(system_table_name), trim(table_name), trim(table_type) from qsys2.systables
             where system_table_schema=?
             and (upper(table_name) in (%1$s) or upper(replace(system_table_name, '"', '')) in (%1$s))
             """;
@@ -98,6 +100,8 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
 
     private final Map<String, String> systemToLongTableName = new HashMap<>();
     private final Map<String, Optional<String>> longToSystemTableName = new HashMap<>();
+    /** {@code TABLE_TYPE} by upper-cased {@code schema.name}, under both names, as {@link #GET_TABLE_TYPE} matches. */
+    private final Map<String, String> tableTypeByUpperName = new HashMap<>();
     private final String realDatabaseName;
 
     /**
@@ -156,9 +160,8 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
         if (includes == null || includes.isBlank()) {
             return Collections.<FileFilter> emptyList();
         }
-        final String[] incs = includes.split(",");
-        final List<FileFilter> r = new ArrayList<>();
-        for (String tableName : incs) {
+        final List<IncludeEntry> entries = new ArrayList<>();
+        for (String tableName : includes.split(",")) {
             String schemaName = "";
             int o = tableName.lastIndexOf('.');
             if (o > 0) {
@@ -178,9 +181,33 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
                 schemaName = schema;
             }
 
-            final String tableSchema = schemaName;
             // AS400 does not handle double-quote escaping, so remove them before building FileFilter object
-            final String bareTableName = tableName.replaceAll("\"", "");
+            entries.add(new IncludeEntry(schemaName, tableName.replaceAll("\"", "")));
+        }
+
+        // One round trip per schema; the per-table lookups below used to cost two each, serially, which put a
+        // hard ceiling on the include list at the task-start budget (issue #71). They remain the fallback.
+        final Map<String, List<String>> tablesBySchema = new LinkedHashMap<>();
+        for (final IncludeEntry entry : entries) {
+            tablesBySchema.computeIfAbsent(entry.schema(), k -> new ArrayList<>()).add(entry.table());
+        }
+        for (final Map.Entry<String, List<String>> perSchema : tablesBySchema.entrySet()) {
+            try {
+                getAllSystemNames(perSchema.getKey(), perSchema.getValue());
+            }
+            catch (final SQLException e) {
+                log.warn("failed to prefetch the catalog entries of schema {}, resolving its tables one by one", perSchema.getKey(), e);
+            }
+            catch (final InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("interrupted while prefetching the catalog entries of schema {}", perSchema.getKey(), e);
+            }
+        }
+
+        final List<FileFilter> r = new ArrayList<>();
+        for (final IncludeEntry entry : entries) {
+            final String tableSchema = entry.schema();
+            final String bareTableName = entry.table();
             final IncludedObject included = classify(tableSchema, bareTableName);
             if (included == IncludedObject.MISSING) {
                 log.error("dropping {}.{} from the journal filters, no such table - nothing will be captured for it",
@@ -195,6 +222,9 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
             getSystemName(tableSchema, bareTableName).map(x -> r.add(new FileFilter(tableSchema, x)));
         }
         return r;
+    }
+
+    private record IncludeEntry(String schema, String table) {
     }
 
     /** What the SQL catalog says about an entry of {@code table.include.list}. */
@@ -225,6 +255,10 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
 
     /** The {@code TABLE_TYPE} of a table named by its long or system name, null when there is no such object. */
     String getTableType(String schemaName, String tableName) throws SQLException {
+        final String cached = tableTypeByUpperName.get(typeKey(schemaName, tableName));
+        if (cached != null) {
+            return cached;
+        }
         return prepareQueryAndMap(GET_TABLE_TYPE,
                 call -> {
                     call.setString(1, schemaName);
@@ -233,6 +267,10 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
                 },
                 singleResultMapper(rs -> rs.getString(1).trim(), (String) null,
                         String.format("no entry in qsys2.systables for %s.%s", schemaName, tableName)));
+    }
+
+    private static String typeKey(String schemaName, String tableName) {
+        return String.format("%s.%s", schemaName.toUpperCase(), tableName.toUpperCase());
     }
 
     /** Upper-cased long and system names of every file in the schema that still has a member; a file without one fails any SQL access with {@code SQL0204}. */
@@ -350,9 +388,15 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
      * size of the source rather than with {@code table.include.list} - hundreds of rows and tens of seconds
      * on every connector start on a long-lived IBM i system, undoing the scoping the column read before it
      * already applies. A table missing from the result is not an error: it resolves lazily on first use.
+     * Tables an earlier call already resolved are not asked about again.
      */
     public void getAllSystemNames(String schemaName, Collection<String> tableNames) throws SQLException, InterruptedException {
-        final List<String> names = tableNames.stream().map(String::toUpperCase).distinct().toList();
+        final List<String> names = tableNames.stream().map(String::toUpperCase).distinct()
+                .filter(name -> !tableTypeByUpperName.containsKey(typeKey(schemaName, name)))
+                .toList();
+        if (names.isEmpty()) {
+            return;
+        }
         int fetched = 0;
         for (int from = 0; from < names.size(); from += SYSTEM_NAME_BATCH_SIZE) {
             fetched += fetchSystemNames(schemaName, names.subList(from, Math.min(from + SYSTEM_NAME_BATCH_SIZE, names.size())));
@@ -376,10 +420,15 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
                     while (rs.next()) {
                         final String systemName = rs.getString(1);
                         final String tableName = rs.getString(2);
+                        final String tableType = rs.getString(3);
                         final String longKey = String.format("%s.%s", schemaName, tableName);
                         longToSystemTableName.put(longKey, Optional.of(systemName));
                         final String shortKey = String.format("%s.%s", schemaName, systemName);
                         systemToLongTableName.put(shortKey, tableName);
+                        if (tableType != null) {
+                            tableTypeByUpperName.put(typeKey(schemaName, tableName), tableType);
+                            tableTypeByUpperName.put(typeKey(schemaName, systemName.replace("\"", "")), tableType);
+                        }
                         fetched[0]++;
                     }
                 });

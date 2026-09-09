@@ -197,6 +197,16 @@ When the lag (`behind`, `JournalBehind`) has grown for three consecutive samples
 every call, the connector logs `CANNOT CATCH UP` at WARN and exposes the count as
 `JournalBehindGrowthSamples`: it reads as fast as the buffer and link allow and the journal still
 grows faster, so it will drift out of the retained receivers (see "Journals deleted").
+### Journal entries that cannot be processed
+
+A journal entry the connector cannot decode or dispatch is skipped with one **ERROR** line naming the offset,
+table, RRN, journal code and entry type, and the position moves past it. A single field that cannot be decoded
+(a blank-filled numeric, say) does not cost the row: it is read as null and logged at **WARN** with the column
+name, once per row-count decade. Both lines end with the row's **record image in hex** (the bytes after the
+journal entry's 16-byte length prefix, capped at 4 KiB), so the offending column can be checked by hand from the
+log alone: slice `2 * byteLength` hex characters per column in table-format order. `4040…` is an uninitialised
+field, random bytes are corruption, a valid-looking pattern that is shifted means the table format changed
+after the entry was journaled. The RRN is what the customer needs to locate the row.
 
 ## Memory
 
