@@ -164,7 +164,7 @@ public class As400StreamingChangeEventSourceSkipLogTest {
 
         final As400StreamingChangeEventSource source = new As400StreamingChangeEventSource(config,
                 oneEntryBlock(undecodableEntry(), insertOnCapturedTable()), jdbcConnection(), dispatcher,
-                mock(ErrorHandler.class), Clock.SYSTEM, schema);
+                mock(ErrorHandler.class), Clock.SYSTEM, schema, new SnapshotActivity());
 
         source.execute(new SingleIterationContext(), new As400Partition(config.getLogicalName()), offsetContext);
 
