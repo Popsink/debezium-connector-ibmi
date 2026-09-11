@@ -99,7 +99,7 @@ class As400StreamingChangeEventSourceRecoveryTest {
         @SuppressWarnings("unchecked")
         final EventDispatcher<As400Partition, TableId> dispatcher = mock(EventDispatcher.class);
         return new As400StreamingChangeEventSource(config, dataConnection, jdbcConnection, dispatcher,
-                mock(ErrorHandler.class), Clock.SYSTEM, mock(As400DatabaseSchema.class));
+                mock(ErrorHandler.class), Clock.SYSTEM, mock(As400DatabaseSchema.class), new SnapshotActivity());
     }
 
     private void execute(As400StreamingChangeEventSource source, int iterations) throws InterruptedException {

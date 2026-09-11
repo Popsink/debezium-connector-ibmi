@@ -179,7 +179,8 @@ public class As400StreamingChangeEventSourceHeartbeatTest {
                 positionAt(BLOCK_START.subtract(BigInteger.ONE), true));
 
         final As400StreamingChangeEventSource source = new As400StreamingChangeEventSource(config,
-                dataConnection(state), jdbcConnection(), dispatcher, mock(ErrorHandler.class), Clock.SYSTEM, schema);
+                dataConnection(state), jdbcConnection(), dispatcher, mock(ErrorHandler.class), Clock.SYSTEM, schema,
+                new SnapshotActivity());
 
         source.execute(new SingleIterationContext(), new As400Partition(config.getLogicalName()), offsetContext);
         return offsetContext;

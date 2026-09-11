@@ -144,21 +144,22 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
 
     public static final long DEFAULT_BLOCKING_SNAPSHOT_PAUSE_TIMEOUT = 120000;
     /**
-     * How long (ms) the streaming thread's paused view may stay out of sync with the coordinator's
-     * ad-hoc blocking-snapshot pause before the {@link WatchDog} fails the task with a retriable error
-     * so it restarts. Guards the issue #27 wedges, where either a requested pause is never honored (the
-     * thread churns inside {@code getJournalEntries} over a large shared journal, refreshing the activity
-     * watchdog but never reaching the pause handshake, so the snapshot never starts) or a finished
-     * snapshot never resumes streaming. Should be comfortably larger than {@code max.journal.timeout}
-     * and than the worst-case time to process a single journal entry (including dispatching a large
-     * buffered transaction into a backpressured queue), since the pause handshake is only reached
-     * between entries.
+     * How long (ms) the ad-hoc blocking-snapshot handshake may stay stuck before the {@link WatchDog}
+     * fails the task with a retriable error so it restarts. Guards all three wedge directions: a
+     * requested pause that is never honored (the thread churns inside {@code getJournalEntries} over a
+     * large shared journal, refreshing the activity watchdog but never reaching the pause handshake, so
+     * the snapshot never starts, issue #27), a finished snapshot that never resumes streaming (#27), and
+     * streaming paused with no snapshot running at all (#74). Should be comfortably larger than
+     * {@code max.journal.timeout} and than the worst-case time to process a single journal entry
+     * (including dispatching a large buffered transaction into a backpressured queue), since the pause
+     * handshake is only reached between entries. It does not bound the snapshot itself: a blocking
+     * snapshot may run for hours without being treated as a wedge.
      */
     public static final Field BLOCKING_SNAPSHOT_PAUSE_TIMEOUT = Field.create("blocking.snapshot.pause.timeout.ms",
             "blocking snapshot pause timeout",
-            "Max time in ms the streaming thread may stay out of sync with a coordinator-requested ad-hoc "
-                    + "blocking-snapshot pause/resume before the task is failed with a retriable error (and "
-                    + "restarted) to avoid a silent wedge.",
+            "Max time in ms the ad-hoc blocking-snapshot pause handshake may stay stuck - a requested pause not "
+                    + "honored, a finished snapshot not resumed, or streaming paused with no snapshot running - "
+                    + "before the task is failed with a retriable error (and restarted) to avoid a silent wedge.",
             DEFAULT_BLOCKING_SNAPSHOT_PAUSE_TIMEOUT);
 
     public static final long DEFAULT_CACHE_ADDITIONAL_DELAY = 5000;

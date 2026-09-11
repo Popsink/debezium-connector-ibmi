@@ -55,7 +55,7 @@ public class As400SnapshotChangeEventSourceMemberlessTest {
         return new As400SnapshotChangeEventSource(new As400ConnectorConfig(builder.build()),
                 mock(As400RpcConnection.class), factory, mock(As400DatabaseSchema.class),
                 mock(EventDispatcher.class), Clock.SYSTEM, mock(SnapshotProgressListener.class),
-                mock(NotificationService.class), mock(SnapshotterService.class));
+                mock(NotificationService.class), mock(SnapshotterService.class), new SnapshotActivity());
     }
 
     private void discovered(TableId... tables) throws SQLException {

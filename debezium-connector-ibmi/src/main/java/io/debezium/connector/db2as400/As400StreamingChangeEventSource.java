@@ -49,6 +49,10 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
     private static final int MAX_RETRIES = 20;
     /** Retry backoff grows from {@code poll.interval.ms} up to this multiple of it, then stays there. */
     private static final long MAX_RETRY_BACKOFF_MULTIPLIER = 8;
+    /** How often the paused streaming thread re-checks and re-acknowledges the blocking-snapshot pause. */
+    private static final long PAUSE_POLL_INTERVAL_MS = 250;
+    /** How often a still-paused streaming thread reports that it is waiting, so a pause is never silent. */
+    private static final long PAUSE_REPORT_INTERVAL_MS = 60_000;
 
     private static final Logger log = LoggerFactory.getLogger(As400StreamingChangeEventSource.class);
 
@@ -74,11 +78,14 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
     private final Map<String, TransactionContext> txMap = new HashMap<>();
     private final Map<String, List<As400ChangeRecord>> bufferRecordMap = new HashMap<>();
     private final String database;
+    private final SnapshotActivity snapshotActivity;
     private As400OffsetContext offsetContext;
 
     public As400StreamingChangeEventSource(As400ConnectorConfig connectorConfig, As400RpcConnection dataConnection,
                                            As400JdbcConnection jdbcConnection, EventDispatcher<As400Partition, TableId> dispatcher,
-                                           ErrorHandler errorHandler, Clock clock, As400DatabaseSchema schema) {
+                                           ErrorHandler errorHandler, Clock clock, As400DatabaseSchema schema,
+                                           SnapshotActivity snapshotActivity) {
+        this.snapshotActivity = snapshotActivity;
         this.connectorConfig = connectorConfig;
         this.dataConnection = dataConnection;
         this.jdbcConnection = jdbcConnection;
@@ -124,27 +131,20 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
         int retries = 0;
         final WatchDog watchDog = new WatchDog(Thread.currentThread(), connectorConfig.getMaxRetrievalTimeout(),
                 connectorConfig.getBlockingSnapshotPauseTimeout(), context::isPaused,
-                errorHandler::setProducerThrowable);
+                snapshotActivity::isSnapshotRunning, errorHandler::setProducerThrowable);
         watchDog.start();
         try {
             while (context.isRunning()) {
                 // Cooperate with the coordinator when an ad-hoc blocking snapshot is requested:
-                // acknowledge the pause so the blocking snapshot can start, then wait for it to
-                // complete before resuming journal streaming. Without this the coordinator's
-                // blocking-snapshot thread waits forever on waitStreamingPaused() and the snapshot
-                // never runs. getJournalEntries() also checks isPaused() and returns promptly once a
-                // pause is requested (issue #27), so this handshake is reached within one journal entry
-                // rather than after a whole shared-journal block; if it is not reached at all the
-                // WatchDog fails the task with a retriable error so it restarts.
+                // acknowledge the pause so the blocking snapshot can start, then wait for it to complete
+                // before resuming journal streaming. Without this the coordinator's blocking-snapshot
+                // thread waits forever on waitStreamingPaused() and the snapshot never runs.
+                // getJournalEntries() also checks isPaused() and returns promptly once a pause is
+                // requested (issue #27), so this handshake is reached within one journal entry rather
+                // than after a whole shared-journal block; if it is not reached at all the WatchDog fails
+                // the task with a retriable error so it restarts.
                 if (context.isPaused()) {
-                    log.info("Streaming will now pause for an ad-hoc blocking snapshot");
-                    // The streaming thread parks in waitSnapshotCompletion() below and stops calling
-                    // watchDog.alive(); suspend the watchdog so it does not interrupt us mid-snapshot.
-                    watchDog.pause();
-                    context.streamingPaused();
-                    context.waitSnapshotCompletion();
-                    watchDog.resume();
-                    log.info("Streaming resumed after blocking snapshot");
+                    awaitBlockingSnapshots(context, watchDog);
                 }
                 try {
                     try {
@@ -208,6 +208,62 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
         finally {
             watchDog.stop();
         }
+    }
+
+    /**
+     * Parks journal streaming for as long as the coordinator keeps {@code context.isPaused()} set, i.e.
+     * for the whole run of ad-hoc blocking snapshots it dispatches back to back, re-acknowledging the
+     * pause on every tick.
+     * <p>
+     * The obvious implementation - acknowledge once with {@code streamingPaused()} and then park in
+     * {@code context.waitSnapshotCompletion()} - deadlocks with the coordinator (issue #74), and did so
+     * twice in one hour in production. {@code waitSnapshotCompletion()} loops on the coordinator's
+     * {@code paused} flag and only re-reads it after re-acquiring the coordinator's lock, which the
+     * resuming thread holds until it has signalled. The blocking-snapshot executor is single-threaded,
+     * so it goes straight from resuming one snapshot to starting the next queued one, and that next task
+     * sets {@code paused = true} (and {@code streaming = true}) again before the woken streaming thread
+     * gets the lock back. The streaming thread then sees "paused" once more and parks again - this time
+     * for good, because the acknowledgement it already sent was consumed by the previous snapshot and the
+     * new task is itself parked in {@code waitStreamingPaused()} waiting for an acknowledgement that can
+     * no longer come. Both sides read "paused" forever, no snapshot runs, streaming never resumes, and
+     * nothing fails: the connector freezes while every health probe stays green.
+     * <p>
+     * Polling the flag instead of parking on the condition breaks that: the pause is acknowledged again
+     * on every tick, so a snapshot task that started while we were already paused gets its handshake and
+     * runs, and the acknowledgement can no longer be lost to a race. The cost is one lock acquisition and
+     * a {@code signalAll()} with no waiters every {@value #PAUSE_POLL_INTERVAL_MS} ms while paused, and up
+     * to that much added latency before streaming resumes - negligible next to a snapshot.
+     * <p>
+     * The pause is not bounded here: a legitimate blocking snapshot can run for hours, so a timeout on
+     * this loop would abort real work. The {@link WatchDog} bounds it instead, using "a snapshot is
+     * running" to tell a healthy pause from a wedged one.
+     */
+    private void awaitBlockingSnapshots(ChangeEventSourceContext context, WatchDog watchDog) throws InterruptedException {
+        log.info("Streaming will now pause for an ad-hoc blocking snapshot");
+        // The streaming thread stops calling watchDog.alive() while parked here; suspend the activity
+        // invariant so it does not interrupt us mid-snapshot. The handshake invariant keeps running.
+        watchDog.pause();
+        final long pausedAt = System.currentTimeMillis();
+        long nextReport = pausedAt + PAUSE_REPORT_INTERVAL_MS;
+        try {
+            while (context.isRunning() && context.isPaused()) {
+                // (re-)acknowledge the pause: this is what a coordinator task parked in
+                // waitStreamingPaused() is waiting for, whether it asked before or after we paused
+                context.streamingPaused();
+                final long now = System.currentTimeMillis();
+                if (now >= nextReport) {
+                    // a multi-hour pause would otherwise be indistinguishable from a freeze in the logs
+                    log.info("Still paused for an ad-hoc blocking snapshot after {}s (snapshot running: {})",
+                            (now - pausedAt) / 1000, snapshotActivity.isSnapshotRunning());
+                    nextReport = now + PAUSE_REPORT_INTERVAL_MS;
+                }
+                Thread.sleep(PAUSE_POLL_INTERVAL_MS);
+            }
+        }
+        finally {
+            watchDog.resume();
+        }
+        log.info("Streaming resumed after blocking snapshot, paused for {}ms", System.currentTimeMillis() - pausedAt);
     }
 
     /**
