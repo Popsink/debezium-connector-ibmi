@@ -16,6 +16,7 @@ import static org.mockito.Mockito.when;
 
 import java.math.BigInteger;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
@@ -673,6 +674,130 @@ class ReceiverPaginationTest {
 
         assertThrows(LostJournalException.class, () -> jreceivers.findRange(as400, inDeletedReceiver));
         verify(journalInfoRetrieval, times(2)).getReceivers(any(), any());
+    }
+
+    // ---- issue #79: a resolved range must never take streaming backwards ----
+
+    /** A receiver chain long enough to tell "rewound to the oldest retained receiver" apart from a small slip. */
+    private static DetailedJournalReceiver receiver(String name, long attach, long start, long end, JournalStatus status) {
+        return new DetailedJournalReceiver(
+                new JournalReceiverInfo(new JournalReceiver(name, "jlib"), new Date(attach), status, Optional.of(1)),
+                BigInteger.valueOf(start), BigInteger.valueOf(end), Optional.empty(), 1, 1);
+    }
+
+    private final DetailedJournalReceiver oldest = receiver("jOLD", 10, 1_000, 1_999, JournalStatus.OnlineSavedDetached);
+    private final DetailedJournalReceiver middle = receiver("jMID", 20, 2_000, 2_999, JournalStatus.OnlineSavedDetached);
+    private final DetailedJournalReceiver newest = receiver("jNEW", 30, 3_000, 3_500, JournalStatus.Attached);
+
+    @Test
+    void findRangeRefusesToRestartFromTheOldestReceiverWhenTheOffsetIsZeroed() throws Exception {
+        final ReceiverPagination jreceivers = new ReceiverPagination(journalInfoRetrieval, 100_000, journalInfo);
+
+        when(journalInfoRetrieval.getReceivers(any(), any())).thenReturn(Arrays.asList(oldest, middle, newest));
+        when(journalInfoRetrieval.getDelayedDetailedJournalReceiver(any(), any())).thenReturn(Optional.of(newest));
+
+        // streaming on the newest receiver with the offset zeroed: resolving this gives the start of the
+        // oldest retained receiver, which is the 71M entry rewind of issue #79
+        final JournalProcessedPosition zeroed = new JournalProcessedPosition(BigInteger.ZERO,
+                new JournalReceiver("jNEW", "jlib"), Instant.ofEpochSecond(0), true);
+
+        assertTrue(jreceivers.findRange(as400, zeroed).isEmpty(), "the rewinding range must be refused");
+        assertEquals(new JournalReceiver("jNEW", "jlib"), zeroed.getReceiver(),
+                "the caller's position must be left where it was, or the next poll resolves the same range again");
+        assertEquals(BigInteger.ZERO, zeroed.getOffset(), "the caller's offset must be left where it was");
+    }
+
+    @Test
+    void findRangeRefusesARangeThatEndsBeforeItStarts() throws Exception {
+        final ReceiverPagination jreceivers = new ReceiverPagination(journalInfoRetrieval, 100_000, journalInfo);
+
+        when(journalInfoRetrieval.getReceivers(any(), any())).thenReturn(Arrays.asList(newest));
+        when(journalInfoRetrieval.getDelayedDetailedJournalReceiver(any(), any())).thenReturn(Optional.of(newest));
+
+        // caught up past the delayed head reading: it only knows about 3500, we have processed 3550
+        final JournalProcessedPosition aheadOfTheDelayedHead = new JournalProcessedPosition(BigInteger.valueOf(3_550),
+                new JournalReceiver("jNEW", "jlib"), Instant.ofEpochSecond(0), true);
+
+        assertTrue(jreceivers.findRange(as400, aheadOfTheDelayedHead).isEmpty(), "the inverted range must be refused");
+        assertEquals(BigInteger.valueOf(3_550), aheadOfTheDelayedHead.getOffset(), "the caller's position must be untouched");
+    }
+
+    @Test
+    void findRangeRefusesTheRewindARollOntoAReceiverStartingAtZeroLeadsTo() throws Exception {
+        final ReceiverPagination jreceivers = new ReceiverPagination(journalInfoRetrieval, 100_000, journalInfo);
+
+        // freshly attached and reporting no entries yet, so it starts before the receiver it follows
+        final DetailedJournalReceiver empty = receiver("jNEW", 30, 0, 0, JournalStatus.Attached);
+        when(journalInfoRetrieval.getReceivers(any(), any())).thenReturn(Arrays.asList(oldest, middle, empty));
+        when(journalInfoRetrieval.getDelayedDetailedJournalReceiver(any(), any())).thenReturn(Optional.of(empty));
+
+        // caught up: exactly on the end of the previous receiver, processed
+        final JournalProcessedPosition position = new JournalProcessedPosition(BigInteger.valueOf(2_999),
+                new JournalReceiver("jMID", "jlib"), Instant.ofEpochSecond(0), true);
+
+        // the roll itself moves the position onto the new receiver, which is forward and allowed - but the
+        // receiver reports a start of zero, so it leaves a zeroed offset behind
+        jreceivers.findRange(as400, position);
+        assertEquals(new JournalReceiver("jNEW", "jlib"), position.getReceiver());
+        assertEquals(BigInteger.ZERO, position.getOffset(), "the zeroed offset the rewind is resolved from");
+
+        // the next poll is where issue #79 bites: a zeroed offset resolves to the oldest retained
+        // receiver. Refusing it stalls the connector, loudly, instead of silently re-reading 9 hours
+        assertTrue(jreceivers.findRange(as400, position).isEmpty(), "the rewinding range must be refused");
+        assertEquals(new JournalReceiver("jNEW", "jlib"), position.getReceiver(), "position left as the refused call found it");
+        assertEquals(BigInteger.ZERO, position.getOffset(), "position left as the refused call found it");
+    }
+
+    @Test
+    void findRangeAllowsAnOrdinaryForwardRange() throws Exception {
+        final ReceiverPagination jreceivers = new ReceiverPagination(journalInfoRetrieval, 100_000, journalInfo);
+
+        when(journalInfoRetrieval.getReceivers(any(), any())).thenReturn(Arrays.asList(oldest, middle, newest));
+        when(journalInfoRetrieval.getDelayedDetailedJournalReceiver(any(), any())).thenReturn(Optional.of(newest));
+
+        // part way through the oldest receiver, catching up towards the head
+        final JournalProcessedPosition catchingUp = new JournalProcessedPosition(BigInteger.valueOf(1_500),
+                new JournalReceiver("jOLD", "jlib"), Instant.ofEpochSecond(0), true);
+
+        final Optional<PositionRange> result = jreceivers.findRange(as400, catchingUp);
+        assertEquals(new PositionRange(false, catchingUp,
+                new JournalPosition(newest.end(), newest.info().receiver())), result.get());
+    }
+
+    @Test
+    void findRangeAllowsARollOnAJournalThatResetsSequenceNumbers() throws Exception {
+        final ReceiverPagination jreceivers = new ReceiverPagination(journalInfoRetrieval, 100_000, journalInfo);
+
+        // SEQOPT(*RESET): every receiver restarts numbering at 1, which is the case on almost every
+        // journal of the test system. The roll must not read as a rewind, or the guard stalls the
+        // connector at every receiver change
+        final DetailedJournalReceiver s1 = receiver("s1", 10, 1, 999, JournalStatus.OnlineSavedDetached);
+        final DetailedJournalReceiver s2 = receiver("s2", 20, 1, 999, JournalStatus.OnlineSavedDetached);
+        final DetailedJournalReceiver s3 = receiver("s3", 30, 1, 500, JournalStatus.Attached);
+        when(journalInfoRetrieval.getReceivers(any(), any())).thenReturn(new ArrayList<>(Arrays.asList(s1, s2, s3)));
+        when(journalInfoRetrieval.getDelayedDetailedJournalReceiver(any(), any())).thenReturn(Optional.of(s3));
+
+        // caught up on the end of s1, so the roll moves the position onto s2, back down to sequence 1
+        final JournalProcessedPosition position = new JournalProcessedPosition(BigInteger.valueOf(999),
+                new JournalReceiver("s1", "jlib"), Instant.ofEpochSecond(0), true);
+
+        final Optional<PositionRange> result = jreceivers.findRange(as400, position);
+        assertEquals(new JournalReceiver("s2", "jlib"), result.get().start().getReceiver(), "moved on to the next receiver");
+        assertEquals(BigInteger.ONE, result.get().start().getOffset(), "a lower sequence number, but forward in the chain");
+    }
+
+    @Test
+    void findRangeAllowsAFreshStartFromTheEarliestReceiver() throws Exception {
+        final ReceiverPagination jreceivers = new ReceiverPagination(journalInfoRetrieval, 100_000, journalInfo);
+
+        when(journalInfoRetrieval.getReceivers(any(), any())).thenReturn(Arrays.asList(oldest, middle, newest));
+        when(journalInfoRetrieval.getDelayedDetailedJournalReceiver(any(), any())).thenReturn(Optional.of(newest));
+
+        // no offset at all: nothing has been dispatched, so the earliest receiver is the right answer
+        final Optional<PositionRange> result = jreceivers.findRange(as400, new JournalProcessedPosition());
+
+        assertEquals(oldest.start(), result.get().start().getOffset());
+        assertEquals(oldest.info().receiver(), result.get().start().getReceiver());
     }
 
 }
