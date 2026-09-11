@@ -35,6 +35,8 @@ class As400ConnectorConfigRecoveryTest {
         assertThat(config("snapshot").getUnavailablePositionRecovery()).isEqualTo(UnavailablePositionRecovery.SNAPSHOT);
         assertThat(config("earliest").getUnavailablePositionRecovery()).isEqualTo(UnavailablePositionRecovery.EARLIEST);
         assertThat(config("EARLIEST").getUnavailablePositionRecovery()).isEqualTo(UnavailablePositionRecovery.EARLIEST);
+        assertThat(config("latest").getUnavailablePositionRecovery()).isEqualTo(UnavailablePositionRecovery.LATEST);
+        assertThat(config("LATEST").getUnavailablePositionRecovery()).isEqualTo(UnavailablePositionRecovery.LATEST);
     }
 
     @Test

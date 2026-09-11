@@ -110,7 +110,8 @@ Three things are done to keep this from turning into a silent crash-loop:
   | --- | --- |
   | `fail` (default) | Stop with a distinct, non-transient error (marker `IBMI_OFFSET_NO_LONGER_AVAILABLE`) so an orchestrator can reset the offset / trigger a snapshot / alert, rather than retry to death. |
   | `snapshot` | Reset the offset and let the configured `snapshot.mode` take a fresh snapshot to re-establish table state, then resume streaming from the current journal position. Use with `snapshot.mode=initial`/`always`/`when_needed`. A snapshot cannot be started from the streaming thread, so when the position is lost mid-stream the task fails with the same marker and the snapshot is taken by the startup recovery on the next start. |
-  | `earliest` | Reset streaming to the earliest available journal receiver and continue. Intended for streaming-only / `no_data` connectors. Changes between the lost position and the earliest available receiver are **unrecoverable** and a loud warning is logged. |
+  | `earliest` | Reset streaming to the earliest available journal receiver and continue. Intended for streaming-only / `no_data` connectors. Changes between the lost position and the earliest available receiver are **unrecoverable** and a loud warning is logged. Its cost scales with retention x journal rate: everything already delivered is re-read. On a busy journal this is effectively a denial of service against yourself - see below. |
+  | `latest` | Reset streaming to the current journal head and continue, replaying nothing. Recommended for streaming-only / `no_data` connectors. Changes between the lost position and the head are **unrecoverable** and a loud warning is logged - exactly the same gap as `earliest`, without the replay. |
 
   Mid-stream recovery is bounded: 20 consecutive failed polls fail the task rather than looping forever.
   A lost connection (`IOException`, or the jt400 driver's `SQLNonTransientConnectionException`) is
@@ -125,6 +126,13 @@ Three things are done to keep this from turning into a silent crash-loop:
 Data already lost from pruned receivers cannot be recovered via CDC; recovery is about getting the
 connector healthy again, not replaying the gap. Ad-hoc snapshots (both incremental and blocking) are
 also supported via the signalling channel.
+
+`earliest` and `latest` therefore leave the same gap: entries between the lost position and the resume
+point are gone either way. What `earliest` adds is re-reading everything the target already has. On a
+measured deployment with 2.7 days of retention and ~15 000 entries/s, `earliest` reset the connector
+3.5 billion entries behind and it needed ~8 days to return to where it already was - longer than the
+retention window, so it could never catch up. Prefer `latest` unless the journal is low-volume and you
+specifically want the retained entries replayed.
 
 ### Blocking-snapshot pause safety
 
