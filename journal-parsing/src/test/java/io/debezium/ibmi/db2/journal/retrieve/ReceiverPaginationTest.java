@@ -707,6 +707,40 @@ class ReceiverPaginationTest {
         assertEquals(BigInteger.ZERO, zeroed.getOffset(), "the caller's offset must be left where it was");
     }
 
+    /**
+     * What produced the rewind in the first place: a poll that crosses a receiver roll resolves its range
+     * from the freshly read receiver list, whose attached receiver carries the live end, while the head we
+     * are allowed to read up to is deliberately held back by the journal cache delay. Reading past it is
+     * what leaves the next poll - which does clamp that receiver to the delayed reading - resolving a range
+     * that ends behind the position just committed.
+     */
+    @Test
+    void findRangeNeverReadsPastTheDelayedJournalHead() throws Exception {
+        final ReceiverPagination jreceivers = new ReceiverPagination(journalInfoRetrieval, 1_000_000, journalInfo);
+
+        final DetailedJournalReceiver previous = receiver("jPRV", 10, 1, 950, JournalStatus.OnlineSavedDetached);
+        // the live list: the attached receiver has reached 1200
+        final DetailedJournalReceiver attached = receiver("jATT", 20, 1, 1_200, JournalStatus.Attached);
+        when(journalInfoRetrieval.getReceivers(any(), any())).thenReturn(Arrays.asList(previous, attached));
+
+        // the delayed head has only reached 300 of it, the entries after that may still be in the journal cache
+        final DetailedJournalReceiver delayedHead = receiver("jATT", 20, 1, 300, JournalStatus.Attached);
+        when(journalInfoRetrieval.getDelayedDetailedJournalReceiver(any(), any()))
+                .thenReturn(Optional.of(previous)) // still reading back the receiver we are on
+                .thenReturn(Optional.of(delayedHead)); // and then it moves on to the attached one
+
+        // caught up with the end of the previous receiver
+        final JournalProcessedPosition position = new JournalProcessedPosition(BigInteger.valueOf(950),
+                previous.info().receiver(), Instant.ofEpochSecond(0), true);
+
+        jreceivers.findRange(as400, position); // primes the cache, nothing to read
+        final PositionRange range = jreceivers.findRange(as400, position).get();
+
+        assertEquals(delayedHead.info().receiver(), range.end().receiver());
+        assertEquals(BigInteger.valueOf(300), range.end().getOffset(),
+                "the range must stop at the delayed head, not at the live end of the attached receiver");
+    }
+
     @Test
     void findRangeRefusesARangeThatEndsBeforeItStarts() throws Exception {
         final ReceiverPagination jreceivers = new ReceiverPagination(journalInfoRetrieval, 100_000, journalInfo);

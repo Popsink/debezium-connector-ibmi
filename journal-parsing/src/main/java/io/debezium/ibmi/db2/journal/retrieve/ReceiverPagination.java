@@ -162,6 +162,13 @@ public class ReceiverPagination {
             // last call to current position won't include the correct end offset so we need to refresh the list
             cachedReceivers = journalInfoRetrieval.getReceivers(as400, journalInfo);
             cachedEndPosition = endPosition;
+            // the list is read live, the head we are allowed to read up to is deliberately held back by the
+            // journal cache delay: without this the newly attached receiver goes into the list carrying its
+            // real end, the range resolved from it runs past the delayed head, and the next poll - which
+            // clamps that same receiver back to the delayed reading in the branch above - resolves a range
+            // ending behind the position we just committed. That range is what rewound streaming by up to
+            // max.entries with nothing in the logs (issue #79)
+            updateEndPosition(cachedReceivers, endPosition);
         }
 
         Optional<PositionRange> endOpt = findPosition(startPosition, maxServerSideEntriesBI, cachedReceivers,
