@@ -5,6 +5,7 @@
  */
 package io.debezium.connector.db2as400;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -14,6 +15,7 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.DebeziumException;
 import io.debezium.bean.StandardBeanNames;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
@@ -191,8 +193,8 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
      * Debezium core throw a generic, retried-to-death engine failure. Transient validation failures are
      * left to propagate so the engine restart is a legitimate retry.
      */
-    private void applyUnavailablePositionRecovery(As400ConnectorConfig connectorConfig, As400RpcConnection rpcConnection,
-                                                  Offsets<As400Partition, As400OffsetContext> previousOffsets) {
+    static void applyUnavailablePositionRecovery(As400ConnectorConfig connectorConfig, As400RpcConnection rpcConnection,
+                                                 Offsets<As400Partition, As400OffsetContext> previousOffsets) {
         if (!connectorConfig.isLogPositionCheckEnabled()) {
             return;
         }
@@ -207,7 +209,8 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
                     throw new OffsetNoLongerAvailableException(
                             "stored journal position " + offset.getPosition() + " is no longer available on the server "
                                     + "(pruned receiver). Reset the offset and trigger a snapshot, or set "
-                                    + "'" + As400ConnectorConfig.UNAVAILABLE_POSITION_RECOVERY.name() + "' to 'snapshot' or 'earliest' to auto-recover.");
+                                    + "'" + As400ConnectorConfig.UNAVAILABLE_POSITION_RECOVERY.name()
+                                    + "' to 'snapshot', 'latest' or 'earliest' to auto-recover.");
                 case SNAPSHOT:
                     LOGGER.warn("Stored journal position {} is no longer available (pruned receiver); resetting the offset so "
                             + "snapshot.mode '{}' can take a fresh snapshot to fill the gap.", offset.getPosition(), connectorConfig.getSnapshotMode().getValue());
@@ -219,7 +222,30 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
                             + "receiver are unrecoverable.", offset.getPosition());
                     offset.setPosition(new JournalProcessedPosition());
                     break;
+                case LATEST:
+                    final JournalProcessedPosition head = currentJournalHead(rpcConnection, offset);
+                    LOGGER.warn("DATA GAP: stored journal position {} is no longer available (pruned receiver); resetting streaming to "
+                            + "the current journal head {}. Changes between the lost position and the head are unrecoverable - as they "
+                            + "are under 'earliest', which replays the whole retained journal to recover none of them.",
+                            offset.getPosition(), head);
+                    offset.setPosition(head);
+                    break;
             }
+        }
+    }
+
+    /**
+     * The position the journal is currently attached at, marked processed so streaming resumes after it
+     * rather than re-reading it. A failure here is transient (RPC/connection), so it propagates and the
+     * engine restart is a legitimate retry rather than a silent reset to an arbitrary position.
+     */
+    private static JournalProcessedPosition currentJournalHead(As400RpcConnection rpcConnection, As400OffsetContext offset) {
+        try {
+            return new JournalProcessedPosition(rpcConnection.getCurrentPosition(), Instant.now(), true);
+        }
+        catch (As400RpcConnection.RpcException e) {
+            throw new DebeziumException("transient failure while resolving the current journal head to recover lost journal position "
+                    + offset.getPosition() + " from", e);
         }
     }
 

@@ -169,8 +169,9 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                     + "retention). 'fail' (default) stops with a distinct, non-transient error so an orchestrator can "
                     + "reset the offset or alert; 'snapshot' resets the offset and lets the configured snapshot.mode take "
                     + "a fresh snapshot to fill the gap; 'earliest' resets streaming to the earliest available journal "
-                    + "receiver and continues, logging that changes between the lost position and the earliest receiver "
-                    + "are unrecoverable.");
+                    + "receiver and continues, replaying the whole retained journal; 'latest' resets streaming to the "
+                    + "current journal head and continues, replaying nothing. Both 'earliest' and 'latest' log that "
+                    + "changes between the lost position and the resume point are unrecoverable.");
 
     public As400ConnectorConfig(Configuration config) {
         // Debezium treats table.include.list as regex (filters + the base snapshot's re-filter via
@@ -526,8 +527,19 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
          * Reset streaming to the earliest journal receiver still available and continue. Intended for
          * streaming-only / {@code no_data} connectors; changes between the lost position and the
          * earliest available receiver are unrecoverable and a loud warning is logged.
+         * <p>
+         * The cost of this scales with retention x journal rate: everything the target already has is
+         * re-read, and none of it is data the gap lost. On a busy journal prefer {@link #LATEST}.
          */
-        EARLIEST("earliest");
+        EARLIEST("earliest"),
+
+        /**
+         * Reset streaming to the current journal head and continue, replaying nothing. Intended for
+         * streaming-only / {@code no_data} connectors; changes between the lost position and the head
+         * are unrecoverable and a loud warning is logged - exactly as they are under {@link #EARLIEST},
+         * which recovers no extra data for the replay it costs.
+         */
+        LATEST("latest");
 
         private final String value;
 
