@@ -33,7 +33,8 @@ jobs:
           DATE=$(date +%Y.%m.%d)
           BASE_VERSION="${DEBEZIUM_VERSION}-ppsk-${DATE}"
 
-          # Find the next available version by checking existing git tags.
+          # Find the next available version by checking existing git tags, which are pushed before
+          # the deploy and so cover attempts that failed part way through as well as releases.
           # If v3.4.2-ppsk-2026.03.17 is taken, try v3.4.2-ppsk-2026.03.17-1, etc.
           VERSION="${BASE_VERSION}"
           COUNTER=0
@@ -91,6 +92,17 @@ jobs:
             -DgenerateBackupPoms=false \
             -DprocessAllModules=true
 
+      # Claiming the version before the deploy, not after. The registry refuses to overwrite an
+      # artifact, so a deploy that fails part way through still leaves that version taken - and a tag
+      # written only on success would never record it, leaving every later run that day to recompute
+      # the same version and fail on `already_exists` until the date rolls over.
+      - name: Claim the release version with its tag
+        run: |
+          git -C ibmi config user.name "github-actions[bot]"
+          git -C ibmi config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C ibmi tag "v${{ steps.version.outputs.version }}"
+          git -C ibmi push origin "v${{ steps.version.outputs.version }}"
+
       - name: Deploy release to GCP Artifact Registry
         run: |
           ./ibmi/mvnw deploy \
@@ -101,10 +113,3 @@ jobs:
             -Dhttp.keepAlive=false \
             -Dmaven.wagon.http.pool=false \
             -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
-
-      - name: Create and push release tag
-        run: |
-          git -C ibmi config user.name "github-actions[bot]"
-          git -C ibmi config user.email "github-actions[bot]@users.noreply.github.com"
-          git -C ibmi tag "v${{ steps.version.outputs.version }}"
-          git -C ibmi push origin "v${{ steps.version.outputs.version }}"
