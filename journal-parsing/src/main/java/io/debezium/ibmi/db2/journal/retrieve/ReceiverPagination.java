@@ -9,7 +9,6 @@ import java.math.BigInteger;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
-import java.util.function.Supplier;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -27,16 +26,6 @@ public class ReceiverPagination {
     private final BigInteger maxServerSideEntriesBI;
     private DetailedJournalReceiver cachedEndPosition;
     private List<DetailedJournalReceiver> cachedReceivers = null;
-    /** why the last poll resolved no range, so a refusal that repeats is not logged again at the same level */
-    private String refusal = null;
-    /** consecutive polls the current refusal has held for */
-    private int refusals = 0;
-    /**
-     * How many consecutive refusals stop being the transient disagreement between the live receiver list and
-     * the deliberately delayed journal head. That one clears within the delay window - seconds - whereas a
-     * refusal that outlives this many polls is a connector that has stopped advancing and has to be seen.
-     */
-    private static final int REFUSALS_BEFORE_ESCALATING = 10;
 
     ReceiverPagination(JournalInfoRetrieval journalInfoRetrieval, int maxServerSideEntries, JournalInfo journalInfo) {
         this.journalInfoRetrieval = journalInfoRetrieval;
@@ -52,77 +41,9 @@ public class ReceiverPagination {
         return Optional.empty();
     }
 
-    /**
-     * Resolves the range for this poll, or {@code null} when {@link #resolveRange} would not resolve one.
-     *
-     * <p>The range is used as resolved: it is not compared against the position it was given, so a range
-     * that starts before that position, or one that ends before its own start, is returned like any
-     * other. The refusals that remain are the ones raised where the range is built, and they leave the
-     * caller's position alone; {@link #refuse} reports them once when they start, and at ERROR if they
-     * do not clear.</p>
-     */
     PositionRange _findRange(AS400 as400, JournalProcessedPosition startPosition, DetailedJournalReceiver endPosition) throws Exception {
-        final PositionRange range = resolveRange(as400, startPosition, endPosition);
-        if (range == null) {
-            // resolveRange refused it and said why; it leaves the caller's position alone
-            return null;
-        }
-        resolved();
-        return range;
-    }
-
-    /**
-     * Reports a range we would not use, once per occurrence rather than once per poll.
-     *
-     * <p>The inversion this guards against recurs at every receiver roll for as long as the delayed journal
-     * head takes to catch up, so on a journal that rolls every few minutes logging it at ERROR on every poll
-     * buries the genuine cases (issue #79). The first poll of a refusal is a WARN carrying the detail, the
-     * ones after it are DEBUG, and a refusal that holds for {@value #REFUSALS_BEFORE_ESCALATING} polls is an
-     * ERROR: at that point streaming has stopped advancing and it is no longer a known transient.</p>
-     */
-    private void refuse(String reason, Supplier<String> detail) {
-        if (!reason.equals(refusal)) {
-            refusal = reason;
-            refusals = 1;
-            log.warn("REFUSING A RANGE: {}. No call is made this poll, the position is left where it is and the "
-                    + "range is resolved again next poll. Detail: {}", reason, detail.get());
-            return;
-        }
-        refusals++;
-        if (refusals % REFUSALS_BEFORE_ESCALATING == 0) {
-            log.error("REFUSING A RANGE: {}, for {} polls running - streaming is not advancing, this is no longer "
-                    + "the transient disagreement between the receiver list and the delayed journal head. Detail: {}",
-                    reason, refusals, detail.get());
-            return;
-        }
-        log.debug("still refusing a range: {} ({} polls)", reason, refusals);
-    }
-
-    /** Called when a range is resolved, so the next refusal is reported as a new occurrence. */
-    private void resolved() {
-        if (refusal != null) {
-            log.info("resolving ranges again after {} refused poll(s): {}", refusals, refusal);
-            refusal = null;
-            refusals = 0;
-        }
-    }
-
-    private PositionRange resolveRange(AS400 as400, JournalProcessedPosition startPosition, DetailedJournalReceiver endPosition) throws Exception {
         final BigInteger start = startPosition.getOffset();
-        final boolean hasReceiver = startPosition.getReceiver() != null && startPosition.getReceiver().name() != null;
-        // only a position with nothing in it is a fresh start. An explicit zero offset that names a receiver is
-        // not: it is a position we were streaming from with its offset lost, and resolving it to the earliest
-        // retained receiver is the rewind of issue #79 - tens of millions of entries re-read, silently. Refuse
-        // it instead, so it shows up as a connector that has stopped rather than one that has started over
-        if (startPosition.isOffsetSet() && start.signum() == 0 && hasReceiver) {
-            final JournalProcessedPosition zeroed = new JournalProcessedPosition(startPosition);
-            refuse("the position has a zero offset on receiver " + startPosition.getReceiver().name(),
-                    () -> String.format("position %s carries a receiver but no usable offset; resolving it would "
-                            + "restart from the earliest retained receiver of %s", zeroed, cachedReceivers));
-            return null;
-        }
-        // a zero offset with no receiver at all is the blank position an unset offset also produces
-        final boolean fromBeginning = !startPosition.isOffsetSet() || (start.signum() == 0 && !hasReceiver);
+        final boolean fromBeginning = !startPosition.isOffsetSet() || start.equals(BigInteger.ZERO);
 
         if (cachedEndPosition == null) {
             cachedEndPosition = endPosition;
@@ -136,11 +57,6 @@ public class ReceiverPagination {
 
         if (fromBeginning) {
             DetailedJournalReceiver first = cachedReceivers.get(0);
-            // every path below that resolves a concrete range returns fromBeginning=false, so
-            // ParameterListBuilder's own "starting from beginning" warning never fires for them: say it
-            // here instead, where it is true regardless of what the range ends up being (issue #79)
-            log.warn("no usable offset in position {}, streaming will resume from the earliest retained receiver {}",
-                    startPosition, first);
             startPosition = new JournalProcessedPosition(first.start(), first.info().receiver(), Instant.EPOCH, false);
         }
 
@@ -159,15 +75,11 @@ public class ReceiverPagination {
             cachedEndPosition = endPosition;
         }
 
-        // the delayed head, not the cached reading of it: it is the furthest we are allowed to read to
-        // (issue #79)
         Optional<PositionRange> endOpt = findPosition(startPosition, maxServerSideEntriesBI, cachedReceivers,
-                endPosition);
+                cachedEndPosition);
         if (endOpt.isEmpty()) {
             log.warn("retrying to find end offset");
             cachedReceivers = journalInfoRetrieval.getReceivers(as400, journalInfo);
-            // this list is live, so it is clamped to the delayed head before anything is resolved from it
-            updateEndPosition(cachedReceivers, endPosition);
             endOpt = findPosition(startPosition, maxServerSideEntriesBI, cachedReceivers, endPosition);
             if (endOpt.isEmpty()) {
                 // our position isn't in the journal's receivers any more, e.g. the receivers were deleted
@@ -200,8 +112,7 @@ public class ReceiverPagination {
      * @param startPosition
      * @param endJournalPosition
      * @param maxServerSideEntriesBI
-     * @return the range to read, or {@code null} when there is nothing to read because the journal head is
-     *         behind the position
+     * @return
      * @throws Exception
      */
     PositionRange paginateInSameReceiver(JournalProcessedPosition startPosition, DetailedJournalReceiver endJournalPosition, BigInteger maxServerSideEntriesBI)
@@ -210,16 +121,6 @@ public class ReceiverPagination {
             throw new Exception(String.format("Error this method is only valid for same receiver start %s, end %s", startPosition, endJournalPosition));
         }
         final BigInteger diff = endJournalPosition.end().subtract(startPosition.getOffset());
-        if (diff.signum() < 0) {
-            // the head we are allowed to read up to is behind the position we have already dispatched, which
-            // happens for as long as the delayed head takes to catch up with a position committed just after a
-            // receiver roll. There is nothing to read, and asking the server for an inverted range earns a
-            // CPF7054 that used to be read as a pruned journal and reset the offset (issue #79)
-            refuse("the delayed journal head is behind the position on receiver " + endJournalPosition.info().receiver().name(),
-                    () -> String.format("position %s is %s entries past the journal head reading %s, nothing to read "
-                            + "until the head catches up", startPosition, diff.negate(), endJournalPosition));
-            return null;
-        }
         if (diff.compareTo(maxServerSideEntriesBI) > 0) {
             final BigInteger restricted = startPosition.getOffset().add(maxServerSideEntriesBI);
             return new PositionRange(false, startPosition,
@@ -285,12 +186,6 @@ public class ReceiverPagination {
                 if (lastReceiver != null && nextReceiver.start().compareTo(lastReceiver.end()) < 0) {
                     // we're at the end and we've processed it move start on to next receiver
                     if (startEqualsEndAndProcessed(startPosition, lastReceiver)) {
-                        // this is the caller's position, i.e. the connector's committed offset, being moved
-                        // from inside range resolution: worth a line, it is the only place that happens
-                        log.info("receiver {} starts at {}, before the end {} of {}: sequence numbers were reset, "
-                                + "moving position {} on to the start of the new receiver",
-                                nextReceiver.info().receiver(), nextReceiver.start(), lastReceiver.end(),
-                                lastReceiver.info().receiver(), startPosition);
                         startPosition.setPosition(new JournalPosition(nextReceiver.start(), nextReceiver.info().receiver()), false);
                     }
                     else {
