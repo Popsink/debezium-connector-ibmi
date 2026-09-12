@@ -8,7 +8,6 @@ package io.debezium.ibmi.db2.journal.retrieve;
 import java.math.BigInteger;
 import java.time.Instant;
 import java.util.List;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Supplier;
 
@@ -54,34 +53,18 @@ public class ReceiverPagination {
     }
 
     /**
-     * Resolves the range and refuses it if it would move streaming backwards.
+     * Resolves the range for this poll, or {@code null} when {@link #resolveRange} would not resolve one.
      *
-     * <p>A start earlier than the one we were given is never correct while streaming: the entries it
-     * covers have already been dispatched, and the position is committed from the end of whatever range
-     * is returned ({@code RetrieveJournal.updateOffsetFromContinuation}), so a rewind here becomes the
-     * connector's offset with nothing in the logs to show it (issue #79). The copy is taken before
-     * resolving because {@link RangeFinder} moves the caller's position in place, which is also why the
-     * caller's object is put back before the range is refused - otherwise the next poll resolves the
-     * same bad range from the position this one left behind.</p>
-     *
-     * <p>Refusing means no call is made this poll: {@code findRange} reports nothing to do, the
-     * streaming loop waits out a poll interval and resolves the range again from an unchanged position.
-     * A condition that persists therefore stalls rather than rewinding, and {@link #refuse} says so -
-     * once when it starts, and at ERROR if it does not clear.</p>
+     * <p>The range is used as resolved: it is not compared against the position it was given, so a range
+     * that starts before that position, or one that ends before its own start, is returned like any
+     * other. The refusals that remain are the ones raised where the range is built, and they leave the
+     * caller's position alone; {@link #refuse} reports them once when they start, and at ERROR if they
+     * do not clear.</p>
      */
     PositionRange _findRange(AS400 as400, JournalProcessedPosition startPosition, DetailedJournalReceiver endPosition) throws Exception {
-        final JournalProcessedPosition requested = new JournalProcessedPosition(startPosition);
         final PositionRange range = resolveRange(as400, startPosition, endPosition);
         if (range == null) {
             // resolveRange refused it and said why; it leaves the caller's position alone
-            return null;
-        }
-        final String rewind = rewindReason(requested, range);
-        if (rewind != null) {
-            refuse(rewind, () -> String.format("resolved the range %s for position %s, which would re-read entries "
-                    + "already dispatched. Cached end position %s, journal head %s, receivers %s",
-                    range, requested, cachedEndPosition, endPosition, cachedReceivers));
-            startPosition.setPosition(requested);
             return null;
         }
         resolved();
@@ -122,59 +105,6 @@ public class ReceiverPagination {
             refusal = null;
             refusals = 0;
         }
-    }
-
-    /**
-     * Why the resolved range would take streaming backwards, or {@code null} when it would not.
-     *
-     * <p>Two ways it can: starting before the position we were asked to carry on from, which re-reads
-     * dispatched entries; or ending before its own start, which asks the server for an inverted range
-     * and leaves the position at an end that is behind where we already are.</p>
-     */
-    private String rewindReason(JournalProcessedPosition requested, PositionRange range) {
-        // a position with no offset at all is a genuine fresh start, and legitimately resolves to the
-        // earliest retained receiver
-        if (requested.isOffsetSet()
-                && isBefore(range.start().getReceiver(), range.start().getOffset(), requested.getReceiver(), requested.getOffset())) {
-            return "the range starts before the position it was given";
-        }
-        if (isBefore(range.end().receiver(), range.end().getOffset(), range.start().getReceiver(), range.start().getOffset())) {
-            return "the range ends before it starts";
-        }
-        return null;
-    }
-
-    /**
-     * Whether one point in the journal is before another. Sequence numbers are only comparable within a
-     * receiver, so two points on different receivers are ordered by their place in the cached list,
-     * which {@code getReceivers} returns in attach order; a receiver that is not in the list at all
-     * cannot be placed, and the two are then taken to be in order.
-     */
-    private boolean isBefore(JournalReceiver receiver, BigInteger offset, JournalReceiver otherReceiver, BigInteger otherOffset) {
-        final int index = indexOfReceiver(receiver);
-        final int otherIndex = indexOfReceiver(otherReceiver);
-        if (index >= 0 && otherIndex >= 0 && index != otherIndex) {
-            return index < otherIndex;
-        }
-        // a guard must never be the thing that fails the task, so an unplaceable or absent receiver is
-        // taken to be in order rather than compared
-        if (!Objects.equals(receiver, otherReceiver)) {
-            return false;
-        }
-        return offset.compareTo(otherOffset) < 0;
-    }
-
-    /** Where a receiver sits in the cached list, or -1 when it is not in it or there is no list yet. */
-    private int indexOfReceiver(JournalReceiver receiver) {
-        if (cachedReceivers == null || receiver == null) {
-            return -1;
-        }
-        for (int i = 0; i < cachedReceivers.size(); i++) {
-            if (receiver.equals(cachedReceivers.get(i).info().receiver())) {
-                return i;
-            }
-        }
-        return -1;
     }
 
     private PositionRange resolveRange(AS400 as400, JournalProcessedPosition startPosition, DetailedJournalReceiver endPosition) throws Exception {
