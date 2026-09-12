@@ -7,9 +7,11 @@ package io.debezium.ibmi.db2.journal.retrieve;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -693,7 +695,6 @@ class ReceiverPaginationTest {
     void findRangeRefusesToRestartFromTheOldestReceiverWhenTheOffsetIsZeroed() throws Exception {
         final ReceiverPagination jreceivers = new ReceiverPagination(journalInfoRetrieval, 100_000, journalInfo);
 
-        when(journalInfoRetrieval.getReceivers(any(), any())).thenReturn(Arrays.asList(oldest, middle, newest));
         when(journalInfoRetrieval.getDelayedDetailedJournalReceiver(any(), any())).thenReturn(Optional.of(newest));
 
         // streaming on the newest receiver with the offset zeroed: resolving this gives the start of the
@@ -705,6 +706,9 @@ class ReceiverPaginationTest {
         assertEquals(new JournalReceiver("jNEW", "jlib"), zeroed.getReceiver(),
                 "the caller's position must be left where it was, or the next poll resolves the same range again");
         assertEquals(BigInteger.ZERO, zeroed.getOffset(), "the caller's offset must be left where it was");
+        // a zero offset that names a receiver is refused on sight: no receiver list is read, and no range is
+        // ever resolved from it (issue #79, fix 4)
+        verify(journalInfoRetrieval, never()).getReceivers(any(), any());
     }
 
     /**
@@ -739,6 +743,70 @@ class ReceiverPaginationTest {
         assertEquals(delayedHead.info().receiver(), range.end().receiver());
         assertEquals(BigInteger.valueOf(300), range.end().getOffset(),
                 "the range must stop at the delayed head, not at the live end of the attached receiver");
+    }
+
+    /**
+     * The whole sequence of issue #79, poll by poll: the poll that crosses a receiver roll must not resolve a
+     * range past the delayed journal head, because the position is committed from the end of the range and
+     * the next poll clamps that same receiver back to the delayed reading. Reading to the live end on the
+     * roll is what left the poll after it resolving an end behind its own start.
+     */
+    @Test
+    void aReceiverRollFollowedByTheNextPollNeverInvertsTheRange() throws Exception {
+        final ReceiverPagination jreceivers = new ReceiverPagination(journalInfoRetrieval, 1_000_000, journalInfo);
+
+        final DetailedJournalReceiver detached = receiver("jOLD", 10, 1_000, 1_999, JournalStatus.OnlineSavedDetached);
+        // the list is read live on every roll: the newly attached receiver is already at 2050
+        final DetailedJournalReceiver live = receiver("jNEW", 20, 2_000, 2_050, JournalStatus.Attached);
+        when(journalInfoRetrieval.getReceivers(any(), any()))
+                .thenAnswer(invocation -> new ArrayList<>(Arrays.asList(detached, live)));
+
+        // the head we are allowed to read to lags the list, and moves on with each poll
+        when(journalInfoRetrieval.getDelayedDetailedJournalReceiver(any(), any()))
+                .thenReturn(Optional.of(detached)) // still reading the receiver we are on
+                .thenReturn(Optional.of(receiver("jNEW", 20, 2_000, 2_020, JournalStatus.Attached))) // the roll
+                .thenReturn(Optional.of(receiver("jNEW", 20, 2_000, 2_030, JournalStatus.Attached)));
+
+        final JournalProcessedPosition position = new JournalProcessedPosition(BigInteger.valueOf(1_500),
+                detached.info().receiver(), Instant.ofEpochSecond(0), true);
+
+        // the connector commits the end of the range it is given, so that is where the next poll starts from
+        commit(position, jreceivers.findRange(as400, position).get()); // catching up inside jOLD
+
+        final PositionRange roll = jreceivers.findRange(as400, position).get();
+        assertEquals(new JournalReceiver("jNEW", "jlib"), roll.end().receiver());
+        assertTrue(roll.end().getOffset().compareTo(BigInteger.valueOf(2_020)) <= 0,
+                "the roll poll must stop at the delayed head 2020, not at the live end 2050, it resolved "
+                        + roll.end().getOffset());
+        commit(position, roll);
+
+        final Optional<PositionRange> afterTheRoll = jreceivers.findRange(as400, position);
+        assertTrue(afterTheRoll.isEmpty() || afterTheRoll.get().end().getOffset().compareTo(position.getOffset()) >= 0,
+                "the poll after a roll must resolve a forward range or nothing at all, it resolved " + afterTheRoll);
+        assertEquals(BigInteger.valueOf(2_020), position.getOffset(), "the position must not have moved backwards");
+    }
+
+    /** What the connector does with a range it was given: read it and carry on from its end. */
+    private static void commit(JournalProcessedPosition position, PositionRange range) {
+        position.setPosition(new JournalProcessedPosition(range.end(), Instant.ofEpochSecond(0), true));
+    }
+
+    /**
+     * Fix 2 of issue #79: the delayed journal head is behind the position for as long as it takes to catch up
+     * with a position committed just after a roll. There is nothing to read, and the inverted range that used
+     * to be returned instead is what the server answered CPF7054 to.
+     */
+    @Test
+    void paginateInSameReceiverReturnsNothingWhenTheHeadIsBehindThePosition() throws Exception {
+        final ReceiverPagination jreceivers = new ReceiverPagination(journalInfoRetrieval, 1_000, journalInfo);
+
+        final JournalProcessedPosition position = new JournalProcessedPosition(BigInteger.valueOf(3_550),
+                new JournalReceiver("jNEW", "jlib"), Instant.ofEpochSecond(0), true);
+        // the delayed reading of the same receiver only knows about 3500
+        final DetailedJournalReceiver behindThePosition = receiver("jNEW", 30, 3_000, 3_500, JournalStatus.Attached);
+
+        assertNull(jreceivers.paginateInSameReceiver(position, behindThePosition, BigInteger.valueOf(1_000)),
+                "an inverted range must be reported as nothing to read");
     }
 
     @Test

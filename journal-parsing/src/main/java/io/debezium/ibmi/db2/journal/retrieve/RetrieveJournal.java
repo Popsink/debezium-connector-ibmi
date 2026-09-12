@@ -37,6 +37,7 @@ import io.debezium.ibmi.db2.journal.retrieve.RetrievalCriteria.JournalCode;
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalCriteria.JournalEntryType;
 import io.debezium.ibmi.db2.journal.retrieve.exception.FatalException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalFilterException;
+import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalRangeException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.RetrieveJournalException;
 import io.debezium.ibmi.db2.journal.retrieve.rjne0200.EntryHeader;
@@ -63,6 +64,8 @@ public class RetrieveJournal {
     private static final JournalEntryType[] REQURED_ENTRY_TYPES = new JournalEntryType[]{ JournalEntryType.PT,
             JournalEntryType.PX, JournalEntryType.UP, JournalEntryType.UB, JournalEntryType.DL, JournalEntryType.DR,
             JournalEntryType.CT, JournalEntryType.CG, JournalEntryType.SC, JournalEntryType.CM };
+    /** how many polls a refused range is recalculated for before the caller has to decide what it means */
+    private static final int MAX_INVALID_RANGES = 5;
     private final FirstHeaderDecoder firstHeaderDecoder;
     private final EntryHeaderDecoder entryHeaderDecoder;
     private final SimpleDateFormat dateFormatter = new SimpleDateFormat("yyMMdd-hhmm");
@@ -86,6 +89,8 @@ public class RetrieveJournal {
     private volatile Prefetch discarded;
     private volatile long lastRpcMs;
     private long lastWaitMs;
+    /** consecutive polls whose resolved range the server refused, see {@link #rangeRejected} */
+    private int invalidRanges = 0;
 
     public RetrieveJournal(RetrieveConfig config, JournalInfoRetrieval journalRetrieval) {
         this(config, journalRetrieval, null);
@@ -149,7 +154,7 @@ public class RetrieveJournal {
                 catch (ExecutionException e) {
                     lastWaitMs = elapsedMs(started);
                     final Throwable cause = e.getCause();
-                    if (cause instanceof LostJournalException) {
+                    if (cause instanceof LostJournalException || cause instanceof InvalidJournalRangeException) {
                         // as for the synchronous continuation: a stale range is not data loss
                         log.warn("prefetch of the range {} failed, recalculating the range", pending.range(), cause);
                     }
@@ -177,23 +182,53 @@ public class RetrieveJournal {
             try {
                 return retrieveJournal(previousPosition, continuation);
             }
-            catch (LostJournalException e) {
-                // a stale range resolves to CPF7053/CPF9801/CPF7054, all of which report as a lost journal and
-                // would cost a re-snapshot: recalculate instead, so a bad guess can never be mistaken for data
-                // loss. Only the speculative refresh at the start of a block is skipped, never the corrective
-                // re-read of the receiver list that findRange does before declaring a position unresolvable
-                // (issue #30). Nothing else is caught: cancelled jobs and connection failures also surface here
-                // and retrying them fights the cancellation, while the streaming loop already recovers from
-                // them by pausing and refetching with a recalculated range
+            catch (LostJournalException | InvalidJournalRangeException e) {
+                // a stale range resolves to CPF7053/CPF9801/CPF7054, none of which mean the data is gone and
+                // all of which would cost a re-snapshot: recalculate instead, so a bad guess can never be
+                // mistaken for data loss. Only the speculative refresh at the start of a block is skipped,
+                // never the corrective re-read of the receiver list that findRange does before declaring a
+                // position unresolvable (issue #30). Nothing else is caught: cancelled jobs and connection
+                // failures also surface here and retrying them fights the cancellation, while the streaming
+                // loop already recovers from them by pausing and refetching with a recalculated range
                 log.warn("failed to continue within the previous range {}, recalculating the range", continuation, e);
             }
         }
 
         final Optional<PositionRange> rangeOpt = journalReceivers.findRange(config.as400().connection(), previousPosition);
         if (rangeOpt.isPresent()) {
-            // don't wrap in a RuntimeException, callers recover from the fatal journal exceptions
-            return retrieveJournal(previousPosition, rangeOpt.get());
+            try {
+                // don't wrap in a RuntimeException, callers recover from the fatal journal exceptions
+                final RetrievalState state = retrieveJournal(previousPosition, rangeOpt.get());
+                invalidRanges = 0;
+                return state;
+            }
+            catch (InvalidJournalRangeException e) {
+                return rangeRejected(rangeOpt.get(), e);
+            }
         }
+        return RetrievalState.NotCalled;
+    }
+
+    /**
+     * A range we resolved ourselves and the server refused (CPF7054). The position is left alone and no
+     * state is committed from it: the next poll resolves the range again, by which time the delayed journal
+     * head has moved on and the range that crossed a receiver roll is forward again (issue #79).
+     *
+     * <p>Swallowing it forever would freeze the connector silently on the other reading of CPF7054 - an
+     * offset that genuinely does not belong to the journal - so once the same rejection has survived
+     * {@value #MAX_INVALID_RANGES} polls it is handed to the caller, which can tell the two apart by
+     * looking the position up in the receiver list.</p>
+     */
+    private RetrievalState rangeRejected(PositionRange range, InvalidJournalRangeException e)
+            throws InvalidJournalRangeException {
+        invalidRanges++;
+        if (invalidRanges >= MAX_INVALID_RANGES) {
+            log.error("the journal range {} has been refused by the server {} polls running, it is not the transient "
+                    + "disagreement between the receiver list and the delayed journal head", range, invalidRanges);
+            invalidRanges = 0;
+            throw e;
+        }
+        log.warn("the journal range {} was refused by the server, recalculating it on the next poll", range, e);
         return RetrievalState.NotCalled;
     }
 
@@ -463,7 +498,7 @@ public class RetrieveJournal {
 
     private Block reThrowIfFatal(JournalProcessedPosition retrievePosition, final ServiceProgramCall spc,
                                  JournalProcessedPosition latestJournalPosition, PositionRange range, String job)
-            throws LostJournalException, FatalException {
+            throws LostJournalException, InvalidJournalRangeException, FatalException {
         for (final AS400Message id : spc.getMessageList()) {
             final String idt = id.getID();
             if (idt == null) {
@@ -480,9 +515,13 @@ public class RetrieveJournal {
                             idt, retrievePosition, builder, getFullAS400MessageText(id)));
                 }
                 case "CPF7054": { // e.g. last < first or using offset that doesn't belong to journal
-                    // the offset we hold is not in this journal, which is what a journal that was deleted and
-                    // recreated under us looks like, so treat it as a lost journal rather than a bad offset
-                    throw new LostJournalException(
+                    // a range the server would not take, which is a bug in the range we resolved rather than a
+                    // pruned receiver - most often an end behind the start, resolved while the receiver list and
+                    // the deliberately delayed journal head disagree at a receiver roll. Reporting it as a lost
+                    // journal is what reset the offset to the earliest retained receiver (issue #79); the caller
+                    // recalculates the range instead, and checks the receiver list before believing the other
+                    // reading of CPF7054, an offset that does not belong to this journal at all
+                    throw new InvalidJournalRangeException(
                             String.format("Call failed position %s parameters %s failed to find offset or invalid offsets: %s",
                                     retrievePosition, builder, id.getText()));
                 }

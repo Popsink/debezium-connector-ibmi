@@ -89,10 +89,20 @@ The same thing happens *while streaming*, e.g. when the journal or its receivers
 running connector. Both cases apply the same recovery strategy; earlier versions silently reset
 streaming to the earliest available receiver instead, which lost data without failing.
 
-Two things are done to keep this from turning into a silent crash-loop:
+Three things are done to keep this from turning into a silent crash-loop:
 
 * A pruned receiver is told apart from a transient RPC/connection error. Only the former is treated as
   "position lost"; a transient failure is retried as before.
+* **Nothing resets the offset until the position is confirmed gone.** Before any mid-stream recovery the
+  position is looked up in the journal's live receiver chain; if its receiver is still there and the
+  offset falls inside that receiver, the poll is simply retried. A range the connector resolved badly
+  reports itself exactly like a pruned receiver does (the server answers `CPF7054`, "last < first, or an
+  offset that does not belong to the journal"), and recovering from one of those re-reads the whole
+  retained journal to recover nothing — which is what used to throw a caught-up connector tens of
+  millions of entries back every time a journal receiver rolled. A refused range is now recalculated on
+  the next poll instead, and only reaches recovery if the receiver chain says the position really has
+  gone. A failure to read the chain counts as "still available", so a connection problem can never
+  produce a reset.
 * The `journal.unavailable.position.recovery` option controls what happens when the stored position is
   gone:
 
