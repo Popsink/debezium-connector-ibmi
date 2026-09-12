@@ -80,6 +80,12 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
                     includes, config.skipUncapturableTables());
             journalInfo = resolved.journalInfo();
 
+            log.info("journal {}, reading its head behind live ({}ms {} + {}ms cache wait, counted only "
+                    + "while the journal caches), poll interval {}ms",
+                    journalInfo, config.cacheAdditionalDelay(),
+                    As400ConnectorConfig.JOURNAL_CACHE_ADDITIONAL_DELAY.name(), cacheWait,
+                    config.getPollInterval().toMillis());
+
             boolean transactionMgt = config.isTransactionMgmtEnabled();
 
             final RetrieveConfig rconfig = new RetrieveConfigBuilder().withAs400(this)
