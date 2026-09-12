@@ -36,6 +36,7 @@ import io.debezium.ibmi.db2.journal.retrieve.RetrievalState;
 import io.debezium.ibmi.db2.journal.retrieve.RetrieveConfig;
 import io.debezium.ibmi.db2.journal.retrieve.RetrieveConfigBuilder;
 import io.debezium.ibmi.db2.journal.retrieve.RetrieveJournal;
+import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalRangeException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.JournalReceiverNotFoundException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
 import io.debezium.ibmi.db2.journal.retrieve.rjne0200.EntryHeader;
@@ -78,9 +79,10 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
             final ResolvedJournal resolved = journalInfoRetrieval.resolveJournal(connection(), config.getSchema(),
                     includes, config.skipUncapturableTables());
             journalInfo = resolved.journalInfo();
-            log.info("journal {}, reading its head {}ms behind live ({}ms {} + {}ms cache wait, counted only "
+
+            log.info("journal {}, reading its head behind live ({}ms {} + {}ms cache wait, counted only "
                     + "while the journal caches), poll interval {}ms",
-                    journalInfo, journalInfoRetrieval.headDelayMs(journalInfo), config.cacheAdditionalDelay(),
+                    journalInfo, config.cacheAdditionalDelay(),
                     As400ConnectorConfig.JOURNAL_CACHE_ADDITIONAL_DELAY.name(), cacheWait,
                     config.getPollInterval().toMillis());
 
@@ -192,6 +194,58 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
         }
     }
 
+    /**
+     * Whether the position streaming holds can still be read: its receiver is in the journal's live receiver
+     * list and its offset falls inside that receiver's range.
+     *
+     * <p>This is the check that has to pass before a failed call is allowed to reset the offset. CPF7053,
+     * CPF9801 and CPF7054 all report as a position the server would not read, but only one of them means the
+     * receiver is gone; the others are a range we resolved badly or a stale one, and resetting for those
+     * re-reads the whole retained journal to recover nothing (issue #79).</p>
+     *
+     * <p>A failure to read the list is not an answer, and the destructive reading is the one that resets, so
+     * it reports the position as still available: the caller then retries, which is what a transient RPC
+     * failure needs anyway, and the retry limit still bounds it.</p>
+     */
+    public boolean isPositionStillAvailable(JournalProcessedPosition position) {
+        try {
+            return isPositionStillAvailable(journalInfoRetrieval, connection(), journalInfo, position);
+        }
+        catch (final IOException e) {
+            log.warn("no connection to check whether position {} is still available, assuming it is rather than "
+                    + "resetting the offset on a failure to look", position, e);
+            return true;
+        }
+    }
+
+    static boolean isPositionStillAvailable(JournalInfoRetrieval journalInfoRetrieval, AS400 as400, JournalInfo journalInfo,
+                                            JournalProcessedPosition position) {
+        if (position == null || !position.isOffsetSet() || position.getReceiver() == null) {
+            return false;
+        }
+        try {
+            final List<DetailedJournalReceiver> receivers = journalInfoRetrieval.getReceivers(as400, journalInfo);
+            for (final DetailedJournalReceiver receiver : receivers) {
+                if (receiver.isSameReceiver(position)) {
+                    final boolean withinRange = position.getOffset().compareTo(receiver.start()) >= 0
+                            && position.getOffset().compareTo(receiver.end()) <= 0;
+                    if (!withinRange) {
+                        log.warn("position {} names a receiver that is still on the server but its offset is outside "
+                                + "the receiver's range {}-{}", position, receiver.start(), receiver.end());
+                    }
+                    return withinRange;
+                }
+            }
+            log.warn("position {} names a receiver that is no longer in the journal's receiver chain {}", position, receivers);
+            return false;
+        }
+        catch (final Exception e) {
+            log.warn("could not read the receiver list to check whether position {} is still available, assuming it is "
+                    + "rather than resetting the offset on a failure to look", position, e);
+            return true;
+        }
+    }
+
     public boolean validateLogPosition(Partition partition, OffsetContext offsetContext, CommonConnectorConfig config) {
         // AVAILABLE and NOT_SET are both valid starting points; only a pruned receiver is unavailable.
         return checkLogPosition(offsetContext) != PositionAvailability.PRUNED;
@@ -282,6 +336,12 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
             logLostJournal(position);
             throw e;
         }
+        catch (InvalidJournalRangeException e) {
+            // not data loss: the server refused the range we asked for. The chain is what the range was
+            // resolved against, so it is the first thing needed to work out why (issue #79)
+            log.warn("the server refused the journal range for position {}, receivers {}", position, receiversForLogging());
+            throw e;
+        }
     }
 
     /**
@@ -337,6 +397,16 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
         }
         catch (final Exception e) {
             log.error("Failed to fetch journal entries for position {}, receiver list unavailable", position, e);
+        }
+    }
+
+    /** The receiver chain, or why it could not be read; only for log messages. */
+    private Object receiversForLogging() {
+        try {
+            return journalInfoRetrieval.getReceivers(connection(), journalInfo);
+        }
+        catch (final Exception e) {
+            return "unavailable: " + e;
         }
     }
 

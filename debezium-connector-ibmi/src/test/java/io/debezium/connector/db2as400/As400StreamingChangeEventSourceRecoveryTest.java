@@ -27,6 +27,7 @@ import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.ibmi.db2.journal.retrieve.JournalReceiver;
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalState;
 import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalFilterException;
+import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalRangeException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.JournalReceiverNotFoundException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
 import io.debezium.pipeline.ErrorHandler;
@@ -88,6 +89,9 @@ class As400StreamingChangeEventSourceRecoveryTest {
     }
 
     private As400StreamingChangeEventSource source(UnavailablePositionRecovery mode) {
+        // the receiver the position names is gone from the chain, i.e. this really is a lost position and not
+        // a range the connector resolved badly (issue #79); positionStillOnTheServer() is the other case
+        when(dataConnection.isPositionStillAvailable(any())).thenReturn(false);
         when(config.getPollInterval()).thenReturn(Duration.ofMillis(1));
         when(config.getMaxRetrievalTimeout()).thenReturn(WATCHDOG_TIMEOUT_MS);
         when(config.getUnavailablePositionRecovery()).thenReturn(mode);
@@ -178,6 +182,56 @@ class As400StreamingChangeEventSourceRecoveryTest {
                 .hasMessageContaining("Unable to process offset");
 
         verify(offsetContext, never()).setPosition(any());
+    }
+
+    /**
+     * The other reading of a failed call: the position is still in the journal's receiver chain, so nothing
+     * was pruned - the range was resolved badly, which is what a CPF7054 at a receiver roll is. Resetting for
+     * that is what threw production connectors back to the earliest retained receiver every time they caught
+     * up with the head (issue #79).
+     */
+    @Test
+    void aPositionStillInTheReceiverChainIsRetriedRatherThanReset() throws Exception {
+        final As400StreamingChangeEventSource source = source(UnavailablePositionRecovery.EARLIEST);
+        when(dataConnection.isPositionStillAvailable(any())).thenReturn(true);
+        when(dataConnection.getJournalEntries(any(), any(), any(), any()))
+                .thenThrow(new LostJournalException("CPF7054 failed to find offset or invalid offsets"))
+                .thenReturn(RetrievalState.Success);
+
+        execute(source, 2);
+
+        verify(offsetContext, never()).setPosition(any());
+        verify(dataConnection, times(2)).getJournalEntries(any(), any(), any(), any());
+    }
+
+    /** A refused range reports itself as its own exception, and takes the same route. */
+    @Test
+    void aRefusedRangeIsRetriedWhileThePositionIsStillThere() throws Exception {
+        final As400StreamingChangeEventSource source = source(UnavailablePositionRecovery.EARLIEST);
+        when(dataConnection.isPositionStillAvailable(any())).thenReturn(true);
+        when(dataConnection.getJournalEntries(any(), any(), any(), any()))
+                .thenThrow(new InvalidJournalRangeException("CPF7054 last < first"))
+                .thenReturn(RetrievalState.Success);
+
+        execute(source, 2);
+
+        verify(offsetContext, never()).setPosition(any());
+    }
+
+    /**
+     * An offset that no longer belongs to the journal - deleted and recreated under us - reports the same
+     * CPF7054 as a badly resolved range does, and the receiver chain is what tells them apart.
+     */
+    @Test
+    void aRefusedRangeWhosePositionHasGoneIsRecovered() throws Exception {
+        final As400StreamingChangeEventSource source = source(UnavailablePositionRecovery.EARLIEST);
+        when(dataConnection.getJournalEntries(any(), any(), any(), any()))
+                .thenThrow(new InvalidJournalRangeException("CPF7054 offset does not belong to this journal"))
+                .thenReturn(RetrievalState.Success);
+
+        execute(source, 2);
+
+        verify(offsetContext).setPosition(new JournalProcessedPosition());
     }
 
     @Test
