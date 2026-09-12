@@ -79,11 +79,6 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
             final ResolvedJournal resolved = journalInfoRetrieval.resolveJournal(connection(), config.getSchema(),
                     includes, config.skipUncapturableTables());
             journalInfo = resolved.journalInfo();
-            log.info("journal {}, reading its head {}ms behind live ({}ms {} + {}ms cache wait, counted only "
-                    + "while the journal caches), poll interval {}ms",
-                    journalInfo, journalInfoRetrieval.headDelayMs(journalInfo), config.cacheAdditionalDelay(),
-                    As400ConnectorConfig.JOURNAL_CACHE_ADDITIONAL_DELAY.name(), cacheWait,
-                    config.getPollInterval().toMillis());
 
             boolean transactionMgt = config.isTransactionMgmtEnabled();
 

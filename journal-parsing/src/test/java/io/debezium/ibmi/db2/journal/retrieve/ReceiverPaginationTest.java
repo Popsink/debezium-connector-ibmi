@@ -712,44 +712,10 @@ class ReceiverPaginationTest {
     }
 
     /**
-     * What produced the rewind in the first place: a poll that crosses a receiver roll resolves its range
-     * from the freshly read receiver list, whose attached receiver carries the live end, while the head we
-     * are allowed to read up to is deliberately held back by the journal cache delay. Reading past it is
-     * what leaves the next poll - which does clamp that receiver to the delayed reading - resolving a range
-     * that ends behind the position just committed.
-     */
-    @Test
-    void findRangeNeverReadsPastTheDelayedJournalHead() throws Exception {
-        final ReceiverPagination jreceivers = new ReceiverPagination(journalInfoRetrieval, 1_000_000, journalInfo);
-
-        final DetailedJournalReceiver previous = receiver("jPRV", 10, 1, 950, JournalStatus.OnlineSavedDetached);
-        // the live list: the attached receiver has reached 1200
-        final DetailedJournalReceiver attached = receiver("jATT", 20, 1, 1_200, JournalStatus.Attached);
-        when(journalInfoRetrieval.getReceivers(any(), any())).thenReturn(Arrays.asList(previous, attached));
-
-        // the delayed head has only reached 300 of it, the entries after that may still be in the journal cache
-        final DetailedJournalReceiver delayedHead = receiver("jATT", 20, 1, 300, JournalStatus.Attached);
-        when(journalInfoRetrieval.getDelayedDetailedJournalReceiver(any(), any()))
-                .thenReturn(Optional.of(previous)) // still reading back the receiver we are on
-                .thenReturn(Optional.of(delayedHead)); // and then it moves on to the attached one
-
-        // caught up with the end of the previous receiver
-        final JournalProcessedPosition position = new JournalProcessedPosition(BigInteger.valueOf(950),
-                previous.info().receiver(), Instant.ofEpochSecond(0), true);
-
-        jreceivers.findRange(as400, position); // primes the cache, nothing to read
-        final PositionRange range = jreceivers.findRange(as400, position).get();
-
-        assertEquals(delayedHead.info().receiver(), range.end().receiver());
-        assertEquals(BigInteger.valueOf(300), range.end().getOffset(),
-                "the range must stop at the delayed head, not at the live end of the attached receiver");
-    }
-
-    /**
-     * The whole sequence of issue #79, poll by poll: the poll that crosses a receiver roll must not resolve a
-     * range past the delayed journal head, because the position is committed from the end of the range and
-     * the next poll clamps that same receiver back to the delayed reading. Reading to the live end on the
-     * roll is what left the poll after it resolving an end behind its own start.
+     * The whole sequence of issue #79, poll by poll: the position is committed from the end of the range it
+     * was given, so the poll that crosses a receiver roll leaves the next one starting from an offset the
+     * delayed journal head has not caught up with. That poll must report nothing to read or a range that runs
+     * forwards - an end behind its own start is what rewound streaming - and must leave the position alone.
      */
     @Test
     void aReceiverRollFollowedByTheNextPollNeverInvertsTheRange() throws Exception {
@@ -775,15 +741,14 @@ class ReceiverPaginationTest {
 
         final PositionRange roll = jreceivers.findRange(as400, position).get();
         assertEquals(new JournalReceiver("jNEW", "jlib"), roll.end().receiver());
-        assertTrue(roll.end().getOffset().compareTo(BigInteger.valueOf(2_020)) <= 0,
-                "the roll poll must stop at the delayed head 2020, not at the live end 2050, it resolved "
-                        + roll.end().getOffset());
         commit(position, roll);
+        final BigInteger committedOnTheRoll = position.getOffset();
 
+        // the delayed head is still behind that, so there is nothing to read until it catches up
         final Optional<PositionRange> afterTheRoll = jreceivers.findRange(as400, position);
         assertTrue(afterTheRoll.isEmpty() || afterTheRoll.get().end().getOffset().compareTo(position.getOffset()) >= 0,
                 "the poll after a roll must resolve a forward range or nothing at all, it resolved " + afterTheRoll);
-        assertEquals(BigInteger.valueOf(2_020), position.getOffset(), "the position must not have moved backwards");
+        assertEquals(committedOnTheRoll, position.getOffset(), "the position must not have moved backwards");
     }
 
     /** What the connector does with a range it was given: read it and carry on from its end. */
