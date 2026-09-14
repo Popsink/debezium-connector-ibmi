@@ -206,6 +206,12 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
      * <p>A failure to read the list is not an answer, and the destructive reading is the one that resets, so
      * it reports the position as still available: the caller then retries, which is what a transient RPC
      * failure needs anyway, and the retry limit still bounds it.</p>
+     *
+     * <p>An object-not-found <em>is</em> an answer: it is the journal itself that has gone (DLTJRN, which ends
+     * journaling on every captured file first, so no later change can ever be journaled). No retry can undo
+     * that, and treating it as "could not look" is what left a deleted journal to exhaust the retry budget and
+     * fail with an unclassified message instead of the OffsetNoLongerAvailableException an orchestrator routes
+     * on.</p>
      */
     public boolean isPositionStillAvailable(JournalProcessedPosition position) {
         try {
@@ -237,6 +243,13 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
                 }
             }
             log.warn("position {} names a receiver that is no longer in the journal's receiver chain {}", position, receivers);
+            return false;
+        }
+        catch (final JournalReceiverNotFoundException e) {
+            // The journal object the chain would be read from does not exist, so there is no chain to be in:
+            // a definitive negative, not a failure to look.
+            log.warn("position {} cannot be in the journal's receiver chain: the journal itself is gone ({})",
+                    position, e.getMessageId(), e);
             return false;
         }
         catch (final Exception e) {
