@@ -239,7 +239,9 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                     + "on restart); 'earliest' resets streaming to the earliest available journal receiver and continues, "
                     + "replaying the whole retained journal; 'latest' resets streaming to the current journal head and "
                     + "continues, replaying nothing. Both 'earliest' and 'latest' log that changes between the lost "
-                    + "position and the resume point are unrecoverable.");
+                    + "position and the resume point are unrecoverable. Because 'latest' declares a data gap rather "
+                    + "than recovering it, it is only accepted together with Kafka Connect's 'errors.tolerance=all'; "
+                    + "any other tolerance rejects it at startup, and 'snapshot' is the safe fallback there.");
 
     /** Shares Kafka Connect's own {@code errors.tolerance}, so it is left out of {@link #configDef()}. */
     public static final Field ERRORS_TOLERANCE = Field.create("errors.tolerance")
@@ -351,6 +353,38 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
      */
     public boolean skipUncapturableTables() {
         return errorsTolerance == ErrorsTolerance.ALL;
+    }
+
+    /** Kafka Connect's configured {@code errors.tolerance}, defaulting to Connect's own default of {@code none}. */
+    public String getErrorsTolerance() {
+        return errorsTolerance.getValue();
+    }
+
+    /**
+     * Refuses {@code journal.unavailable.position.recovery=latest} unless {@code errors.tolerance=all}.
+     * <p>
+     * {@code latest} does not recover the gap, it declares it: the changes between the lost position and
+     * the journal head are dropped. That is only a legitimate configuration where the pipeline has already
+     * accepted that records can be dropped, which under Kafka Connect is exactly {@code errors.tolerance=all}.
+     * With the default {@code errors.tolerance=none} the operator has asked for the opposite, so the two
+     * settings contradict each other and the combination is rejected at startup rather than silently losing
+     * data at the first pruned receiver. {@code snapshot} is the safe recovery there: it fills the gap
+     * instead of skipping it.
+     *
+     * @throws IllegalStateException if the two settings are incompatible
+     */
+    public void validateUnavailablePositionRecovery() {
+        if (unavailablePositionRecovery == UnavailablePositionRecovery.LATEST && errorsTolerance != ErrorsTolerance.ALL) {
+            throw new IllegalStateException(
+                    "incompatible configuration: '" + UNAVAILABLE_POSITION_RECOVERY.name() + "="
+                            + UnavailablePositionRecovery.LATEST.getValue() + "' skips the changes between the lost journal "
+                            + "position and the journal head, which is data loss, but '" + ERRORS_TOLERANCE.name() + "="
+                            + errorsTolerance.getValue() + "' declares that no record may be dropped. Either set '"
+                            + ERRORS_TOLERANCE.name() + "=" + ErrorsTolerance.ALL.getValue()
+                            + "' to accept the declared gap, or use '"
+                            + UNAVAILABLE_POSITION_RECOVERY.name() + "=" + UnavailablePositionRecovery.SNAPSHOT.getValue()
+                            + "', which fills the gap instead of skipping it.");
+        }
     }
 
     @Override
@@ -672,6 +706,11 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
          * streaming-only / {@code no_data} connectors; changes between the lost position and the head
          * are unrecoverable and a loud warning is logged - exactly as they are under {@link #EARLIEST},
          * which recovers no extra data for the replay it costs.
+         * <p>
+         * This trades a bounded, declared gap for availability, so it is only accepted alongside
+         * {@code errors.tolerance=all}; see {@link As400ConnectorConfig#validateUnavailablePositionRecovery()}. Where a
+         * dropped record is not acceptable, {@link #SNAPSHOT} is the safe fallback - it fills the gap
+         * rather than skipping it.
          */
         LATEST("latest");
 
