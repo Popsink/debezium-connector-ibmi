@@ -38,6 +38,12 @@ public class As400OffsetContext extends CommonOffsetContext<SourceInfo> {
     public static final String RECEIVER_LIBRARY = "offset.receiver_library";
     public static final String PROCESSED = "offset.processed";
     public static final String RECEIVER = "offset.receiver";
+    /**
+     * Token of the last operator-requested reposition applied to this offset (see
+     * {@code As400ConnectorConfig.REPOSITION_TOKEN}). Stored so the reposition is applied once and not
+     * again on every task restart, which would silently skip the journal each time.
+     */
+    public static final String REPOSITION_TOKEN = "offset.reposition_token";
     private static final String SNAPSHOT_COMPLETED_KEY = "snapshot_completed";
 
     public static final Field EVENT_SEQUENCE_FIELD = Field.create(EVENT_SEQUENCE);
@@ -52,6 +58,7 @@ public class As400OffsetContext extends CommonOffsetContext<SourceInfo> {
     private final SourceInfo sourceInfo;
     private final JournalProcessedPosition position;
     private boolean hasNewTables = false;
+    private String repositionToken;
     private final IncrementalSnapshotContext<TableId> incrementalSnapshotContext;
 
     public As400OffsetContext(As400ConnectorConfig connectorConfig) {
@@ -84,6 +91,16 @@ public class As400OffsetContext extends CommonOffsetContext<SourceInfo> {
 
     public void setPosition(JournalProcessedPosition newPosition) {
         this.position.setPosition(newPosition);
+    }
+
+    /** Token of the last operator-requested reposition applied to this offset, or null if none ever was. */
+    public String getRepositionToken() {
+        return repositionToken;
+    }
+
+    /** Records that the reposition carrying this token has been applied, so restarts do not repeat it. */
+    public void setRepositionToken(String repositionToken) {
+        this.repositionToken = repositionToken;
     }
 
     public boolean isSnapshotComplete() {
@@ -128,6 +145,9 @@ public class As400OffsetContext extends CommonOffsetContext<SourceInfo> {
                 As400OffsetContext.PROCESSED, Boolean.toString(position.processed()),
                 As400OffsetContext.RECEIVER_LIBRARY, position.getReceiver().library(),
                 As400OffsetContext.SNAPSHOT_COMPLETED_KEY, Boolean.toString(snapshotCompleted)));
+        if (!Strings.isNullOrBlank(repositionToken)) {
+            offset.put(As400OffsetContext.REPOSITION_TOKEN, repositionToken);
+        }
         incrementalSnapshotContext.store(offset);
         return offset;
     }
@@ -193,7 +213,10 @@ public class As400OffsetContext extends CommonOffsetContext<SourceInfo> {
                 Instant time = (Strings.isNullOrBlank(timeStr)) ? Instant.ofEpochSecond(0) : Instant.ofEpochSecond(Long.parseLong(timeStr));
                 position = new JournalProcessedPosition(offset, new JournalReceiver(receiver, receiverLibrary), time, processed);
             }
-            return new As400OffsetContext(connectorConfig, position, snapshotComplete, SignalBasedIncrementalSnapshotContext.load(map, true));
+            final As400OffsetContext context = new As400OffsetContext(connectorConfig, position, snapshotComplete,
+                    SignalBasedIncrementalSnapshotContext.load(map, true));
+            context.setRepositionToken((String) map.get(As400OffsetContext.REPOSITION_TOKEN));
+            return context;
         }
     }
 

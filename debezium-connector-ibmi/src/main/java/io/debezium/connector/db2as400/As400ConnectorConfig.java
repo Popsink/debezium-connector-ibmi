@@ -243,6 +243,29 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                     + "than recovering it, it is only accepted together with Kafka Connect's 'errors.tolerance=all'; "
                     + "any other tolerance rejects it at startup, and 'snapshot' is the safe fallback there.");
 
+    /**
+     * One-shot escape hatch: move streaming to the current journal head, whatever the stored position is.
+     * <p>
+     * {@link UnavailablePositionRecovery#LATEST} only fires when the stored position has been <em>pruned</em>. A
+     * connector that is merely too far behind to ever catch up has a position that is still perfectly available,
+     * so nothing triggers, and there is no supported way to move it: the offset lives in the connector's Kafka
+     * offsets topic, and hand-editing it risks writing an unset position, which {@code ReceiverPagination} reads
+     * as "from the beginning" - the opposite of the intent, and unrecoverable on a busy journal.
+     * <p>
+     * Any non-blank value repositions to the head once and is then recorded in the offset, so restarts do not
+     * skip the journal again. Change the value to arm another reposition; leaving it in place is harmless. Like
+     * {@code LATEST} it declares a data gap rather than recovering one, so it is only accepted alongside
+     * {@code errors.tolerance=all}, and the skipped range has to be recovered by a backfill.
+     */
+    public static final Field REPOSITION_TOKEN = Field.create("journal.reposition.token")
+            .withDisplayName("One-shot journal reposition to the current head")
+            .withType(Type.STRING)
+            .withImportance(Importance.LOW)
+            .withDescription("Operator escape hatch for a connector too far behind to catch up. Any non-blank value "
+                    + "moves streaming to the current journal head once, then is recorded in the offset so restarts do "
+                    + "not repeat it; change the value to arm another reposition. The skipped changes are lost and must "
+                    + "be recovered with a backfill, so this is only accepted together with 'errors.tolerance=all'.");
+
     /** Shares Kafka Connect's own {@code errors.tolerance}, so it is left out of {@link #configDef()}. */
     public static final Field ERRORS_TOLERANCE = Field.create("errors.tolerance")
             .withDisplayName("Tolerance for tables that cannot be captured")
@@ -356,6 +379,17 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
     }
 
     /** Kafka Connect's configured {@code errors.tolerance}, defaulting to Connect's own default of {@code none}. */
+    /** The armed reposition token, or null when no reposition is requested. */
+    public String getRepositionToken() {
+        return config.getString(REPOSITION_TOKEN);
+    }
+
+    /** Whether a reposition to the journal head is armed. */
+    private boolean isRepositionRequested() {
+        final String token = getRepositionToken();
+        return token != null && !token.isBlank();
+    }
+
     public String getErrorsTolerance() {
         return errorsTolerance.getValue();
     }
@@ -374,6 +408,14 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
      * @throws IllegalStateException if the two settings are incompatible
      */
     public void validateUnavailablePositionRecovery() {
+        if (isRepositionRequested() && errorsTolerance != ErrorsTolerance.ALL) {
+            throw new IllegalStateException(
+                    "incompatible configuration: '" + REPOSITION_TOKEN.name() + "' skips every change between the "
+                            + "stored journal position and the journal head, which is data loss, but '" + ERRORS_TOLERANCE.name()
+                            + "=" + errorsTolerance.getValue() + "' declares that no record may be dropped. Either set '"
+                            + ERRORS_TOLERANCE.name() + "=" + ErrorsTolerance.ALL.getValue()
+                            + "' and plan the backfill that recovers the skipped range, or clear '" + REPOSITION_TOKEN.name() + "'.");
+        }
         if (unavailablePositionRecovery == UnavailablePositionRecovery.LATEST && errorsTolerance != ErrorsTolerance.ALL) {
             throw new IllegalStateException(
                     "incompatible configuration: '" + UNAVAILABLE_POSITION_RECOVERY.name() + "="
@@ -545,7 +587,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
             RelationalDatabaseConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE, SOCKET_TIMEOUT,
             MAX_SERVER_SIDE_ENTRIES, TOPIC_NAMING_STRATEGY, FROM_CCSID, TO_CCSID, SECURE,
             DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
-            UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
+            UNAVAILABLE_POSITION_RECOVERY, REPOSITION_TOKEN, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
             ERRORS_TOLERANCE, LOB_FETCH, POINTER_HANDLE_THRESHOLD, JOURNAL_PREFETCH);
 
     public static ConfigDef configDef() {
@@ -555,7 +597,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                         HOSTNAME, USER, PASSWORD, SCHEMA, BUFFER_SIZE,
                         SOCKET_TIMEOUT, FROM_CCSID, TO_CCSID, SECURE,
                         DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
-                        UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
+                        UNAVAILABLE_POSITION_RECOVERY, REPOSITION_TOKEN, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
                         LOB_FETCH,
                         POINTER_HANDLE_THRESHOLD, JOURNAL_PREFETCH)
                 .connector(
