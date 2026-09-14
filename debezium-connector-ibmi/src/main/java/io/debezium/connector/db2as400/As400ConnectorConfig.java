@@ -58,6 +58,16 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
      */
     private static final int DEFAULT_SNAPSHOT_FETCH_SIZE = 2_000;
 
+    /**
+     * Kafka Connect's {@code errors.tolerance}. Declared in connect-runtime, which is not on this
+     * connector's compile classpath, but it is part of the connector configuration the task receives,
+     * so it is read as a raw string. {@code none} (Connect's default) means "a dropped record is a
+     * bug"; {@code all} means the pipeline has already accepted that records can be dropped.
+     */
+    static final String ERRORS_TOLERANCE = "errors.tolerance";
+    static final String ERRORS_TOLERANCE_ALL = "all";
+    static final String ERRORS_TOLERANCE_NONE = "none";
+
     private final CharSequenceTrimMode charSequenceTrimMode;
     private final SnapshotMode snapshotMode;
     private final UnavailablePositionRecovery unavailablePositionRecovery;
@@ -169,8 +179,12 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                     + "retention). 'fail' (default) stops with a distinct, non-transient error so an orchestrator can "
                     + "reset the offset or alert; 'snapshot' resets the offset and lets the configured snapshot.mode take "
                     + "a fresh snapshot to fill the gap; 'earliest' resets streaming to the earliest available journal "
-                    + "receiver and continues, logging that changes between the lost position and the earliest receiver "
-                    + "are unrecoverable.");
+                    + "receiver and continues, replaying the whole retained journal; 'latest' resets streaming to the "
+                    + "current journal head and continues, replaying nothing. Both 'earliest' and 'latest' log that "
+                    + "changes between the lost position and the resume point are unrecoverable. Because 'latest' "
+                    + "declares a data gap rather than recovering it, it is only accepted together with Kafka Connect's "
+                    + "'" + ERRORS_TOLERANCE + "=" + ERRORS_TOLERANCE_ALL + "'; any other tolerance rejects it at "
+                    + "startup, and 'snapshot' is the safe fallback there.");
 
     public As400ConnectorConfig(Configuration config) {
         // Debezium treats table.include.list as regex (filters + the base snapshot's re-filter via
@@ -236,6 +250,40 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
 
     public UnavailablePositionRecovery getUnavailablePositionRecovery() {
         return unavailablePositionRecovery;
+    }
+
+    /** Kafka Connect's configured {@code errors.tolerance}, defaulting to Connect's own default of {@code none}. */
+    public String getErrorsTolerance() {
+        final String tolerance = config.getString(ERRORS_TOLERANCE);
+        return tolerance == null || tolerance.isBlank() ? ERRORS_TOLERANCE_NONE : tolerance.trim();
+    }
+
+    /**
+     * Refuses {@code journal.unavailable.position.recovery=latest} unless {@code errors.tolerance=all}.
+     * <p>
+     * {@code latest} does not recover the gap, it declares it: the changes between the lost position and
+     * the journal head are dropped. That is only a legitimate configuration where the pipeline has already
+     * accepted that records can be dropped, which under Kafka Connect is exactly {@code errors.tolerance=all}.
+     * With the default {@code errors.tolerance=none} the operator has asked for the opposite, so the two
+     * settings contradict each other and the combination is rejected at startup rather than silently losing
+     * data at the first pruned receiver. {@code snapshot} is the safe recovery there: it fills the gap
+     * instead of skipping it.
+     *
+     * @throws IllegalStateException if the two settings are incompatible
+     */
+    public void validateUnavailablePositionRecovery() {
+        final String tolerance = getErrorsTolerance();
+        if (unavailablePositionRecovery == UnavailablePositionRecovery.LATEST
+                && !ERRORS_TOLERANCE_ALL.equalsIgnoreCase(tolerance)) {
+            throw new IllegalStateException(
+                    "incompatible configuration: '" + UNAVAILABLE_POSITION_RECOVERY.name() + "="
+                            + UnavailablePositionRecovery.LATEST.getValue() + "' skips the changes between the lost journal "
+                            + "position and the journal head, which is data loss, but '" + ERRORS_TOLERANCE + "=" + tolerance
+                            + "' declares that no record may be dropped. Either set '" + ERRORS_TOLERANCE + "="
+                            + ERRORS_TOLERANCE_ALL + "' to accept the declared gap, or use '"
+                            + UNAVAILABLE_POSITION_RECOVERY.name() + "=" + UnavailablePositionRecovery.SNAPSHOT.getValue()
+                            + "', which fills the gap instead of skipping it.");
+        }
     }
 
     @Override
@@ -526,8 +574,24 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
          * Reset streaming to the earliest journal receiver still available and continue. Intended for
          * streaming-only / {@code no_data} connectors; changes between the lost position and the
          * earliest available receiver are unrecoverable and a loud warning is logged.
+         * <p>
+         * The cost of this scales with retention x journal rate: everything the target already has is
+         * re-read, and none of it is data the gap lost. On a busy journal prefer {@link #LATEST}.
          */
-        EARLIEST("earliest");
+        EARLIEST("earliest"),
+
+        /**
+         * Reset streaming to the current journal head and continue, replaying nothing. Intended for
+         * streaming-only / {@code no_data} connectors; changes between the lost position and the head
+         * are unrecoverable and a loud warning is logged - exactly as they are under {@link #EARLIEST},
+         * which recovers no extra data for the replay it costs.
+         * <p>
+         * This trades a bounded, declared gap for availability, so it is only accepted alongside
+         * {@code errors.tolerance=all}; see {@link As400ConnectorConfig#validateUnavailablePositionRecovery()}. Where a
+         * dropped record is not acceptable, {@link #SNAPSHOT} is the safe fallback - it fills the gap
+         * rather than skipping it.
+         */
+        LATEST("latest");
 
         private final String value;
 
