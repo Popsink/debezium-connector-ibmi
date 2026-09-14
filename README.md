@@ -87,10 +87,17 @@ Two things are done to keep this from turning into a silent crash-loop:
   | `fail` (default) | Stop with a distinct, non-transient error (marker `IBMI_OFFSET_NO_LONGER_AVAILABLE`) so an orchestrator can reset the offset / trigger a snapshot / alert, rather than retry to death. |
   | `snapshot` | Reset the offset and let the configured `snapshot.mode` take a fresh snapshot to re-establish table state, then resume streaming from the current journal position. Use with `snapshot.mode=initial`/`always`/`when_needed`. |
   | `earliest` | Reset streaming to the earliest available journal receiver and continue. Intended for streaming-only / `no_data` connectors. Changes between the lost position and the earliest available receiver are **unrecoverable** and a loud warning is logged. Its cost scales with retention x journal rate: everything already delivered is re-read. On a busy journal this is effectively a denial of service against yourself - see below. |
-  | `latest` | Reset streaming to the current journal head and continue, replaying nothing. Recommended for streaming-only / `no_data` connectors. Changes between the lost position and the head are **unrecoverable** and a loud warning is logged - exactly the same gap as `earliest`, without the replay. |
+  | `latest` | Reset streaming to the current journal head and continue, replaying nothing. Recommended for streaming-only / `no_data` connectors. Changes between the lost position and the head are **unrecoverable** and a loud warning is logged - exactly the same gap as `earliest`, without the replay. Requires `errors.tolerance=all` - see below. |
 
   Setting `snapshot.mode=when_needed` also triggers Debezium core's own re-snapshot-on-data-error path,
   which is equivalent to `journal.unavailable.position.recovery=snapshot`.
+
+  `latest` does not recover the gap, it *declares* it, so it is only accepted together with Kafka
+  Connect's `errors.tolerance=all`. With any other tolerance - including Connect's default `none` - the
+  connector refuses to start with an `IllegalStateException` naming both settings, rather than
+  discovering the contradiction at the first pruned receiver, when it would already have cost data.
+  Where a dropped record is not acceptable, `snapshot` is the safe recovery: it fills the gap instead
+  of skipping it.
 
 Data already lost from pruned receivers cannot be recovered via CDC; recovery is about getting the
 connector healthy again, not replaying the gap. Ad-hoc snapshots (both incremental and blocking) are

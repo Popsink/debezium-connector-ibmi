@@ -68,6 +68,9 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
     public CdcSourceTaskContext<? extends CommonConnectorConfig> preStart(Configuration config) {
 
         connectorConfig = new As400ConnectorConfig(config);
+        // fail fast on a recovery strategy that contradicts errors.tolerance, rather than discovering the
+        // contradiction at the first pruned receiver, when it would already have cost data
+        connectorConfig.validateUnavailablePositionRecovery();
         taskContext = new CdcSourceTaskContext<>(config, connectorConfig, connectorConfig.getCustomMetricTags());
 
         return taskContext;
@@ -210,7 +213,9 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
                             "stored journal position " + offset.getPosition() + " is no longer available on the server "
                                     + "(pruned receiver). Reset the offset and trigger a snapshot, or set "
                                     + "'" + As400ConnectorConfig.UNAVAILABLE_POSITION_RECOVERY.name()
-                                    + "' to 'snapshot', 'latest' or 'earliest' to auto-recover.");
+                                    + "' to 'snapshot' or 'earliest' to auto-recover, or to 'latest' together with '"
+                                    + As400ConnectorConfig.ERRORS_TOLERANCE + "=" + As400ConnectorConfig.ERRORS_TOLERANCE_ALL
+                                    + "' to accept the declared gap.");
                 case SNAPSHOT:
                     LOGGER.warn("Stored journal position {} is no longer available (pruned receiver); resetting the offset so "
                             + "snapshot.mode '{}' can take a fresh snapshot to fill the gap.", offset.getPosition(), connectorConfig.getSnapshotMode().getValue());

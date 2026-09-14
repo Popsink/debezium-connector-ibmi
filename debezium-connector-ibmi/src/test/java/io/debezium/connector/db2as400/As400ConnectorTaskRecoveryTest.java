@@ -40,10 +40,13 @@ class As400ConnectorTaskRecoveryTest {
     private static final BigInteger HEAD_OFFSET = BigInteger.valueOf(3_525_020_805L);
 
     private static As400ConnectorConfig config(String recovery) {
+        // 'latest' only starts under errors.tolerance=all, so these exercise a configuration that
+        // As400ConnectorConfig#validateUnavailablePositionRecovery would actually let through
         return new As400ConnectorConfig(Configuration.create()
                 .with(CommonConnectorConfig.TOPIC_PREFIX, "serverX")
                 .with(As400ConnectorConfig.DATABASE_NAME, "serverX")
                 .with(As400ConnectorConfig.UNAVAILABLE_POSITION_RECOVERY, recovery)
+                .with(As400ConnectorConfig.ERRORS_TOLERANCE, As400ConnectorConfig.ERRORS_TOLERANCE_ALL)
                 .build());
     }
 
@@ -124,6 +127,8 @@ class As400ConnectorTaskRecoveryTest {
 
         assertThatThrownBy(() -> As400ConnectorTask.applyUnavailablePositionRecovery(config, prunedConnection(), previousOffsets))
                 .isInstanceOf(OffsetNoLongerAvailableException.class)
-                .hasMessageContaining("'snapshot', 'latest' or 'earliest'");
+                .hasMessageContaining("'snapshot' or 'earliest'")
+                // 'latest' is offered only with the tolerance it requires, so the hint cannot be followed into a rejected start
+                .hasMessageContaining("'latest' together with 'errors.tolerance=all'");
     }
 }
