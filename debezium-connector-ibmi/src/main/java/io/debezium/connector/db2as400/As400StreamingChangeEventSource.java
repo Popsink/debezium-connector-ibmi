@@ -28,6 +28,7 @@ import io.debezium.ibmi.db2.journal.data.types.Diagnostics;
 import io.debezium.ibmi.db2.journal.retrieve.JournalEntryType;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.ibmi.db2.journal.retrieve.exception.FatalException;
+import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalRangeException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
@@ -167,11 +168,13 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         dispatcher.dispatchHeartbeatEventAlsoToIncrementalSnapshot(partition, offsetContext);
                         retries = 0;
                     }
-                    catch (final LostJournalException e) {
-                        // the journal or the receivers we were reading are gone, e.g. deleted while we were
+                    catch (final LostJournalException | InvalidJournalRangeException e) {
+                        // the journal or the receivers we were reading may be gone, e.g. deleted while we were
                         // streaming: data is already lost, so apply the configured recovery strategy rather
-                        // than silently skipping on
-                        applyUnavailablePositionRecovery(offsetContext, e);
+                        // than silently skipping on - but only once the receiver list says the position really
+                        // has gone, since the same failures are also how a badly resolved range reports
+                        // itself, and recovering from one of those costs the whole retained journal (issue #79)
+                        recoverIfThePositionIsReallyGone(offsetContext, e);
                         retries = pauseBeforeRetry(retries, offsetContext, e);
                     }
                     catch (final FatalException e) {
@@ -264,6 +267,30 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
             watchDog.resume();
         }
         log.info("Streaming resumed after blocking snapshot, paused for {}ms", System.currentTimeMillis() - pausedAt);
+    }
+
+    /**
+     * Applies the recovery strategy only to a position the server can no longer resolve, and retries
+     * everything else.
+     *
+     * <p>CPF7053, CPF9801 and CPF7054 all arrive here, and only the first two mean the receiver has been
+     * pruned. CPF7054 is a range the server would not take - most often one resolved while the live receiver
+     * list and the deliberately delayed journal head disagreed, moments after a receiver roll. Reading that
+     * as a lost journal is what reset production connectors to the earliest retained receiver, 70-90 million
+     * entries back, every time they caught up with the head (issue #79). A stale range self-heals within the
+     * delay window, so the right answer for it is to wait a poll and resolve the range again.</p>
+     *
+     * <p>The check is on the position, not on the message id: an offset that really does not belong to the
+     * journal any more - deleted and recreated under us - also reports CPF7054, and is a genuine loss. The
+     * receiver list is what tells the two apart.</p>
+     */
+    private void recoverIfThePositionIsReallyGone(As400OffsetContext offsetContext, Exception cause) {
+        if (dataConnection.isPositionStillAvailable(offsetContext.getPosition())) {
+            log.warn("the journal call failed for position {}, but that position is still in the journal's receiver "
+                    + "chain: retrying rather than resetting the offset", offsetContext.getPosition(), cause);
+            return;
+        }
+        applyUnavailablePositionRecovery(offsetContext, cause);
     }
 
     /**
