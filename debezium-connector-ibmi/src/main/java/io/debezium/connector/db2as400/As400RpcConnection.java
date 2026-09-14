@@ -424,9 +424,10 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
             final int growthSamples = catchUpTrend.record(behind, bufferFull);
             streamingMetrics.setJournalBehindGrowthSamples(growthSamples);
             final FirstHeader header = retrieveJournal.getFirstHeader();
-            log.info("Current position diagnostics last call {}, header {}, behind {}, current receiver {}, "
-                    + "last block rpc {}ms waited {}ms consumed {}ms, small call {}ms, {}, lag growth samples {}", state,
-                    header, behind, currentReceiver, retrieveJournal.lastRpcMs(), retrieveJournal.lastWaitMs(), lastConsumedMs,
+            log.info("Current position diagnostics last call {}, header {}, behind {}, parked on receiver {} at offset {}, "
+                    + "current receiver {}, last block rpc {}ms waited {}ms consumed {}ms, small call {}ms, {}, "
+                    + "lag growth samples {}", state, header, behind, position.getReceiver(), position.getOffset(),
+                    currentReceiver, retrieveJournal.lastRpcMs(), retrieveJournal.lastWaitMs(), lastConsumedMs,
                     smallCallMs, describeLink(header == null ? 0 : header.totalBytes(), retrieveJournal.lastRpcMs(), smallCallMs),
                     growthSamples);
             if (growthSamples >= CatchUpTrend.WARN_AFTER) {
