@@ -134,6 +134,17 @@ class As400RpcConnectionLogPositionTest {
     }
 
     @Test
+    void aDeletedJournalLeavesNoChainToBeIn() throws Exception {
+        final JournalInfoRetrieval retrieval = mock(JournalInfoRetrieval.class);
+        when(retrieval.getReceivers(any(), any()))
+                .thenThrow(new JournalReceiverNotFoundException("Object JRN in library JRNLIB not found.", "CPF9801"));
+
+        // DLTJRN: the chain cannot be read because it no longer exists, which is an answer and not a failure
+        // to look - retrying it forever costs the classification the orchestrator routes on
+        assertThat(As400RpcConnection.isPositionStillAvailable(retrieval, as400, JOURNAL, position(82))).isFalse();
+    }
+
+    @Test
     void aBlankPositionIsNotAvailable() throws Exception {
         final JournalInfoRetrieval retrieval = mock(JournalInfoRetrieval.class);
 
