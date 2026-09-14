@@ -170,6 +170,11 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
                             + "the earlier failure to resolve the journal for {}", connectorConfig.getSchema()));
         }
 
+        // An operator-requested reposition runs first: it is the escape hatch for a connector that cannot
+        // catch up, and it has to work whether or not the stored position is still available - including
+        // under the default 'fail' recovery, which would otherwise throw before we got here.
+        applyOperatorReposition(connectorConfig, rpcConnection, previousOffsetPartition);
+
         // Detect and recover from a stored position whose receiver has been pruned, before Debezium
         // core turns an unavailable position into a generic crash-loop.
         applyUnavailablePositionRecovery(connectorConfig, rpcConnection, previousOffsetPartition);
@@ -222,6 +227,44 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
      * A receiver can also be pruned once streaming is under way; that is handled by the equivalent recovery
      * in {@code As400StreamingChangeEventSource.applyUnavailablePositionRecovery}.
      */
+    /**
+     * Moves streaming to the current journal head when a reposition token is armed and has not been applied yet.
+     * <p>
+     * This is the deliberate, operator-driven counterpart of
+     * {@link As400ConnectorConfig.UnavailablePositionRecovery#LATEST}, which only fires on a pruned position. A
+     * connector whose read rate is below the journal's own growth rate never catches up even though its position
+     * stays perfectly available, and there is no other supported way to move it forward.
+     * <p>
+     * The applied token is written into the offset, so the reposition happens once rather than on every task
+     * restart - a reposition that repeated silently would skip the journal again each time the pod moved. The
+     * skipped range is a declared data gap and must be recovered by a backfill; the {@code errors.tolerance=all}
+     * requirement is enforced in {@link As400ConnectorConfig#validateUnavailablePositionRecovery()}.
+     */
+    static void applyOperatorReposition(As400ConnectorConfig connectorConfig, As400RpcConnection rpcConnection,
+                                        Offsets<As400Partition, As400OffsetContext> previousOffsets) {
+        final String token = connectorConfig.getRepositionToken();
+        if (token == null || token.isBlank()) {
+            return;
+        }
+        for (Map.Entry<As400Partition, As400OffsetContext> entry : previousOffsets) {
+            final As400OffsetContext offset = entry.getValue();
+            if (offset == null) {
+                continue;
+            }
+            if (token.equals(offset.getRepositionToken())) {
+                LOGGER.info("journal reposition '{}' was already applied; leaving streaming at {}. Change "
+                        + "'{}' to arm another one.", token, offset.getPosition(), As400ConnectorConfig.REPOSITION_TOKEN.name());
+                continue;
+            }
+            final JournalProcessedPosition head = currentJournalHead(rpcConnection, offset);
+            LOGGER.warn("DATA GAP: operator-requested reposition '{}': moving streaming from {} to the current journal "
+                    + "head {}. Every change between the two is skipped and can only be recovered by a backfill.",
+                    token, offset.getPosition(), head);
+            offset.setPosition(head);
+            offset.setRepositionToken(token);
+        }
+    }
+
     static void applyUnavailablePositionRecovery(As400ConnectorConfig connectorConfig, As400RpcConnection rpcConnection,
                                                  Offsets<As400Partition, As400OffsetContext> previousOffsets) {
         if (!connectorConfig.isLogPositionCheckEnabled()) {

@@ -130,6 +130,35 @@ Three things are done to keep this from turning into a silent crash-loop:
   Where a dropped record is not acceptable, `snapshot` is the safe recovery: it fills the gap instead
   of skipping it.
 
+### Repositioning a connector that cannot catch up
+
+`journal.unavailable.position.recovery` only fires when the stored position has been *pruned*. A
+connector whose read rate is below the journal's own growth rate never catches up even though its
+position stays perfectly available, so none of the strategies above trigger, and nothing else moves it:
+the offset lives in the connector's Kafka offsets topic, and hand-editing it risks writing an unset
+position, which `ReceiverPagination` reads as *from the beginning* — the opposite of the intent, and
+unrecoverable on a busy journal.
+
+`journal.reposition.token` is the escape hatch. Any non-blank value moves streaming to the current
+journal head once:
+
+```properties
+errors.tolerance=all
+journal.reposition.token=incident-1234
+```
+
+The applied value is recorded in the offset, so the reposition happens **once** rather than on every
+task restart — a reposition that repeated silently would skip the journal again each time the pod
+moved. Leaving the setting in place is therefore harmless; change the value to arm another one.
+
+It runs before the pruned-position recovery, so it also works under the default `fail`, which would
+otherwise stop the task first.
+
+Like `latest` it *declares* a data gap rather than recovering one, so it is only accepted together
+with `errors.tolerance=all` and the connector refuses to start otherwise. **The skipped range is only
+recoverable by a backfill** — reposition first, then backfill, so the backfill's fresh rows are not
+overwritten by the replay of stale journal entries.
+
 Data already lost from pruned receivers cannot be recovered via CDC; recovery is about getting the
 connector healthy again, not replaying the gap. Ad-hoc snapshots (both incremental and blocking) are
 also supported via the signalling channel.
