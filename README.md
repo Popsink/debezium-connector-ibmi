@@ -2,6 +2,34 @@
 
 Use the IBM I journal as a source of CDC events see https://github.com/debezium/debezium-connector-ibmi/tree/main/journal-parsing/ for the journal fetch/decoding
 
+# Popsink fork
+
+This repository is Popsink's fork of [debezium/debezium-connector-ibmi](https://github.com/debezium/debezium-connector-ibmi).
+`main` is upstream `v3.6.3.Final` with the patches below rebased on top, so `git log v3.6.3.Final..main` lists exactly the fork delta.
+Builds are published to GCP Artifact Registry as `<debezium version>-ppsk-<date>[-N]` by `publish-release.yml`.
+
+Patches that upstream accepts are dropped from the fork at the next rebase. Upstream enforces DCO, so commits proposed there need a `Signed-off-by` line.
+
+## Fork delta
+
+| Patch | Status |
+|---|---|
+| Release management: GCP Artifact Registry repositories, `gcloud` deploy profile, `publish-release.yml` / `publish-snapshot.yml` / `build-pr.yml`, checkstyle and Sonatype publishing disabled, `version.debezium` pinned | Popsink-only |
+| Optional transaction support (`transaction.management`) | Popsink-only until there is a demand upstream |
+| Ad-hoc blocking snapshots in journal streaming, journal watchdog suspended during a blocking snapshot | Popsink-only for now; depends on how upstream wants blocking snapshots to interact with the watchdog |
+| Blocking-snapshot boundary probe hinted with `OPTIMIZE FOR 1 ROW` (#21), optimisation hints on the snapshot selects, IBM i query governor off by default | Popsink-only; tuned for our customers' systems |
+| Better configuration defaults and JDBC validation | Popsink-only |
+| RRN retrieved from journal entries and exposed in the source block | Popsink-only |
+| `$` in table names | Candidate for upstream (#93) |
+| Null handling in the journal decoder | Candidate for upstream (#93) |
+| DATE/TIME decoded using the column's DATFMT instead of assuming `*ISO`, PUB400-compatible `DateTimeFormatCache` | Candidate for upstream (#93) |
+| Tables across several libraries sharing one journal | Candidate for upstream (#93) |
+| Recovery from a pruned journal receiver (#14) | Candidate for upstream (#93) |
+| `latest` journal position recovery strategy (#84) | Candidate for upstream (#93) |
+| SLF4J placeholder mismatches (#56) | Candidate for upstream (#93) |
+
+Already accepted upstream and no longer carried here: persist and load the incremental snapshot status (debezium/dbz#1861) and the reliable connection close that clears the prepared-statement cache (debezium/dbz#2204).
+
 # Configuration
 
 ## IBMI Permissions

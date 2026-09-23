@@ -2,7 +2,7 @@
     <parent>
         <groupId>io.debezium</groupId>
         <artifactId>debezium-connector-reactor-ibmi</artifactId>
-        <version>3.5.0.Final</version>
+        <version>3.6.3.Final</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
     <modelVersion>4.0.0</modelVersion>
@@ -243,7 +243,7 @@
                 </plugins>
             </build>
             <properties>
-                <docker.filter>${docker.dbs},quay.io/apicurio/apicurio-registry-mem:${version.apicurio}</docker.filter>
+                <docker.filter>${docker.dbs},${apicurio.image}:${version.apicurio}</docker.filter>
             </properties>
         </profile>
     </profiles>
