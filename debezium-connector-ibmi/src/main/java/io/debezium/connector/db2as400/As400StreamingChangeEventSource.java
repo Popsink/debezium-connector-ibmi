@@ -9,7 +9,6 @@ import java.io.IOException;
 import java.sql.SQLNonTransientConnectionException;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -22,11 +21,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.DebeziumException;
+import io.debezium.connector.db2as400.As400ConnectorConfig.UnavailablePositionRecovery;
 import io.debezium.connector.db2as400.As400RpcConnection.BlockingReceiverConsumer;
 import io.debezium.data.Envelope.Operation;
+import io.debezium.ibmi.db2.journal.data.types.Diagnostics;
 import io.debezium.ibmi.db2.journal.retrieve.JournalEntryType;
+import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.ibmi.db2.journal.retrieve.exception.FatalException;
-import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidPositionException;
+import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalRangeException;
+import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
@@ -42,9 +45,15 @@ import io.debezium.util.Metronome;
  * </p>
  */
 public class As400StreamingChangeEventSource implements StreamingChangeEventSource<As400Partition, As400OffsetContext> {
-    private static final String NO_TRANSACTION_ID = "00000000000000000000";
-    private long connectionTime = -1;
-    private final long MIN_DISCONNECT_TIME_MS = 30000;
+
+    private static final int TRANSACTION_MAP_WARN_SIZE = 50_000;
+    private static final int MAX_RETRIES = 20;
+    /** Retry backoff grows from {@code poll.interval.ms} up to this multiple of it, then stays there. */
+    private static final long MAX_RETRY_BACKOFF_MULTIPLIER = 8;
+    /** How often the paused streaming thread re-checks and re-acknowledges the blocking-snapshot pause. */
+    private static final long PAUSE_POLL_INTERVAL_MS = 250;
+    /** How often a still-paused streaming thread reports that it is waiting, so a pause is never silent. */
+    private static final long PAUSE_REPORT_INTERVAL_MS = 60_000;
 
     private static final Logger log = LoggerFactory.getLogger(As400StreamingChangeEventSource.class);
 
@@ -70,11 +79,14 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
     private final Map<String, TransactionContext> txMap = new HashMap<>();
     private final Map<String, List<As400ChangeRecord>> bufferRecordMap = new HashMap<>();
     private final String database;
+    private final SnapshotActivity snapshotActivity;
     private As400OffsetContext offsetContext;
 
     public As400StreamingChangeEventSource(As400ConnectorConfig connectorConfig, As400RpcConnection dataConnection,
                                            As400JdbcConnection jdbcConnection, EventDispatcher<As400Partition, TableId> dispatcher,
-                                           ErrorHandler errorHandler, Clock clock, As400DatabaseSchema schema) {
+                                           ErrorHandler errorHandler, Clock clock, As400DatabaseSchema schema,
+                                           SnapshotActivity snapshotActivity) {
+        this.snapshotActivity = snapshotActivity;
         this.connectorConfig = connectorConfig;
         this.dataConnection = dataConnection;
         this.jdbcConnection = jdbcConnection;
@@ -118,25 +130,22 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
             throws InterruptedException {
         final Metronome metronome = Metronome.sleeper(pollInterval, clock);
         int retries = 0;
-        final WatchDog watchDog = new WatchDog(Thread.currentThread(), connectorConfig.getMaxRetrievalTimeout());
+        final WatchDog watchDog = new WatchDog(Thread.currentThread(), connectorConfig.getMaxRetrievalTimeout(),
+                connectorConfig.getBlockingSnapshotPauseTimeout(), context::isPaused,
+                snapshotActivity::isSnapshotRunning, errorHandler::setProducerThrowable);
         watchDog.start();
         try {
             while (context.isRunning()) {
                 // Cooperate with the coordinator when an ad-hoc blocking snapshot is requested:
-                // acknowledge the pause so the blocking snapshot can start, then wait for it to
-                // complete before resuming journal streaming. Without this the coordinator's
-                // blocking-snapshot thread waits forever on waitStreamingPaused() and the snapshot
-                // never runs. The check happens between RPC polls, so the pause takes effect after
-                // the current getJournalEntries() call returns (bounded by the watchdog timeout).
+                // acknowledge the pause so the blocking snapshot can start, then wait for it to complete
+                // before resuming journal streaming. Without this the coordinator's blocking-snapshot
+                // thread waits forever on waitStreamingPaused() and the snapshot never runs.
+                // getJournalEntries() also checks isPaused() and returns promptly once a pause is
+                // requested (issue #27), so this handshake is reached within one journal entry rather
+                // than after a whole shared-journal block; if it is not reached at all the WatchDog fails
+                // the task with a retriable error so it restarts.
                 if (context.isPaused()) {
-                    log.info("Streaming will now pause for an ad-hoc blocking snapshot");
-                    // The streaming thread parks in waitSnapshotCompletion() below and stops calling
-                    // watchDog.alive(); suspend the watchdog so it does not interrupt us mid-snapshot.
-                    watchDog.pause();
-                    context.streamingPaused();
-                    context.waitSnapshotCompletion();
-                    watchDog.resume();
-                    log.info("Streaming resumed after blocking snapshot");
+                    awaitBlockingSnapshots(context, watchDog);
                 }
                 try {
                     try {
@@ -148,17 +157,25 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                                 break;
                             case NotCalled:
                                 metronome.pause();
-                                dispatcher.dispatchHeartbeatEventAlsoToIncrementalSnapshot(partition, offsetContext);
                                 break;
                             default:
                                 metronome.pause();
                                 break;
                         }
+                        // The read position advances for every entry retrieved from the journal.
+                        // Debezium throttles this to heartbeat.interval.ms internally and
+                        // no-ops when heartbeats are disabled, so the per-iteration call is cheap.
+                        dispatcher.dispatchHeartbeatEventAlsoToIncrementalSnapshot(partition, offsetContext);
                         retries = 0;
                     }
-                    catch (final InvalidPositionException e) {
-                        throw new DebeziumException("Invalid journal receiver/sequence are we using the wrong offset for the receiver: " + offsetContext.getPosition(),
-                                e);
+                    catch (final LostJournalException | InvalidJournalRangeException e) {
+                        // the journal or the receivers we were reading may be gone, e.g. deleted while we were
+                        // streaming: data is already lost, so apply the configured recovery strategy rather
+                        // than silently skipping on - but only once the receiver list says the position really
+                        // has gone, since the same failures are also how a badly resolved range reports
+                        // itself, and recovering from one of those costs the whole retained journal (issue #79)
+                        recoverIfThePositionIsReallyGone(offsetContext, e);
+                        retries = pauseBeforeRetry(retries, offsetContext, e);
                     }
                     catch (final FatalException e) {
                         throw new DebeziumException("Unable to process offset " + offsetContext.getPosition(), e);
@@ -167,8 +184,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         if (context.isRunning()) {
                             log.error("Interrupted processing offset {} retry {}", offsetContext.getPosition(), retries);
                             closeAndReconnect();
-                            retries++;
-                            metronome.pause();
+                            retries = pauseBeforeRetry(retries, offsetContext, e);
                         }
                     }
                     catch (IOException | SQLNonTransientConnectionException e) { // SQLNonTransientConnectionException
@@ -177,14 +193,12 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         log.error("Connection failed offset {} retry {}", offsetContext.getPosition(), retries, e);
                         closeAndReconnect();
 
-                        retries++;
-                        metronome.pause(); // throws interruptedException
+                        retries = pauseBeforeRetry(retries, offsetContext, e);
                     }
                     catch (final Exception e) {
                         log.error("Failed to process offset {} retry {}", offsetContext.getPosition(), retries, e);
 
-                        retries++;
-                        metronome.pause();
+                        retries = pauseBeforeRetry(retries, offsetContext, e);
                     }
                 }
                 catch (final InterruptedException e) { // handle InterruptedException during the exception handling
@@ -199,13 +213,159 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
         }
     }
 
-    public void rateLimittedClose() {
-        if (System.currentTimeMillis() - connectionTime > MIN_DISCONNECT_TIME_MS) {
-            closeAndReconnect();
+    /**
+     * Parks journal streaming for as long as the coordinator keeps {@code context.isPaused()} set, i.e.
+     * for the whole run of ad-hoc blocking snapshots it dispatches back to back, re-acknowledging the
+     * pause on every tick.
+     * <p>
+     * The obvious implementation - acknowledge once with {@code streamingPaused()} and then park in
+     * {@code context.waitSnapshotCompletion()} - deadlocks with the coordinator (issue #74), and did so
+     * twice in one hour in production. {@code waitSnapshotCompletion()} loops on the coordinator's
+     * {@code paused} flag and only re-reads it after re-acquiring the coordinator's lock, which the
+     * resuming thread holds until it has signalled. The blocking-snapshot executor is single-threaded,
+     * so it goes straight from resuming one snapshot to starting the next queued one, and that next task
+     * sets {@code paused = true} (and {@code streaming = true}) again before the woken streaming thread
+     * gets the lock back. The streaming thread then sees "paused" once more and parks again - this time
+     * for good, because the acknowledgement it already sent was consumed by the previous snapshot and the
+     * new task is itself parked in {@code waitStreamingPaused()} waiting for an acknowledgement that can
+     * no longer come. Both sides read "paused" forever, no snapshot runs, streaming never resumes, and
+     * nothing fails: the connector freezes while every health probe stays green.
+     * <p>
+     * Polling the flag instead of parking on the condition breaks that: the pause is acknowledged again
+     * on every tick, so a snapshot task that started while we were already paused gets its handshake and
+     * runs, and the acknowledgement can no longer be lost to a race. The cost is one lock acquisition and
+     * a {@code signalAll()} with no waiters every {@value #PAUSE_POLL_INTERVAL_MS} ms while paused, and up
+     * to that much added latency before streaming resumes - negligible next to a snapshot.
+     * <p>
+     * The pause is not bounded here: a legitimate blocking snapshot can run for hours, so a timeout on
+     * this loop would abort real work. The {@link WatchDog} bounds it instead, using "a snapshot is
+     * running" to tell a healthy pause from a wedged one.
+     */
+    private void awaitBlockingSnapshots(ChangeEventSourceContext context, WatchDog watchDog) throws InterruptedException {
+        log.info("Streaming will now pause for an ad-hoc blocking snapshot");
+        // The streaming thread stops calling watchDog.alive() while parked here; suspend the activity
+        // invariant so it does not interrupt us mid-snapshot. The handshake invariant keeps running.
+        watchDog.pause();
+        final long pausedAt = System.currentTimeMillis();
+        long nextReport = pausedAt + PAUSE_REPORT_INTERVAL_MS;
+        try {
+            while (context.isRunning() && context.isPaused()) {
+                // (re-)acknowledge the pause: this is what a coordinator task parked in
+                // waitStreamingPaused() is waiting for, whether it asked before or after we paused
+                context.streamingPaused();
+                final long now = System.currentTimeMillis();
+                if (now >= nextReport) {
+                    // a multi-hour pause would otherwise be indistinguishable from a freeze in the logs
+                    log.info("Still paused for an ad-hoc blocking snapshot after {}s (snapshot running: {})",
+                            (now - pausedAt) / 1000, snapshotActivity.isSnapshotRunning());
+                    nextReport = now + PAUSE_REPORT_INTERVAL_MS;
+                }
+                Thread.sleep(PAUSE_POLL_INTERVAL_MS);
+            }
         }
-        else {
-            log.debug("Only connected since {} ignoring disconnect", new Date(connectionTime));
+        finally {
+            watchDog.resume();
         }
+        log.info("Streaming resumed after blocking snapshot, paused for {}ms", System.currentTimeMillis() - pausedAt);
+    }
+
+    /**
+     * Applies the recovery strategy only to a position the server can no longer resolve, and retries
+     * everything else.
+     *
+     * <p>CPF7053, CPF9801 and CPF7054 all arrive here, and only the first two mean the receiver has been
+     * pruned. CPF7054 is a range the server would not take - most often one resolved while the live receiver
+     * list and the deliberately delayed journal head disagreed, moments after a receiver roll. Reading that
+     * as a lost journal is what reset production connectors to the earliest retained receiver, 70-90 million
+     * entries back, every time they caught up with the head (issue #79). A stale range self-heals within the
+     * delay window, so the right answer for it is to wait a poll and resolve the range again.</p>
+     *
+     * <p>The check is on the position, not on the message id: an offset that really does not belong to the
+     * journal any more - deleted and recreated under us - also reports CPF7054, and is a genuine loss. The
+     * receiver list is what tells the two apart.</p>
+     */
+    private void recoverIfThePositionIsReallyGone(As400OffsetContext offsetContext, Exception cause) {
+        if (dataConnection.isPositionStillAvailable(offsetContext.getPosition())) {
+            log.warn("the journal call failed for position {}, but that position is still in the journal's receiver "
+                    + "chain: retrying rather than resetting the offset", offsetContext.getPosition(), cause);
+            return;
+        }
+        applyUnavailablePositionRecovery(offsetContext, cause);
+    }
+
+    /**
+     * Streaming counterpart of {@code As400ConnectorTask.applyUnavailablePositionRecovery}: the journal and its
+     * receivers can go away while the connector is running, not only between restarts, so the configured
+     * {@link UnavailablePositionRecovery} strategy has to be honoured here too.
+     * <p>
+     * {@code SNAPSHOT} cannot re-run the initial snapshot from the streaming thread, so it fails the task
+     * with the same machine-readable marker used at startup; the offset reset and the fresh snapshot are then
+     * done by the startup recovery when the task restarts. Set {@code errors.max.retries} together with a
+     * {@code custom.retriable.exception} matching {@link OffsetNoLongerAvailableException#ERROR_CODE} to have
+     * the engine restart itself rather than waiting for the orchestrator.
+     */
+    private void applyUnavailablePositionRecovery(As400OffsetContext offsetContext, Exception cause) {
+        final String lost = "journal position " + offsetContext.getPosition() + " is no longer available on the server while streaming";
+        switch (connectorConfig.getUnavailablePositionRecovery()) {
+            case FAIL:
+                throw new OffsetNoLongerAvailableException(lost + ". Reset the offset and trigger a snapshot, or set '"
+                        + As400ConnectorConfig.UNAVAILABLE_POSITION_RECOVERY.name() + "' to 'snapshot' or 'earliest' to auto-recover.", cause);
+            case SNAPSHOT:
+                throw new OffsetNoLongerAvailableException(lost + "; failing the task so snapshot.mode '"
+                        + connectorConfig.getSnapshotMode().getValue() + "' can take a fresh snapshot to fill the gap when it restarts.", cause);
+            case EARLIEST:
+                log.warn("DATA GAP: {}; resetting streaming to the earliest available journal receiver. Changes between the "
+                        + "lost position and the earliest available receiver are unrecoverable.", lost, cause);
+                offsetContext.setPosition(new JournalProcessedPosition());
+                // discard ongoing transactions
+                beforeMap.clear();
+                txMap.clear();
+                bufferRecordMap.clear();
+                offsetContext.endTransaction();
+        }
+    }
+
+    /**
+     * Waits out an exponentially growing backoff before the next attempt, giving up once the same failure
+     * has been retried {@link #MAX_RETRIES} times so a permanently broken stream fails the connector
+     * instead of retrying forever. A lost connection is retriable, so failing here restarts the connector,
+     * see {@link As400ErrorHandler}.
+     * <p>
+     * The wait is deliberately not taken from the streaming loop's {@link Metronome}. That one advances its
+     * tick by exactly one period per {@code pause()} call rather than by the wall clock, and the healthy
+     * path never calls it - {@code Success} and {@code MoreDataAvailable} both fall straight through - so by
+     * the time a failure burst starts its tick is behind by roughly the whole time spent streaming and every
+     * {@code pause()} returns immediately. Sharing it inverted the intent: the busier the connector, the
+     * less backoff it got, and 20 attempts could be spent in under 3 seconds.
+     *
+     * @return the number of retries attempted so far
+     */
+    private int pauseBeforeRetry(int retries, As400OffsetContext offsetContext, Exception e)
+            throws InterruptedException {
+        final int attempted = retries + 1;
+        if (attempted >= MAX_RETRIES) {
+            throw new DebeziumException(
+                    String.format("Failed to process offset %s after %d retries", offsetContext.getPosition(), attempted), e);
+        }
+        final Duration backoff = retryBackoff(retries);
+        log.info("Retrying offset {} in {}ms, attempt {}/{}", offsetContext.getPosition(), backoff.toMillis(), attempted,
+                MAX_RETRIES);
+        // a Metronome of its own, created here, so this first and only pause() really waits the whole backoff
+        Metronome.sleeper(backoff, clock).pause();
+        return attempted;
+    }
+
+    /**
+     * {@code pollInterval * 2^retries}, capped at {@link #MAX_RETRY_BACKOFF_MULTIPLIER} times the poll
+     * interval so the wait stays proportional to how often the connector was asked to poll. The whole
+     * {@link #MAX_RETRIES} budget spans 135 poll intervals: about 68s at the 500ms default, about 4.5
+     * minutes at {@code poll.interval.ms=2000} - rather than the 2.7 seconds it took while the streaming
+     * metronome was shared.
+     */
+    Duration retryBackoff(int retries) {
+        // 1L << 30 already dwarfs the cap; clamping the shift keeps it out of overflow territory
+        final long multiplier = Math.min(1L << Math.min(retries, 30), MAX_RETRY_BACKOFF_MULTIPLIER);
+        return pollInterval.multipliedBy(multiplier);
     }
 
     public void closeAndReconnect() {
@@ -223,13 +383,19 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
         catch (final Exception e) {
             log.error("Failure reconnecting sql", e);
         }
-        connectionTime = System.currentTimeMillis();
     }
 
     // TODO tidy up exception handling
     private BlockingReceiverConsumer processJournalEntries(As400Partition partition, As400OffsetContext offsetContext)
             throws IOException, SQLNonTransientConnectionException {
         return (nextOffset, r, eheader) -> {
+            String longName = eheader.getFile();
+            try {
+                longName = jdbcConnection.getLongName(eheader.getLibrary(), eheader.getFile());
+            }
+            catch (final IllegalStateException e) {
+                log.error("failed to look up long name", e);
+            }
             try {
                 final JournalEntryType journalEntryType = eheader.getJournalEntryType();
 
@@ -238,13 +404,6 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                     return;
                 }
 
-                String longName = eheader.getFile();
-                try {
-                    longName = jdbcConnection.getLongName(eheader.getLibrary(), eheader.getFile());
-                }
-                catch (final IllegalStateException e) {
-                    log.error("failed to look up long name", e);
-                }
                 final TableId tableId = new TableId(database, eheader.getLibrary(), longName);
 
                 final boolean includeTable = connectorConfig.getTableFilters().dataCollectionFilter()
@@ -269,6 +428,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         txc.beginTransaction(txId);
                         offsetContext.setTransaction(txc);
                         txMap.put(txId, txc);
+                        warnIfOversized();
                         log.debug("start transaction id {} tx {} table {}", nextOffset, txId, tableId);
                         if (connectorConfig.isTransactionMgmtEnabled()) {
                             startTransaction(txId);
@@ -458,7 +618,12 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                 throw e;
             }
             catch (final Exception e) {
-                log.error("Failed to process record", e);
+                // same line as the throwable, so the dead-letter record carries the row bytes
+                log.error("Failed to process record at offset = " + eheader.getSequenceNumber() + "  in table = " + longName +
+                        " at RRN = " + eheader.getRelativeRecordNumber() + " [journalCode = " + eheader.getJournalCode() + ", journalEntryType = "
+                        + eheader.getJournalEntryType() + "], " +
+                        "skipping and dumping diagnostics if enabled ... record image (hex) = "
+                        + r.currentRecordImageHex(Diagnostics.MAX_LOGGED_RECORD_BYTES), e);
             }
         };
     }
@@ -476,6 +641,15 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
     private void startTransaction(String txId) {
         List<As400ChangeRecord> bufferList = new ArrayList<>();
         bufferRecordMap.put(txId, bufferList);
+    }
+
+    private void warnIfOversized() {
+        final int txMapSize = txMap.size();
+        if (txMapSize >= TRANSACTION_MAP_WARN_SIZE && txMapSize % TRANSACTION_MAP_WARN_SIZE == 0) {
+            log.warn("tracking {} in-flight transactions ({} of them buffering events) - commit cycles are being "
+                    + "retained without a matching commit or rollback entry and will consume heap until the task restarts",
+                    txMapSize, bufferRecordMap.size());
+        }
     }
 
     private boolean ignore(JournalEntryType journalCode) {

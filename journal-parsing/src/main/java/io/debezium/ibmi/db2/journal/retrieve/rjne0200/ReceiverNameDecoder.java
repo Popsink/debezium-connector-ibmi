@@ -15,18 +15,18 @@ import org.slf4j.LoggerFactory;
 import com.ibm.as400.access.AS400Bin2;
 import com.ibm.as400.access.AS400DataType;
 import com.ibm.as400.access.AS400Structure;
-import com.ibm.as400.access.AS400Text;
 import com.ibm.as400.access.AS400Timestamp;
 import com.ibm.as400.access.BinaryFieldDescription;
-import com.ibm.as400.access.CharacterFieldDescription;
 import com.ibm.as400.access.FieldDescription;
+
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 
 public class ReceiverNameDecoder {
     private static final Logger log = LoggerFactory.getLogger(ReceiverNameDecoder.class);
 
     private final AS400Structure structure;
 
-    public ReceiverNameDecoder() {
+    public ReceiverNameDecoder(As400TextFactory textFactory) {
         ArrayList<AS400DataType> dataTypes = new ArrayList<AS400DataType>();
         AS400Timestamp timeType = new AS400Timestamp();
         try {
@@ -42,9 +42,9 @@ public class ReceiverNameDecoder {
         }
 
         FieldDescription[] fds = new FieldDescription[]{
-                new CharacterFieldDescription(new AS400Text(10), "0 receiver name"),
-                new CharacterFieldDescription(new AS400Text(10), "1 library name"),
-                new CharacterFieldDescription(new AS400Text(10), "2 ASP device name"),
+                textFactory.charField(10, "0 receiver name"),
+                textFactory.charField(10, "1 library name"),
+                textFactory.charField(10, "2 ASP device name"),
                 new BinaryFieldDescription(new AS400Bin2(), "3 ASP number") };
         for (int i = 0; i < fds.length; i++) {
             dataTypes.add(fds[i].getDataType());

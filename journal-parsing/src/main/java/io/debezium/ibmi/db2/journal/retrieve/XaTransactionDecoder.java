@@ -10,10 +10,10 @@ import java.util.ArrayList;
 import com.ibm.as400.access.AS400Bin4;
 import com.ibm.as400.access.AS400DataType;
 import com.ibm.as400.access.AS400Structure;
-import com.ibm.as400.access.AS400Text;
 import com.ibm.as400.access.BinaryFieldDescription;
-import com.ibm.as400.access.CharacterFieldDescription;
 import com.ibm.as400.access.FieldDescription;
+
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 
 public class XaTransactionDecoder {
     final AS400Structure structure;
@@ -25,11 +25,11 @@ public class XaTransactionDecoder {
      * long bqual_length; Length of branch qualifier
      * char data[XIDDATASIZE]; Transaction branch id
      */
-    public XaTransactionDecoder() {
+    public XaTransactionDecoder(As400TextFactory textFactory) {
         FieldDescription[] fds = new FieldDescription[]{
                 new BinaryFieldDescription(new AS400Bin4(), "SRCDAT"),
                 new BinaryFieldDescription(new AS400Bin4(), "SRCSEQ"),
-                new CharacterFieldDescription(new AS400Text(80), "SRCDTA"),
+                textFactory.charField(80, "SRCDTA"),
         };
         ArrayList<AS400DataType> dataTypes = new ArrayList<AS400DataType>();
         for (int i = 0; i < fds.length; i++) {

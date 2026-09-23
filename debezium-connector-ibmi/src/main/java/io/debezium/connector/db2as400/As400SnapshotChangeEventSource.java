@@ -10,11 +10,13 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
@@ -49,13 +51,14 @@ public class As400SnapshotChangeEventSource
     private final As400RpcConnection rpcConnection;
     private final As400DatabaseSchema schema;
     protected final SnapshotterService snapshotterService;
+    private final SnapshotActivity snapshotActivity;
 
     public As400SnapshotChangeEventSource(As400ConnectorConfig connectorConfig, As400RpcConnection rpcConnection,
                                           MainConnectionProvidingConnectionFactory<As400JdbcConnection> jdbcConnectionFactory,
                                           As400DatabaseSchema schema, EventDispatcher<As400Partition, TableId> dispatcher, Clock clock,
                                           SnapshotProgressListener<As400Partition> snapshotProgressListener,
                                           NotificationService<As400Partition, As400OffsetContext> notificationService,
-                                          SnapshotterService snapshotterService) {
+                                          SnapshotterService snapshotterService, SnapshotActivity snapshotActivity) {
 
         super(connectorConfig, jdbcConnectionFactory, schema, dispatcher, clock, snapshotProgressListener,
                 notificationService, snapshotterService);
@@ -65,14 +68,27 @@ public class As400SnapshotChangeEventSource
         this.jdbcConnection = jdbcConnectionFactory.mainConnection();
         this.schema = schema;
         this.snapshotterService = snapshotterService;
+        this.snapshotActivity = snapshotActivity;
     }
 
+    /**
+     * Publishes "a snapshot is running" for the whole duration of the snapshot, so the streaming side's
+     * {@link WatchDog} can tell a streaming thread legitimately paused for an ad-hoc blocking snapshot
+     * from one paused on a coordinator pause flag that leaked (issue #74). This has to span the whole
+     * call: the preparation phase before the first row is exported took nearly four minutes in the
+     * reported incident, and it is just as legitimate as the export itself.
+     */
     @Override
     public SnapshotResult<As400OffsetContext> execute(ChangeEventSourceContext context, As400Partition partition,
                                                       As400OffsetContext previousOffset, SnapshottingTask snapshottingTask)
             throws InterruptedException {
-
-        return super.execute(context, partition, previousOffset, snapshottingTask);
+        snapshotActivity.snapshotStarted();
+        try {
+            return super.execute(context, partition, previousOffset, snapshottingTask);
+        }
+        finally {
+            snapshotActivity.snapshotFinished();
+        }
     }
 
     /**
@@ -167,7 +183,59 @@ public class As400SnapshotChangeEventSource
         for (final String schema : connectorConfig.getCaptureSchemas()) {
             tables.addAll(jdbcConnection.readTableNames(databaseName, schema, null, new String[]{ "TABLE" }));
         }
+        if (connectorConfig.skipUncapturableTables()) {
+            dropMemberlessFiles(tables);
+        }
         return tables;
+    }
+
+    /**
+     * A memberless physical file fails any SQL access with {@code SQL0204} and would abort the snapshot of
+     * every other table; under {@code errors.tolerance=all} it is dropped instead.
+     */
+    private void dropMemberlessFiles(Set<TableId> tables) {
+        final Set<String> schemas = tables.stream().map(TableId::schema).collect(Collectors.toSet());
+        for (final String schema : schemas) {
+            final Set<String> withMembers;
+            try {
+                withMembers = jdbcConnection.tablesWithMembers(schema);
+            }
+            catch (final SQLException e) {
+                log.error("failed to list the tables of {} with members, keeping them all in the snapshot", schema, e);
+                continue;
+            }
+            final Iterator<TableId> iterator = tables.iterator();
+            while (iterator.hasNext()) {
+                final TableId tableId = iterator.next();
+                if (schema.equals(tableId.schema()) && !withMembers.contains(tableId.table().toUpperCase())) {
+                    log.error("errors.tolerance=all: dropping {} from the snapshot, the physical file has no member "
+                            + "- nothing will be captured for it", tableId);
+                    iterator.remove();
+                }
+            }
+        }
+    }
+
+    /**
+     * Names the {@code table.include.list} entries that matched no table on the source.
+     * <p>
+     * They are skipped by design - #33 settled that the include list is an allow list and that a table
+     * missing from the source must not block startup - but the skip left no trace anywhere, not even at
+     * DEBUG. On a connector configured for ~41 tables across two schemas only ~30 ever appeared in the
+     * "Adding table" lines and the rest showed up in neither direction, so the only way to tell "never
+     * captured because it does not exist" from "captured fine" was to diff the configured list against the
+     * log by hand. Nothing about which tables are captured changes here.
+     */
+    private void logUnresolvedIncludeListEntries(Set<TableId> capturedTables) {
+        final Map<String, Predicate<TableId>> matchers = connectorConfig.getTableIncludeListMatchers();
+        final List<String> unresolved = matchers.entrySet().stream()
+                .filter(entry -> capturedTables.stream().noneMatch(entry.getValue()))
+                .map(Map.Entry::getKey)
+                .toList();
+        if (!unresolved.isEmpty()) {
+            log.info("{} of the {} table.include.list entries matched no table on the source and will not be "
+                    + "captured: {}", unresolved.size(), matchers.size(), String.join(", ", unresolved));
+        }
     }
 
     @Override
@@ -229,6 +297,8 @@ public class As400SnapshotChangeEventSource
         final Set<String> schemas = snapshotContext.capturedTables.stream().map(TableId::schema)
                 .collect(Collectors.toSet());
 
+        logUnresolvedIncludeListEntries(snapshotContext.capturedTables);
+
         // reading info only for the schemas we're interested in as per the set of
         // captured tables;
         // while the passed table name filter alone would skip all non-included tables,
@@ -246,10 +316,17 @@ public class As400SnapshotChangeEventSource
                     connectorConfig.getTableFilters().eligibleDataCollectionFilter(), null, false);
 
             try {
-                jdbcConnection.getAllSystemNames(schema);
+                // scoped to this schema's captured tables for the same reason as the read above: the
+                // mapping is only ever consulted for those, and fetching the whole library's worth cost
+                // tens of seconds of round trips on every start
+                final Set<String> capturedInSchema = snapshotContext.capturedTables.stream()
+                        .filter(id -> schema.equals(id.schema()))
+                        .map(TableId::table)
+                        .collect(Collectors.toSet());
+                jdbcConnection.getAllSystemNames(schema, capturedInSchema);
             }
             catch (final Exception e) {
-                log.warn("failure fetching table names", e);
+                log.warn("failure fetching table names for schema {}", schema, e);
             }
         }
 
@@ -289,6 +366,22 @@ public class As400SnapshotChangeEventSource
         }
         String fullTableName = String.format("%s.%s", tableId.schema(), table);
         return snapshotterService.getSnapshotQuery().snapshotQuery(fullTableName, columns);
+    }
+
+    @Override
+    protected Long rowCountForTableChunked(TableId tableId) throws SQLException {
+        try {
+            return super.rowCountForTableChunked(tableId);
+        }
+        catch (SQLException e) {
+            final String hint = switch (e.getErrorCode()) {
+                case -204 -> " (SQL0204: the physical file may have no member, or the table was dropped after discovery)";
+                case -551, -552 -> " (SQL0551/SQL0552: the connecting user profile is not authorized to the table)";
+                case -913 -> " (SQL0913: the object is locked - a save or reorganize may be running)";
+                default -> "";
+            };
+            throw new SQLException("Failed to count rows for table " + tableId + hint, e.getSQLState(), e.getErrorCode(), e);
+        }
     }
 
     @Override

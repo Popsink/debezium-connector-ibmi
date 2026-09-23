@@ -23,19 +23,24 @@ import com.ibm.as400.access.SocketProperties;
 import io.debezium.DebeziumException;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.connector.db2as400.metrics.As400StreamingChangeEventSourceMetrics;
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.Connect;
 import io.debezium.ibmi.db2.journal.retrieve.FileFilter;
 import io.debezium.ibmi.db2.journal.retrieve.JournalInfo;
 import io.debezium.ibmi.db2.journal.retrieve.JournalInfoRetrieval;
+import io.debezium.ibmi.db2.journal.retrieve.JournalInfoRetrieval.ResolvedJournal;
 import io.debezium.ibmi.db2.journal.retrieve.JournalPosition;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
+import io.debezium.ibmi.db2.journal.retrieve.PointerHandles;
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalState;
 import io.debezium.ibmi.db2.journal.retrieve.RetrieveConfig;
 import io.debezium.ibmi.db2.journal.retrieve.RetrieveConfigBuilder;
 import io.debezium.ibmi.db2.journal.retrieve.RetrieveJournal;
+import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalRangeException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.JournalReceiverNotFoundException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
 import io.debezium.ibmi.db2.journal.retrieve.rjne0200.EntryHeader;
+import io.debezium.ibmi.db2.journal.retrieve.rjne0200.FirstHeader;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.DetailedJournalReceiver;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.JournalReceiverInfo;
 import io.debezium.pipeline.source.spi.ChangeEventSource.ChangeEventSourceContext;
@@ -52,7 +57,11 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
     private AS400 as400;
     private static SocketProperties socketProperties = new SocketProperties();
     private final LogLimmiting periodic = new LogLimmiting(5 * 60 * 1000l);
+    private final CatchUpTrend catchUpTrend = new CatchUpTrend();
+    /** walking and dispatching the previous block, the part a prefetch hides */
+    private long lastConsumedMs;
     private final JournalInfoRetrieval journalInfoRetrieval;
+    private final As400TextFactory textFactory;
 
     private final boolean isSecure;
 
@@ -61,19 +70,33 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
         this.config = config;
         this.isSecure = config.getJdbcConfig().getBoolean("secure", config.isSecure());
         this.streamingMetrics = streamingMetrics;
-        this.journalInfoRetrieval = new JournalInfoRetrieval(cacheWait, config.cacheAdditionalDelay(), config.getPollInterval().toMillis());
+        System.setProperty("com.ibm.as400.access.AS400.guiAvailable", "False");
+        // every AS400Text used to encode API parameters and decode journal data is built against
+        // this, so the CCSID follows the remote system instead of the connector's own locale
+        this.textFactory = createTextFactory();
+        this.journalInfoRetrieval = new JournalInfoRetrieval(textFactory, cacheWait, config.cacheAdditionalDelay(), config.getPollInterval().toMillis());
         try {
-            System.setProperty("com.ibm.as400.access.AS400.guiAvailable", "False");
-            journalInfo = journalInfoRetrieval.getJournal(connection(), config.getSchema(), includes);
+            final ResolvedJournal resolved = journalInfoRetrieval.resolveJournal(connection(), config.getSchema(),
+                    includes, config.skipUncapturableTables());
+            journalInfo = resolved.journalInfo();
+
+            log.info("journal {}, reading its head behind live ({}ms {} + {}ms cache wait, counted only "
+                    + "while the journal caches), poll interval {}ms",
+                    journalInfo, config.cacheAdditionalDelay(),
+                    As400ConnectorConfig.JOURNAL_CACHE_ADDITIONAL_DELAY.name(), cacheWait,
+                    config.getPollInterval().toMillis());
 
             boolean transactionMgt = config.isTransactionMgmtEnabled();
 
             final RetrieveConfig rconfig = new RetrieveConfigBuilder().withAs400(this)
+                    .withTextFactory(textFactory)
                     .withJournalBufferSize(config.getJournalBufferSize())
                     .withJournalInfo(journalInfo)
                     .withMaxServerSideEntries(config.getMaxServerSideEntries())
                     .withServerFiltering(!transactionMgt)
-                    .withIncludeFiles(includes).withDumpFolder(config.diagnosticsFolder())
+                    .withIncludeFiles(resolved.includes()).withDumpFolder(config.diagnosticsFolder())
+                    .withPointerHandleThreshold(config.getPointerHandleThreshold())
+                    .withPrefetch(config.isJournalPrefetchEnabled())
                     .build();
             retrieveJournal = new RetrieveJournal(rconfig, journalInfoRetrieval);
         }
@@ -82,19 +105,43 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
         }
     }
 
+    private As400TextFactory createTextFactory() {
+        try {
+            return As400TextFactory.forSystem(connection());
+        }
+        catch (final IOException e) {
+            log.error("unable to reach the system to read its ccsid, character conversion will fall back "
+                    + "to guessing one from the local locale", e);
+            return As400TextFactory.localeDefault();
+        }
+    }
+
     @Override
     public void close() {
+        if (as400 != null) {
+            log.info("Disconnecting");
+            if (retrieveJournal != null) {
+                // only meaningful while a retrieve is in flight; between polls there is nothing to cancel
+                retrieveJournal.cancelJob();
+            }
+        }
+        dropConnection();
+    }
+
+    /**
+     * Gives up the connection object. {@link #connection()} builds a fresh one the next time it is
+     * asked, which is what lands us on a different host server job - see
+     * {@link #freePointerHandlesIfDue()}.
+     */
+    private void dropConnection() {
         try {
             if (as400 != null) {
-                log.info("Disconnecting");
-                retrieveJournal.cancelJob();
                 this.as400.disconnectAllServices();
             }
         }
         catch (final Exception e) {
             log.debug("Problem closing connection", e);
         }
-
         this.as400 = null;
     }
 
@@ -147,6 +194,71 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
         }
     }
 
+    /**
+     * Whether the position streaming holds can still be read: its receiver is in the journal's live receiver
+     * list and its offset falls inside that receiver's range.
+     *
+     * <p>This is the check that has to pass before a failed call is allowed to reset the offset. CPF7053,
+     * CPF9801 and CPF7054 all report as a position the server would not read, but only one of them means the
+     * receiver is gone; the others are a range we resolved badly or a stale one, and resetting for those
+     * re-reads the whole retained journal to recover nothing (issue #79).</p>
+     *
+     * <p>A failure to read the list is not an answer, and the destructive reading is the one that resets, so
+     * it reports the position as still available: the caller then retries, which is what a transient RPC
+     * failure needs anyway, and the retry limit still bounds it.</p>
+     *
+     * <p>An object-not-found <em>is</em> an answer: it is the journal itself that has gone (DLTJRN, which ends
+     * journaling on every captured file first, so no later change can ever be journaled). No retry can undo
+     * that, and treating it as "could not look" is what left a deleted journal to exhaust the retry budget and
+     * fail with an unclassified message instead of the OffsetNoLongerAvailableException an orchestrator routes
+     * on.</p>
+     */
+    public boolean isPositionStillAvailable(JournalProcessedPosition position) {
+        try {
+            return isPositionStillAvailable(journalInfoRetrieval, connection(), journalInfo, position);
+        }
+        catch (final IOException e) {
+            log.warn("no connection to check whether position {} is still available, assuming it is rather than "
+                    + "resetting the offset on a failure to look", position, e);
+            return true;
+        }
+    }
+
+    static boolean isPositionStillAvailable(JournalInfoRetrieval journalInfoRetrieval, AS400 as400, JournalInfo journalInfo,
+                                            JournalProcessedPosition position) {
+        if (position == null || !position.isOffsetSet() || position.getReceiver() == null) {
+            return false;
+        }
+        try {
+            final List<DetailedJournalReceiver> receivers = journalInfoRetrieval.getReceivers(as400, journalInfo);
+            for (final DetailedJournalReceiver receiver : receivers) {
+                if (receiver.isSameReceiver(position)) {
+                    final boolean withinRange = position.getOffset().compareTo(receiver.start()) >= 0
+                            && position.getOffset().compareTo(receiver.end()) <= 0;
+                    if (!withinRange) {
+                        log.warn("position {} names a receiver that is still on the server but its offset is outside "
+                                + "the receiver's range {}-{}", position, receiver.start(), receiver.end());
+                    }
+                    return withinRange;
+                }
+            }
+            log.warn("position {} names a receiver that is no longer in the journal's receiver chain {}", position, receivers);
+            return false;
+        }
+        catch (final JournalReceiverNotFoundException e) {
+            // The journal object the chain would be read from does not exist, so there is no chain to be in:
+            // a definitive negative, not a failure to look.
+            log.warn("position {} cannot be in the journal's receiver chain: the journal itself is gone ({})",
+                    position, e.getMessageId(), e);
+            return false;
+        }
+        catch (final Exception e) {
+            log.warn("could not read the receiver list to check whether position {} is still available, assuming it is "
+                    + "rather than resetting the offset on a failure to look", position, e);
+            return true;
+        }
+    }
+
     public boolean validateLogPosition(Partition partition, OffsetContext offsetContext, CommonConnectorConfig config) {
         // AVAILABLE and NOT_SET are both valid starting points; only a pruned receiver is unavailable.
         return checkLogPosition(offsetContext) != PositionAvailability.PRUNED;
@@ -178,6 +290,11 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
         return as400;
     }
 
+    /** Empty when the journal could not be resolved at startup. */
+    public Optional<JournalInfo> getJournalInfo() {
+        return Optional.ofNullable(journalInfo);
+    }
+
     public JournalPosition getCurrentPosition() throws RpcException {
         try {
             final JournalPosition position = journalInfoRetrieval.getCurrentPosition(connection(), journalInfo);
@@ -201,7 +318,14 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
             watchDog.alive();
 
             if (state.hasData()) {
-                while (retrieveJournal.nextEntry() && context.isRunning()) {
+                final long started = System.nanoTime();
+                // Also break out when an ad-hoc blocking snapshot has been requested (context.isPaused()).
+                // Over a large shared journal a single block can hold a huge run of entries that are mostly
+                // filtered out; draining it fully keeps refreshing the watchdog (alive() below) yet never
+                // returns to the caller's pause handshake, wedging the connector while it still looks live
+                // (issue #27). Leaving the loop early lets the caller acknowledge the pause after one entry;
+                // the position persisted below makes the next retrieval resume from here.
+                while (context.isRunning() && !context.isPaused() && retrieveJournal.nextEntry()) {
                     watchDog.alive();
                     final EntryHeader eheader = retrieveJournal.getEntryHeader();
                     final BigInteger processingOffset = eheader.getSequenceNumber();
@@ -213,35 +337,134 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
 
                 // note that getPosition returns the current position or the next continuation offset after the current block
                 offsetCtx.setPosition(retrieveJournal.getPosition());
-
+                lastConsumedMs = (System.nanoTime() - started) / 1_000_000;
             }
+            // between polls, with the batch dispatched and the position committed: the only safe moment
+            // to swap the connection, which a retrieve in flight would be using
+            freePointerHandlesIfDue();
             return state;
         }
         catch (LostJournalException e) {
-            // this is bad, we've probably lost data
-            final List<DetailedJournalReceiver> receivers = journalInfoRetrieval.getReceivers(connection(), journalInfo);
-            log.error("Failed to fetch journal entries '{}', resetting journal to blank",
-                    Map.of("position", position,
-                            "receivers", receivers));
-            offsetCtx.setPosition(new JournalProcessedPosition());
+            // this is bad, we've probably lost data; the caller applies the configured recovery strategy
+            logLostJournal(position);
+            throw e;
         }
+        catch (InvalidJournalRangeException e) {
+            // not data loss: the server refused the range we asked for. The chain is what the range was
+            // resolved against, so it is the first thing needed to work out why (issue #79)
+            log.warn("the server refused the journal range for position {}, receivers {}", position, receiversForLogging());
+            throw e;
+        }
+    }
 
-        return RetrievalState.NotCalled;
+    /**
+     * Frees the pointer handles the retrieves have accumulated, by replacing the connection so that the
+     * next retrieve runs in a different host server job.
+     *
+     * <p>
+     * Entries of a table with a LOB column each come back owning an allocation that is only released
+     * when the handle is deleted or the job ends. Deleting them individually costs a round trip an
+     * entry - 31 ms measured over a wide area link, so 31 seconds for a thousand entry buffer, paid
+     * even when the LOB data is never read. Landing on a new job frees all of them at once, for about
+     * 1.1 seconds including authentication - 0.02 ms an entry at the default threshold.
+     * </p>
+     *
+     * <p>
+     * {@link #connection()} re-establishes everything transparently; only the journal retrieve API's
+     * own job-scoped state is affected, and it keeps none across calls.
+     * </p>
+     */
+    private void freePointerHandlesIfDue() {
+        final PointerHandles handles = retrieveJournal.pointerHandles();
+        if (!handles.shouldCycle()) {
+            return;
+        }
+        if (retrieveJournal.prefetchInFlight()) {
+            // no new prefetch starts while the budget is spent, so the next poll can replace it
+            log.debug("deferring the replacement of the connection, a journal retrieve is in flight");
+            return;
+        }
+        try {
+            log.info("freeing {} outstanding journal pointer handles by replacing the connection",
+                    handles.outstanding());
+            // dropping the AS400 object, not just disconnecting its service. QZRCSRVS are prestart
+            // jobs: disconnecting returns one to a pool and the same object reconnects straight back
+            // into it, handles intact, where a new object lands on a different job with a fresh handle
+            // space. connection() builds one the next time it is asked.
+            dropConnection();
+            // the budget clears itself once a retrieve reports a different job, so a recycle that did
+            // not take effect shows up as handles that keep accumulating rather than a count silently
+            // zeroed on an assumption
+        }
+        catch (final Exception e) {
+            // not fatal: the handles stay outstanding and the next poll tries again. It only becomes a
+            // problem if it keeps failing all the way to the API's own maximum.
+            log.warn("could not replace the connection to free {} pointer handles", handles.outstanding(), e);
+        }
+    }
+
+    private void logLostJournal(JournalProcessedPosition position) {
+        try {
+            final List<DetailedJournalReceiver> receivers = journalInfoRetrieval.getReceivers(connection(), journalInfo);
+            log.error("Failed to fetch journal entries '{}'", Map.of("position", position, "receivers", receivers));
+        }
+        catch (final Exception e) {
+            log.error("Failed to fetch journal entries for position {}, receiver list unavailable", position, e);
+        }
+    }
+
+    /** The receiver chain, or why it could not be read; only for log messages. */
+    private Object receiversForLogging() {
+        try {
+            return journalInfoRetrieval.getReceivers(connection(), journalInfo);
+        }
+        catch (final Exception e) {
+            return "unavailable: " + e;
+        }
     }
 
     private void logOffsets(JournalProcessedPosition position, RetrievalState state) throws IOException, Exception {
         if (periodic.shouldLogRateLimted("offsets")) {
+            // moves almost no data: the cost of a round trip
+            final long smallCallStarted = System.nanoTime();
             final JournalPosition currentReceiver = getCurrentPosition();
+            final long smallCallMs = (System.nanoTime() - smallCallStarted) / 1_000_000;
             final BigInteger behind = currentReceiver.getOffset().subtract(position.getOffset());
             streamingMetrics.setJournalOffset(currentReceiver.getOffset());
             streamingMetrics.setJournalBehind(behind);
             streamingMetrics.setLastProcessedMs(position.getTimeOfLastProcessed().toEpochMilli());
-            log.info(
-                    "Current position diagnostics last call {}, parked on receiver {} at offset {}, journal attached to receiver {} at offset {}, behind {}, header {}",
-                    state, position.getReceiver(), position.getOffset(),
-                    currentReceiver.getReceiver(), currentReceiver.getOffset(), behind,
-                    retrieveJournal.getFirstHeader());
+            final boolean bufferFull = state == RetrievalState.MoreDataAvailable;
+            final int growthSamples = catchUpTrend.record(behind, bufferFull);
+            streamingMetrics.setJournalBehindGrowthSamples(growthSamples);
+            final FirstHeader header = retrieveJournal.getFirstHeader();
+            log.info("Current position diagnostics last call {}, header {}, behind {}, parked on receiver {} at offset {}, "
+                    + "current receiver {}, last block rpc {}ms waited {}ms consumed {}ms, small call {}ms, {}, "
+                    + "lag growth samples {}", state, header, behind, position.getReceiver(), position.getOffset(),
+                    currentReceiver, retrieveJournal.lastRpcMs(), retrieveJournal.lastWaitMs(), lastConsumedMs,
+                    smallCallMs, describeLink(header == null ? 0 : header.totalBytes(), retrieveJournal.lastRpcMs(), smallCallMs),
+                    growthSamples);
+            if (growthSamples >= CatchUpTrend.WARN_AFTER) {
+                log.warn("CANNOT CATCH UP: lag grew for {} consecutive samples (now {} behind) with a full {} byte buffer "
+                        + "every call; the journal grows faster than this connection reads it and the position will fall out "
+                        + "of the retained receivers (issue #30). Check the link rate above, raise buffer.size with "
+                        + "max.journal.timeout, or retain receivers for longer.", growthSamples, behind, config.getJournalBufferSize());
+            }
         }
+    }
+
+    /**
+     * Rate the transfer sustained, net of one round trip, and the bytes that fit in a round trip at that
+     * rate. A low rate with tens of KB in flight over a long round trip is a TCP window (an IBM i ships
+     * with 64 KiB, {@code CHGTCPA TCPSNDBUF}), which no buffer size or prefetch gets past.
+     */
+    static String describeLink(long blockBytes, long blockMs, long roundTripMs) {
+        final long transferMs = blockMs - roundTripMs;
+        if (blockBytes <= 0 || transferMs <= 0) {
+            return "link rate n/a";
+        }
+        final long bytesPerSecond = blockBytes * 1000 / transferMs;
+        final long inFlight = bytesPerSecond * roundTripMs / 1000;
+        return String.format("link rate %d KB/s, %d KB in flight per round trip", bytesPerSecond / 1024, inFlight / 1024);
     }
 
     public interface BlockingReceiverConsumer {

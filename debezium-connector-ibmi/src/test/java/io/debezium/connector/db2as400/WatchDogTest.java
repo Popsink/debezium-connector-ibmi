@@ -5,13 +5,18 @@
  */
 package io.debezium.connector.db2as400;
 
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 public class WatchDogTest {
     private WatchDog createTestSubject() {
-        return new WatchDog(Thread.currentThread(), 10);
+        // no pause ever pending: exercises the original activity-timeout behaviour only
+        return new WatchDog(Thread.currentThread(), 10, 10_000, () -> false, () -> false, t -> {
+        });
     }
 
     @AfterEach
@@ -80,5 +85,157 @@ public class WatchDogTest {
         }
         Assertions.assertThat(afterResume).isInstanceOf(InterruptedException.class);
         testSubject.stop();
+    }
+
+    /**
+     * Issue #27 (first wedge): a blocking-snapshot pause stays pending (context.isPaused() == true)
+     * while the streaming thread keeps calling alive() — so the activity timeout never fires. The
+     * watchdog must not interrupt (rescue attempts are unreliable) but must report the wedge with a
+     * retriable exception so the task restarts.
+     */
+    @Test
+    public void testUnhonoredPauseFailsTask() throws Exception {
+        final AtomicReference<Throwable> wedged = new AtomicReference<>();
+        // long activity timeout so failure mode 1 cannot fire; short pause timeout is what we test
+        final WatchDog testSubject = new WatchDog(Thread.currentThread(), 10_000, 30, () -> true, () -> false, wedged::set);
+        testSubject.start();
+        Exception thrown = null;
+        try {
+            final long deadline = System.currentTimeMillis() + 400;
+            while (System.currentTimeMillis() < deadline) {
+                testSubject.alive(); // keep the activity watchdog satisfied, as the #27 drain loop did
+                Thread.sleep(5);
+            }
+        }
+        catch (final Exception e) {
+            thrown = e;
+        }
+        finally {
+            testSubject.stop();
+        }
+        Assertions.assertThat(thrown).isNull();
+        // IOException is what Debezium's ErrorHandler classifies as retriable
+        Assertions.assertThat(wedged.get()).isInstanceOf(java.io.IOException.class);
+    }
+
+    /**
+     * Issue #27 (second wedge): the blocking snapshot finished so the coordinator cleared the pause
+     * (pausePending == false), but the streaming thread stayed parked (paused == true) and never
+     * resumed. The watchdog must report the wedge without interrupting the parked thread.
+     */
+    @Test
+    public void testStuckResumeFailsTask() throws Exception {
+        final AtomicReference<Throwable> wedged = new AtomicReference<>();
+        // coordinator is no longer paused, but the streaming thread still believes it is paused
+        final WatchDog testSubject = new WatchDog(Thread.currentThread(), 10_000, 30, () -> false, () -> false, wedged::set);
+        testSubject.pause();
+        testSubject.start();
+        Exception thrown = null;
+        try {
+            Thread.sleep(400);
+        }
+        catch (final Exception e) {
+            thrown = e;
+        }
+        finally {
+            testSubject.stop();
+        }
+        Assertions.assertThat(thrown).isNull();
+        Assertions.assertThat(wedged.get()).isInstanceOf(java.io.IOException.class);
+    }
+
+    /**
+     * The pause handshake normally completes between journal entries: a mismatch that resolves within
+     * pauseTimeout is not a wedge and must not fail the task. Once the pause is honored a snapshot runs,
+     * for as long as it takes, and that must not be failed either.
+     */
+    @Test
+    public void testPauseHonoredWithinTimeoutIsNotAWedge() throws Exception {
+        final AtomicReference<Throwable> wedged = new AtomicReference<>();
+        final WatchDog testSubject = new WatchDog(Thread.currentThread(), 10_000, 200, () -> true, () -> true, wedged::set);
+        testSubject.start();
+        try {
+            // honor the pending pause well before the timeout, then linger past several check ticks
+            Thread.sleep(50);
+            testSubject.pause();
+            Thread.sleep(500);
+        }
+        finally {
+            testSubject.stop();
+        }
+        Assertions.assertThat(wedged.get()).isNull();
+        Assertions.assertThat(Thread.currentThread().isInterrupted()).isFalse();
+    }
+
+    /**
+     * Issue #74 (third wedge): the coordinator's pause flag leaked, so both views agree on "paused"
+     * forever with no snapshot running. Comparing the two views detects nothing - only the absence of a
+     * running snapshot gives it away - and the activity invariant is suspended while paused, so without
+     * this check the connector freezes silently and permanently.
+     */
+    @Test
+    public void testPausedWithNoSnapshotRunningFailsTask() throws Exception {
+        final AtomicReference<Throwable> wedged = new AtomicReference<>();
+        // both views paused, nothing snapshotting: the state the connector froze in
+        final WatchDog testSubject = new WatchDog(Thread.currentThread(), 10_000, 30, () -> true, () -> false, wedged::set);
+        testSubject.pause();
+        testSubject.start();
+        Exception thrown = null;
+        try {
+            Thread.sleep(400);
+        }
+        catch (final Exception e) {
+            thrown = e;
+        }
+        finally {
+            testSubject.stop();
+        }
+        Assertions.assertThat(thrown).isNull();
+        Assertions.assertThat(wedged.get()).isInstanceOf(java.io.IOException.class);
+        Assertions.assertThat(wedged.get()).hasMessageContaining("no snapshot is running");
+    }
+
+    /**
+     * A blocking snapshot may legitimately run for hours with both views paused the whole time, so the
+     * paused state itself must never be bounded by elapsed time alone.
+     */
+    @Test
+    public void testLongRunningSnapshotIsNotAWedge() throws Exception {
+        final AtomicReference<Throwable> wedged = new AtomicReference<>();
+        final WatchDog testSubject = new WatchDog(Thread.currentThread(), 10_000, 30, () -> true, () -> true, wedged::set);
+        testSubject.pause();
+        testSubject.start();
+        try {
+            // many times the pause timeout: a time-based cap on the pause would have fired long ago
+            Thread.sleep(400);
+        }
+        finally {
+            testSubject.stop();
+        }
+        Assertions.assertThat(wedged.get()).isNull();
+        Assertions.assertThat(Thread.currentThread().isInterrupted()).isFalse();
+    }
+
+    /**
+     * The snapshot only starts once the pause has been acknowledged, so "paused with no snapshot
+     * running" is normal for a moment and must not be reported before the timeout elapses.
+     */
+    @Test
+    public void testSnapshotStartingUpIsNotAWedge() throws Exception {
+        final AtomicReference<Throwable> wedged = new AtomicReference<>();
+        final AtomicBoolean snapshotRunning = new AtomicBoolean(false);
+        final WatchDog testSubject = new WatchDog(Thread.currentThread(), 10_000, 200, () -> true, snapshotRunning::get, wedged::set);
+        testSubject.pause();
+        testSubject.start();
+        try {
+            // the snapshot gets going well within the timeout, then runs past several check ticks
+            Thread.sleep(50);
+            snapshotRunning.set(true);
+            Thread.sleep(500);
+        }
+        finally {
+            testSubject.stop();
+        }
+        Assertions.assertThat(wedged.get()).isNull();
     }
 }

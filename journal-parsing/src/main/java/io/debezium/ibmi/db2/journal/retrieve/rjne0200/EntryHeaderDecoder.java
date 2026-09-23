@@ -10,6 +10,7 @@ import java.lang.reflect.Method;
 import java.math.BigInteger;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.TimeZone;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -17,27 +18,32 @@ import org.slf4j.LoggerFactory;
 import com.ibm.as400.access.AS400Bin1;
 import com.ibm.as400.access.AS400DataType;
 import com.ibm.as400.access.AS400Structure;
-import com.ibm.as400.access.AS400Text;
 import com.ibm.as400.access.AS400Timestamp;
 import com.ibm.as400.access.AS400UnsignedBin2;
 import com.ibm.as400.access.AS400UnsignedBin4;
 import com.ibm.as400.access.AS400UnsignedBin8;
 import com.ibm.as400.access.BinaryFieldDescription;
-import com.ibm.as400.access.CharacterFieldDescription;
 import com.ibm.as400.access.FieldDescription;
 import com.ibm.as400.access.TimestampFieldDescription;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.XaTransactionDecoder;
 
 public class EntryHeaderDecoder {
     private final AS400Structure structure;
-    private final XaTransactionDecoder txDecoder = new XaTransactionDecoder();
-    private final ReceiverNameDecoder nameDecoder = new ReceiverNameDecoder();
+    private final XaTransactionDecoder txDecoder;
+    private final ReceiverNameDecoder nameDecoder;
+    private final TimeZone systemTimeZone;
     private static String[] EMPTY = { "", "" };
     private static final Logger log = LoggerFactory.getLogger(EntryHeaderDecoder.class);
 
-    public EntryHeaderDecoder() {
+    public EntryHeaderDecoder(As400TextFactory textFactory, TimeZone systemTimeZone) {
+        txDecoder = new XaTransactionDecoder(textFactory);
+        nameDecoder = new ReceiverNameDecoder(textFactory);
+        this.systemTimeZone = systemTimeZone;
         ArrayList<AS400DataType> dataTypes = new ArrayList<AS400DataType>();
+        // *DTS values are decoded by jt400 assuming GMT, but the underlying IBM i TOD clock is set to
+        // the system's local wall-clock time
         AS400Timestamp timeType = new AS400Timestamp();
 
         try {
@@ -69,22 +75,22 @@ public class EntryHeaderDecoder {
                 new BinaryFieldDescription(new AS400UnsignedBin2(), "13 remote port"),
                 new BinaryFieldDescription(new AS400UnsignedBin2(), "14 arm number"),
                 new BinaryFieldDescription(new AS400UnsignedBin2(), "15 program library ASP number"),
-                new CharacterFieldDescription(new AS400Text(16), "16 remote access"),
-                new CharacterFieldDescription(new AS400Text(1), "17 journal code"),
-                new CharacterFieldDescription(new AS400Text(2), "18 entry type"),
-                new CharacterFieldDescription(new AS400Text(10), "19 job name"),
-                new CharacterFieldDescription(new AS400Text(10), "20 user name"),
-                new CharacterFieldDescription(new AS400Text(6), "21 job number"),
-                new CharacterFieldDescription(new AS400Text(10), "22 program name"),
-                new CharacterFieldDescription(new AS400Text(10), "23 program library name"),
-                new CharacterFieldDescription(new AS400Text(10), "24 program ASP device name"),
-                new CharacterFieldDescription(new AS400Text(30), "25 object"),
-                new CharacterFieldDescription(new AS400Text(10), "26 user profile"),
-                new CharacterFieldDescription(new AS400Text(10), "27 Journal identifier"),
-                new CharacterFieldDescription(new AS400Text(1), "28 address family"),
-                new CharacterFieldDescription(new AS400Text(8), "29 System name"),
-                new CharacterFieldDescription(new AS400Text(1), "30 Indicator flag"),
-                new CharacterFieldDescription(new AS400Text(1), "31 Object name identifier"),
+                textFactory.charField(16, "16 remote access"),
+                textFactory.charField(1, "17 journal code"),
+                textFactory.charField(2, "18 entry type"),
+                textFactory.charField(10, "19 job name"),
+                textFactory.charField(10, "20 user name"),
+                textFactory.charField(6, "21 job number"),
+                textFactory.charField(10, "22 program name"),
+                textFactory.charField(10, "23 program library name"),
+                textFactory.charField(10, "24 program ASP device name"),
+                textFactory.charField(30, "25 object"),
+                textFactory.charField(10, "26 user profile"),
+                textFactory.charField(10, "27 Journal identifier"),
+                textFactory.charField(1, "28 address family"),
+                textFactory.charField(8, "29 System name"),
+                textFactory.charField(1, "30 Indicator flag"),
+                textFactory.charField(1, "31 Object name identifier"),
                 new BinaryFieldDescription(new AS400Bin1(), "32 bit flags")
         };
         for (int i = 0; i < fds.length; i++) {
@@ -135,10 +141,18 @@ public class EntryHeaderDecoder {
                     "Offsets too big for data, these are used as offsets into the buffer the data is in, they should never be this big nextEntryOffset " + nextEntryOffset
                             + ", nullEntryOffset " + nullEntryOffset);
         }
-        Instant time = (timestamp == null) ? Instant.ofEpochSecond(0) : timestamp.toInstant();
+        Instant time = toCorrectedInstant(timestamp);
         return new EntryHeader(nextEntryOffset.intValue(), nullEntryOffset.intValue(), entrySpecificDataOffset, sequenceNumber, systemSequenceNumber,
                 time, journalCode, entryType, objectName, commitCycle, endOffset, pointerHandle, receiver[0], receiver[1], relativeRecordNumber);
 
+    }
+
+    private Instant toCorrectedInstant(java.sql.Timestamp timestamp) {
+        if (timestamp == null) {
+            return Instant.ofEpochSecond(0);
+        }
+        final Instant raw = timestamp.toInstant();
+        return raw.minusMillis(systemTimeZone.getOffset(raw.toEpochMilli()));
     }
 
 }

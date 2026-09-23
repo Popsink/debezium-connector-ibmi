@@ -7,8 +7,11 @@ package io.debezium.ibmi.db2.journal.retrieve;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.math.BigInteger;
@@ -26,6 +29,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import com.ibm.as400.access.AS400;
 
+import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.DetailedJournalReceiver;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.JournalReceiverInfo;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.JournalStatus;
@@ -231,4 +235,66 @@ class ReceiverPaginationTest {
         assertEquals(start.asJournalPosition(), found.get().end());
         assertTrue(found.get().startEqualsEnd());
     }
+
+    /**
+     * Starting over has to work from a fresh receiver list. The cached one is only refreshed when the
+     * attached receiver changes, which deleting older receivers does not do, so a connector resetting to the
+     * earliest receiver after losing its position would otherwise be sent straight back to a deleted one.
+     */
+    @Test
+    void findRangeFromBeginningRefetchesReceivers() throws Exception {
+        final ReceiverPagination jreceivers = new ReceiverPagination(journalInfoRetrieval, 100, journalInfo);
+
+        // j1 is deleted between the two calls while j2 stays attached
+        when(journalInfoRetrieval.getReceivers(any(), any())).thenReturn(Arrays.asList(dr1, dr2)).thenReturn(Arrays.asList(dr2));
+        when(journalInfoRetrieval.getDelayedDetailedJournalReceiver(any(), any())).thenReturn(Optional.of(dr2));
+
+        final JournalProcessedPosition inFirstReceiver = new JournalProcessedPosition(BigInteger.ONE,
+                dr1.info().receiver(), Instant.ofEpochSecond(0), true);
+        jreceivers.findRange(as400, inFirstReceiver);
+
+        final Optional<PositionRange> result = jreceivers.findRange(as400, new JournalProcessedPosition());
+        assertEquals(dr2.info().receiver(), result.get().start().getReceiver());
+        assertEquals(dr2.start(), result.get().start().getOffset());
+    }
+
+    /**
+     * The receiver list is only refreshed when the attached receiver changes, so a position living in a
+     * receiver the cached list never saw looks exactly like a position that is no longer in the journal
+     * (issue #30). The list has to be re-read before concluding the position is unresolvable.
+     */
+    @Test
+    void findRangeRefetchesReceiversBeforeGivingUpOnPosition() throws Exception {
+        final ReceiverPagination jreceivers = new ReceiverPagination(journalInfoRetrieval, 100, journalInfo);
+
+        // the cached list is missing j1, a re-read of the list finds it
+        when(journalInfoRetrieval.getReceivers(any(), any())).thenReturn(Arrays.asList(dr2, dr3))
+                .thenReturn(Arrays.asList(dr1, dr2, dr3));
+        when(journalInfoRetrieval.getDelayedDetailedJournalReceiver(any(), any())).thenReturn(Optional.of(dr3));
+
+        final JournalProcessedPosition inMissingReceiver = new JournalProcessedPosition(BigInteger.ONE,
+                dr1.info().receiver(), Instant.ofEpochSecond(0), true);
+        final Optional<PositionRange> result = jreceivers.findRange(as400, inMissingReceiver);
+
+        assertEquals(new PositionRange(false, inMissingReceiver,
+                new JournalPosition(dr1.end(), dr1.info().receiver())), result.get(),
+                "position resolved from the refreshed list");
+        verify(journalInfoRetrieval, times(2)).getReceivers(any(), any());
+    }
+
+    @Test
+    void findRangeThrowsLostJournalOnlyAfterRefetchingReceivers() throws Exception {
+        final ReceiverPagination jreceivers = new ReceiverPagination(journalInfoRetrieval, 100, journalInfo);
+
+        // j1 really is gone, both reads agree
+        when(journalInfoRetrieval.getReceivers(any(), any())).thenReturn(Arrays.asList(dr2, dr3));
+        when(journalInfoRetrieval.getDelayedDetailedJournalReceiver(any(), any())).thenReturn(Optional.of(dr3));
+
+        final JournalProcessedPosition inDeletedReceiver = new JournalProcessedPosition(BigInteger.ONE,
+                dr1.info().receiver(), Instant.ofEpochSecond(0), true);
+
+        assertThrows(LostJournalException.class, () -> jreceivers.findRange(as400, inDeletedReceiver));
+        verify(journalInfoRetrieval, times(2)).getReceivers(any(), any());
+    }
+
 }

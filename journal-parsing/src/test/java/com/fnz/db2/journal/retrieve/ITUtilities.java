@@ -24,6 +24,7 @@ import com.ibm.as400.access.AS400SecurityException;
 import com.ibm.as400.access.CommandCall;
 import com.ibm.as400.access.ErrorCompletingRequestException;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.JournalInfo;
 import io.debezium.ibmi.db2.journal.retrieve.JournalInfoRetrieval;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.DetailedJournalReceiver;
@@ -103,7 +104,7 @@ public class ITUtilities {
         dropAllTables(con, journal.journalLibrary());
 
         final long cacheWait = JournalInfoRetrieval.getJournalCacheDurationInMilliseconds(() -> con);
-        final JournalInfoRetrieval journalInfoRetrieval = new JournalInfoRetrieval(cacheWait, 0, 2000);
+        final JournalInfoRetrieval journalInfoRetrieval = new JournalInfoRetrieval(As400TextFactory.forSystem(as400), cacheWait, 0, 2000);
 
         // get receiver list before deleting the receivers from the library
         final List<DetailedJournalReceiver> receviers = journalInfoRetrieval.getReceivers(as400, journal);

@@ -29,6 +29,7 @@ import org.slf4j.LoggerFactory;
 import com.ibm.as400.access.AS400;
 import com.ibm.as400.access.AS400Text;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.Connect;
 import io.debezium.ibmi.db2.journal.retrieve.JdbcFileDecoder;
 import io.debezium.ibmi.db2.journal.retrieve.JournalEntryType;
@@ -68,7 +69,7 @@ class JournalEntryDecoderTestIT {
     @Test
     public void testCharacterTypes() throws Exception {
         final long cacheWait = JournalInfoRetrieval.getJournalCacheDurationInMilliseconds(sqlConnect);
-        final JournalInfoRetrieval journalInfoRetrieval = new JournalInfoRetrieval(cacheWait, 0, 2000);
+        final JournalInfoRetrieval journalInfoRetrieval = new JournalInfoRetrieval(As400TextFactory.forConnection(sqlConnect), cacheWait, 0, 2000);
         final JournalInfo journal = journalInfoRetrieval.getJournal(as400Connect.connection(), schema);
         final Instant now = Instant.now();
         final JournalPosition current = journalInfoRetrieval.getCurrentPosition(as400Connect.connection(), journal);
@@ -83,7 +84,7 @@ class JournalEntryDecoderTestIT {
         final SchemaCacheHash schemaHash = new SchemaCacheHash();
 
         final String database = JdbcFileDecoder.getDatabaseName(sqlConnect.connection());
-        final JdbcFileDecoder fileDecoder = new JdbcFileDecoder(sqlConnect, database, schemaHash, -1, -1);
+        final JdbcFileDecoder fileDecoder = new JdbcFileDecoder(sqlConnect, database, schemaHash, As400TextFactory.forConnection(sqlConnect), -1, -1);
         boolean foundInsert = false;
         RetrievalState success = RetrievalState.Success;
 

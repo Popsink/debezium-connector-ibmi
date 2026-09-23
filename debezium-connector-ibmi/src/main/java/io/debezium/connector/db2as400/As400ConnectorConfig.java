@@ -7,9 +7,12 @@ package io.debezium.connector.db2as400;
 
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -27,11 +30,13 @@ import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
 import io.debezium.connector.SourceInfoStructMaker;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
+import io.debezium.ibmi.db2.journal.retrieve.PointerHandles;
 import io.debezium.ibmi.db2.journal.retrieve.RetrieveConfig;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.relational.ColumnFilterMode;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.RelationalTableFilters;
+import io.debezium.relational.Selectors;
 import io.debezium.relational.Selectors.TableIdToStringMapper;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables.TableFilter;
@@ -58,19 +63,10 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
      */
     private static final int DEFAULT_SNAPSHOT_FETCH_SIZE = 2_000;
 
-    /**
-     * Kafka Connect's {@code errors.tolerance}. Declared in connect-runtime, which is not on this
-     * connector's compile classpath, but it is part of the connector configuration the task receives,
-     * so it is read as a raw string. {@code none} (Connect's default) means "a dropped record is a
-     * bug"; {@code all} means the pipeline has already accepted that records can be dropped.
-     */
-    static final String ERRORS_TOLERANCE = "errors.tolerance";
-    static final String ERRORS_TOLERANCE_ALL = "all";
-    static final String ERRORS_TOLERANCE_NONE = "none";
-
     private final CharSequenceTrimMode charSequenceTrimMode;
     private final SnapshotMode snapshotMode;
     private final UnavailablePositionRecovery unavailablePositionRecovery;
+    private final ErrorsTolerance errorsTolerance;
     private final Configuration config;
     private String incrementalTables = "";
 
@@ -87,7 +83,10 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
      * A field for the size of buffer for fetching journal entries default 65535 (should not be smaller)
      */
     public static final Field BUFFER_SIZE = Field.create("buffer.size", "journal buffer size",
-            "size of buffer for fetching journal entries default 131072 (should not be smaller)", "131072");
+            "size of buffer for fetching journal entries default 131072 (should not be smaller). A call takes "
+                    + "longer the bigger it is, so raise max.journal.timeout with it; with journal.prefetch two buffers "
+                    + "can be live at once.",
+            "131072");
 
     /**
      * keep alive flag, should the driver use a secure connection defaults to false
@@ -139,7 +138,29 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
      * Maximum number of journal entries to process server side
      */
     public static final Field MAX_RETRIEVAL_TIMEOUT = Field.create("max.journal.timeout", "max time to fetch the journal entries",
-            "Maximum time to fetch the journal entries in ms", DEFAULT_MAX_JOURNAL_TIMEOUT);
+            "Maximum time in ms the streaming thread may go without progress, which bounds one journal call: "
+                    + "raise it together with buffer.size.",
+            DEFAULT_MAX_JOURNAL_TIMEOUT);
+
+    public static final long DEFAULT_BLOCKING_SNAPSHOT_PAUSE_TIMEOUT = 120000;
+    /**
+     * How long (ms) the ad-hoc blocking-snapshot handshake may stay stuck before the {@link WatchDog}
+     * fails the task with a retriable error so it restarts. Guards all three wedge directions: a
+     * requested pause that is never honored (the thread churns inside {@code getJournalEntries} over a
+     * large shared journal, refreshing the activity watchdog but never reaching the pause handshake, so
+     * the snapshot never starts, issue #27), a finished snapshot that never resumes streaming (#27), and
+     * streaming paused with no snapshot running at all (#74). Should be comfortably larger than
+     * {@code max.journal.timeout} and than the worst-case time to process a single journal entry
+     * (including dispatching a large buffered transaction into a backpressured queue), since the pause
+     * handshake is only reached between entries. It does not bound the snapshot itself: a blocking
+     * snapshot may run for hours without being treated as a wedge.
+     */
+    public static final Field BLOCKING_SNAPSHOT_PAUSE_TIMEOUT = Field.create("blocking.snapshot.pause.timeout.ms",
+            "blocking snapshot pause timeout",
+            "Max time in ms the ad-hoc blocking-snapshot pause handshake may stay stuck - a requested pause not "
+                    + "honored, a finished snapshot not resumed, or streaming paused with no snapshot running - "
+                    + "before the task is failed with a retriable error (and restarted) to avoid a silent wedge.",
+            DEFAULT_BLOCKING_SNAPSHOT_PAUSE_TIMEOUT);
 
     public static final long DEFAULT_CACHE_ADDITIONAL_DELAY = 5000;
 
@@ -152,6 +173,41 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
             "handle commit/rollback lifecycle",
             "event submission is delayed until a commit or rollback event. This requires relaxing a filter in AS400 RMI call, it may increase the load on the connector",
             DEFAULT_TRANSACTION_MGMT_ENABLED);
+
+    public static final boolean DEFAULT_LOB_FETCH = false;
+
+    public static final Field LOB_FETCH = Field.create("lob.fetch",
+            "fetch the data of lob columns",
+            "A journal entry carries no CLOB, DBCLOB, BLOB or XML data, only a pointer into the journal "
+                    + "receiver that can only be followed on the IBM i itself, so the values are read back with "
+                    + "QSYS2.DISPLAY_JOURNAL. Entries are fetched a run at a time rather than one by one, so the "
+                    + "first lob entry of a batch pays for the ones behind it. Turn this off to skip the reads "
+                    + "entirely, in which case lob columns stream as null, no extra query is made at all, and "
+                    + "every other column of the table is unaffected. Snapshots read lob columns over JDBC "
+                    + "either way.",
+            DEFAULT_LOB_FETCH);
+
+    public static final long DEFAULT_POINTER_HANDLE_THRESHOLD = PointerHandles.DEFAULT_THRESHOLD;
+
+    public static final Field POINTER_HANDLE_THRESHOLD = Field.create("journal.pointer.handle.threshold",
+            "pointer handles held before the connection is replaced",
+            "Every journal entry of a table with a lob column comes back owning an allocation on the IBM i "
+                    + "that is only released when the handle is deleted or the job that made the request ends. "
+                    + "Deleting them one at a time costs a round trip per entry; instead they are counted and "
+                    + "freed together once this many have accumulated by replacing the connection, so that the "
+                    + "next retrieve runs in a different host server job. Nothing is cancelled or ended on "
+                    + "the system: the connection is simply re-established, transparently. Lower it on a "
+                    + "system with a constrained job storage limit, raise it to replace the connection less "
+                    + "often.",
+            DEFAULT_POINTER_HANDLE_THRESHOLD);
+
+    public static final boolean DEFAULT_JOURNAL_PREFETCH = true;
+
+    public static final Field JOURNAL_PREFETCH = Field.create("journal.prefetch",
+            "fetch the next journal block while the current one is dispatched",
+            "Fetch the next block of journal entries in the background while the current one is decoded and "
+                    + "dispatched, at the cost of a second buffer of buffer.size bytes. Set to false to read one block at a time.",
+            DEFAULT_JOURNAL_PREFETCH);
 
     public static final Field TOPIC_NAMING_STRATEGY = Field.create("topic.naming.strategy")
             .withDisplayName("Topic naming strategy class")
@@ -174,17 +230,29 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
             .withDisplayName("Recovery strategy when the stored journal position is no longer available")
             .withEnum(UnavailablePositionRecovery.class, UnavailablePositionRecovery.FAIL)
             .withImportance(Importance.MEDIUM)
-            .withDescription("Controls how the connector recovers when its stored journal position points at a receiver "
-                    + "that has been pruned/rotated off the server (typically after downtime longer than the journal "
-                    + "retention). 'fail' (default) stops with a distinct, non-transient error so an orchestrator can "
+            .withDescription("Controls how the connector recovers when the journal position it wants to read is no longer "
+                    + "on the server (typically after downtime longer than the journal retention, or because the journal "
+                    + "or its receivers were deleted while the connector was streaming). "
+                    + "'fail' (default) stops with a distinct, non-transient error so an orchestrator can "
                     + "reset the offset or alert; 'snapshot' resets the offset and lets the configured snapshot.mode take "
-                    + "a fresh snapshot to fill the gap; 'earliest' resets streaming to the earliest available journal "
-                    + "receiver and continues, replaying the whole retained journal; 'latest' resets streaming to the "
-                    + "current journal head and continues, replaying nothing. Both 'earliest' and 'latest' log that "
-                    + "changes between the lost position and the resume point are unrecoverable. Because 'latest' "
-                    + "declares a data gap rather than recovering it, it is only accepted together with Kafka Connect's "
-                    + "'" + ERRORS_TOLERANCE + "=" + ERRORS_TOLERANCE_ALL + "'; any other tolerance rejects it at "
-                    + "startup, and 'snapshot' is the safe fallback there.");
+                    + "a fresh snapshot to fill the gap (detected while streaming it fails the task so the snapshot runs "
+                    + "on restart); 'earliest' resets streaming to the earliest available journal receiver and continues, "
+                    + "replaying the whole retained journal; 'latest' resets streaming to the current journal head and "
+                    + "continues, replaying nothing. Both 'earliest' and 'latest' log that changes between the lost "
+                    + "position and the resume point are unrecoverable. Because 'latest' declares a data gap rather "
+                    + "than recovering it, it is only accepted together with Kafka Connect's 'errors.tolerance=all'; "
+                    + "any other tolerance rejects it at startup, and 'snapshot' is the safe fallback there.");
+
+    /** Shares Kafka Connect's own {@code errors.tolerance}, so it is left out of {@link #configDef()}. */
+    public static final Field ERRORS_TOLERANCE = Field.create("errors.tolerance")
+            .withDisplayName("Tolerance for tables that cannot be captured")
+            .withEnum(ErrorsTolerance.class, ErrorsTolerance.NONE)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("What to do with a table in 'table.include.list' that exists but has no journal, "
+                    + "either because it was never journaled or because it is an SQL view. 'none' (default) fails "
+                    + "startup; 'all' logs it at ERROR level and captures the remaining tables. A table that does "
+                    + "not exist is always dropped, as Debezium ignores include-list entries with no matching table. "
+                    + "Tables spanning more than one journal, or none of them being capturable, always fails.");
 
     public As400ConnectorConfig(Configuration config) {
         // Debezium treats table.include.list as regex (filters + the base snapshot's re-filter via
@@ -199,11 +267,38 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                 TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE.defaultValueAsString());
         this.unavailablePositionRecovery = UnavailablePositionRecovery.parse(
                 config.getString(UNAVAILABLE_POSITION_RECOVERY), UNAVAILABLE_POSITION_RECOVERY.defaultValueAsString());
+        this.errorsTolerance = ErrorsTolerance.parse(config.getString(ERRORS_TOLERANCE), ERRORS_TOLERANCE.defaultValueAsString());
     }
 
     /** The raw {@code table.include.list} as supplied (e.g. {@code PYP31."$SCHAR"}), for the journal path. */
     public String getRawTableIncludeList() {
         return config.getString(TABLE_INCLUDE_LIST);
+    }
+
+    /**
+     * Every {@code table.include.list} entry paired with the predicate the table filters apply on its
+     * behalf, so a caller can tell which entries matched nothing on the source. Built with the same builder
+     * and the same {@link #tableToString} mapper as {@link #getTableFilters()}, so an entry that matches
+     * nothing here matches nothing there either.
+     * <p>
+     * Keyed by the entry as configured rather than by its normalized form: the regex-escaped version is an
+     * implementation detail, the configured one is what an operator can act on.
+     */
+    public Map<String, Predicate<TableId>> getTableIncludeListMatchers() {
+        final String includeList = getRawTableIncludeList();
+        if (includeList == null || includeList.isBlank()) {
+            return Map.of();
+        }
+        final Map<String, Predicate<TableId>> matchers = new LinkedHashMap<>();
+        for (final String raw : includeList.split(",")) {
+            final String entry = raw.trim();
+            if (!entry.isEmpty()) {
+                matchers.put(entry, Selectors.tableSelector()
+                        .includeTables(normalizeTablePattern(entry), tableToString)
+                        .build());
+            }
+        }
+        return matchers;
     }
 
     /** Escapes AS400 table names with regex metacharacters so they match as literals. */
@@ -252,10 +347,17 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
         return unavailablePositionRecovery;
     }
 
+    /**
+     * Whether an included table that exists but has no journal should be skipped with a loud ERROR instead
+     * of failing startup. A table that does not exist is dropped regardless.
+     */
+    public boolean skipUncapturableTables() {
+        return errorsTolerance == ErrorsTolerance.ALL;
+    }
+
     /** Kafka Connect's configured {@code errors.tolerance}, defaulting to Connect's own default of {@code none}. */
     public String getErrorsTolerance() {
-        final String tolerance = config.getString(ERRORS_TOLERANCE);
-        return tolerance == null || tolerance.isBlank() ? ERRORS_TOLERANCE_NONE : tolerance.trim();
+        return errorsTolerance.getValue();
     }
 
     /**
@@ -272,15 +374,14 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
      * @throws IllegalStateException if the two settings are incompatible
      */
     public void validateUnavailablePositionRecovery() {
-        final String tolerance = getErrorsTolerance();
-        if (unavailablePositionRecovery == UnavailablePositionRecovery.LATEST
-                && !ERRORS_TOLERANCE_ALL.equalsIgnoreCase(tolerance)) {
+        if (unavailablePositionRecovery == UnavailablePositionRecovery.LATEST && errorsTolerance != ErrorsTolerance.ALL) {
             throw new IllegalStateException(
                     "incompatible configuration: '" + UNAVAILABLE_POSITION_RECOVERY.name() + "="
                             + UnavailablePositionRecovery.LATEST.getValue() + "' skips the changes between the lost journal "
-                            + "position and the journal head, which is data loss, but '" + ERRORS_TOLERANCE + "=" + tolerance
-                            + "' declares that no record may be dropped. Either set '" + ERRORS_TOLERANCE + "="
-                            + ERRORS_TOLERANCE_ALL + "' to accept the declared gap, or use '"
+                            + "position and the journal head, which is data loss, but '" + ERRORS_TOLERANCE.name() + "="
+                            + errorsTolerance.getValue() + "' declares that no record may be dropped. Either set '"
+                            + ERRORS_TOLERANCE.name() + "=" + ErrorsTolerance.ALL.getValue()
+                            + "' to accept the declared gap, or use '"
                             + UNAVAILABLE_POSITION_RECOVERY.name() + "=" + UnavailablePositionRecovery.SNAPSHOT.getValue()
                             + "', which fills the gap instead of skipping it.");
         }
@@ -363,6 +464,10 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
         return config.getInteger(MAX_RETRIEVAL_TIMEOUT);
     }
 
+    public long getBlockingSnapshotPauseTimeout() {
+        return config.getLong(BLOCKING_SNAPSHOT_PAUSE_TIMEOUT);
+    }
+
     public Integer getFromCcsid() {
         return config.getInteger(FROM_CCSID);
     }
@@ -389,6 +494,18 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
 
     public boolean isTransactionMgmtEnabled() {
         return config.getBoolean(TRANSACTION_MGMT_ENABLED);
+    }
+
+    public boolean isLobFetchEnabled() {
+        return config.getBoolean(LOB_FETCH);
+    }
+
+    public Long getPointerHandleThreshold() {
+        return config.getLong(POINTER_HANDLE_THRESHOLD);
+    }
+
+    public boolean isJournalPrefetchEnabled() {
+        return config.getBoolean(JOURNAL_PREFETCH);
     }
 
     public JournalProcessedPosition getOffset() {
@@ -428,7 +545,8 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
             RelationalDatabaseConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE, SOCKET_TIMEOUT,
             MAX_SERVER_SIDE_ENTRIES, TOPIC_NAMING_STRATEGY, FROM_CCSID, TO_CCSID, SECURE,
             DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
-            UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT);
+            UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
+            ERRORS_TOLERANCE, LOB_FETCH, POINTER_HANDLE_THRESHOLD, JOURNAL_PREFETCH);
 
     public static ConfigDef configDef() {
         final ConfigDef c = RelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
@@ -437,7 +555,9 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                         HOSTNAME, USER, PASSWORD, SCHEMA, BUFFER_SIZE,
                         SOCKET_TIMEOUT, FROM_CCSID, TO_CCSID, SECURE,
                         DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
-                        UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT)
+                        UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
+                        LOB_FETCH,
+                        POINTER_HANDLE_THRESHOLD, JOURNAL_PREFETCH)
                 .connector(
                         SCHEMA_NAME_ADJUSTMENT_MODE)
                 .events(
@@ -552,8 +672,8 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
     }
 
     /**
-     * Recovery strategy applied at startup when the stored journal position points at a receiver that
-     * is no longer available on the server (pruned/rotated).
+     * Recovery strategy applied when the journal position is no longer available on the server (receiver
+     * pruned, rotated or deleted), both at startup and when it happens while streaming.
      */
     public enum UnavailablePositionRecovery implements EnumeratedValue {
 
@@ -566,7 +686,8 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
 
         /**
          * Reset the offset and let the configured {@code snapshot.mode} take a fresh snapshot to
-         * re-establish table state, then resume streaming from the current journal position.
+         * re-establish table state, then resume streaming from the current journal position. Detected while
+         * streaming, the task is failed instead so the snapshot is taken by the startup recovery on restart.
          */
         SNAPSHOT("snapshot"),
 
@@ -623,6 +744,49 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                 mode = parse(defaultValue);
             }
             return mode;
+        }
+    }
+
+    /**
+     * How much of the include list the connector insists on being able to capture before it starts. The
+     * default is strict: a configured table that silently never streams is worse than a visible failure.
+     */
+    public enum ErrorsTolerance implements EnumeratedValue {
+
+        NONE("none"),
+
+        ALL("all");
+
+        private final String value;
+
+        ErrorsTolerance(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        public static ErrorsTolerance parse(String value) {
+            if (value == null) {
+                return null;
+            }
+            value = value.trim();
+            for (final ErrorsTolerance option : ErrorsTolerance.values()) {
+                if (option.getValue().equalsIgnoreCase(value)) {
+                    return option;
+                }
+            }
+            return null;
+        }
+
+        public static ErrorsTolerance parse(String value, String defaultValue) {
+            ErrorsTolerance tolerance = parse(value);
+            if (tolerance == null && defaultValue != null) {
+                tolerance = parse(defaultValue);
+            }
+            return tolerance;
         }
     }
 

@@ -16,6 +16,9 @@ import java.time.Instant;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.Optional;
+import java.util.TimeZone;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.slf4j.Logger;
@@ -29,11 +32,12 @@ import com.ibm.as400.access.ProgramParameter;
 import com.ibm.as400.access.SecureAS400;
 import com.ibm.as400.access.ServiceProgramCall;
 
+import io.debezium.ibmi.db2.journal.data.types.Diagnostics;
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalCriteria.JournalCode;
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalCriteria.JournalEntryType;
 import io.debezium.ibmi.db2.journal.retrieve.exception.FatalException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalFilterException;
-import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidPositionException;
+import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalRangeException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.RetrieveJournalException;
 import io.debezium.ibmi.db2.journal.retrieve.rjne0200.EntryHeader;
@@ -45,6 +49,12 @@ import io.debezium.ibmi.db2.journal.retrieve.rjne0200.OffsetStatus;
 /**
  * based on the work of Stanley Vong see
  * https://www.ibm.com/docs/en/i/7.5?topic=ssw_ibm_i_75/apis/QJORJRNE.html
+ *
+ * <p>
+ * When a call comes back with the buffer full the server has said where the rest starts, so the call
+ * for the next block is issued on a background thread while the caller walks this one. A block is only
+ * installed on the caller's thread and at most one call is ever in flight.
+ * </p>
  */
 public class RetrieveJournal {
     private static final Logger log = LoggerFactory.getLogger(RetrieveJournal.class);
@@ -54,11 +64,14 @@ public class RetrieveJournal {
     private static final JournalEntryType[] REQURED_ENTRY_TYPES = new JournalEntryType[]{ JournalEntryType.PT,
             JournalEntryType.PX, JournalEntryType.UP, JournalEntryType.UB, JournalEntryType.DL, JournalEntryType.DR,
             JournalEntryType.CT, JournalEntryType.CG, JournalEntryType.SC, JournalEntryType.CM };
-    private final FirstHeaderDecoder firstHeaderDecoder = new FirstHeaderDecoder();
-    private final EntryHeaderDecoder entryHeaderDecoder = new EntryHeaderDecoder();
+    /** how many polls a refused range is recalculated for before the caller has to decide what it means */
+    private static final int MAX_INVALID_RANGES = 5;
+    private final FirstHeaderDecoder firstHeaderDecoder;
+    private final EntryHeaderDecoder entryHeaderDecoder;
     private final SimpleDateFormat dateFormatter = new SimpleDateFormat("yyMMdd-hhmm");
     private final ReceiverPagination journalReceivers;
-    private final ParameterListBuilder builder = new ParameterListBuilder();
+    private final ParameterListBuilder builder;
+    private final PointerHandles pointerHandles;
 
     RetrieveConfig config;
     private byte[] outputData = null;
@@ -66,14 +79,46 @@ public class RetrieveJournal {
     private EntryHeader entryHeader = null;
     private int offset = -1;
     private JournalProcessedPosition position;
+    private MoreData moreData = null;
     private long totalTransferred = 0;
     private AtomicReference<Job> ibmiJob = new AtomicReference<>();
+    private final BlockFetcher fetcher;
+    /** the call for the next block, null when there is none */
+    private volatile Prefetch prefetch;
+    /** a background call whose block is no longer wanted but may still be running */
+    private volatile Prefetch discarded;
+    private volatile long lastRpcMs;
+    private long lastWaitMs;
+    /** consecutive polls whose resolved range the server refused, see {@link #rangeRejected} */
+    private int invalidRanges = 0;
 
     public RetrieveJournal(RetrieveConfig config, JournalInfoRetrieval journalRetrieval) {
+        this(config, journalRetrieval, null);
+    }
+
+    /** @param fetcher stands in for the real call in tests */
+    RetrieveJournal(RetrieveConfig config, JournalInfoRetrieval journalRetrieval, BlockFetcher fetcher) {
         this.config = config;
+        this.fetcher = fetcher == null ? this::fetch : fetcher;
+        firstHeaderDecoder = new FirstHeaderDecoder(config.textFactory());
+        entryHeaderDecoder = new EntryHeaderDecoder(config.textFactory(), systemTimeZone(config));
+        builder = new ParameterListBuilder(config.textFactory());
+        pointerHandles = new PointerHandles(config.pointerHandleThreshold());
         journalReceivers = new ReceiverPagination(journalRetrieval, config.maxServerSideEntries(), config.journalInfo());
 
         builder.withJournal(config.journalInfo().journalName(), config.journalInfo().journalLibrary());
+    }
+
+    // the *DTS journal entry timestamp is decoded assuming GMT even though the IBM i TOD clock is set to the
+    // system's local time; the correction needs the real system time zone, falling back to no correction if unreachable
+    private static TimeZone systemTimeZone(RetrieveConfig config) {
+        try {
+            return config.as400().connection().getTimeZone();
+        }
+        catch (final Exception e) {
+            log.error("failed to fetch AS400 system time zone, journal entry timestamps may be off by a fixed offset", e);
+            return TimeZone.getTimeZone("GMT");
+        }
     }
 
     /**
@@ -90,40 +135,182 @@ public class RetrieveJournal {
      *                   to capture this and log an error as we may have missed data
      */
     public RetrievalState retrieveJournal(JournalProcessedPosition previousPosition) throws Exception {
+        final Prefetch pending = prefetch;
+        prefetch = null;
+        if (pending != null) {
+            if (previousPosition.equals(pending.from())) {
+                final long started = System.nanoTime();
+                try {
+                    final Block block = pending.task().get();
+                    lastWaitMs = elapsedMs(started);
+                    log.debug("using the prefetched block {} after waiting {}ms", pending.range(), lastWaitMs);
+                    return install(block, previousPosition);
+                }
+                catch (InterruptedException e) {
+                    // still running: the next fetch must wait for it
+                    discarded = pending;
+                    throw e;
+                }
+                catch (ExecutionException e) {
+                    lastWaitMs = elapsedMs(started);
+                    final Throwable cause = e.getCause();
+                    if (cause instanceof LostJournalException || cause instanceof InvalidJournalRangeException) {
+                        // as for the synchronous continuation: a stale range is not data loss
+                        log.warn("prefetch of the range {} failed, recalculating the range", pending.range(), cause);
+                    }
+                    else if (cause instanceof Exception ex) {
+                        throw ex;
+                    }
+                    else {
+                        throw e;
+                    }
+                }
+            }
+            else {
+                log.debug("position {} is not the prefetched continuation {}, discarding the prefetched block",
+                        previousPosition, pending.from());
+                pending.discard();
+            }
+        }
+
+        final Optional<PositionRange> continuationOpt = continuationRange(moreData, previousPosition);
+        // one hop only: a range we declined, finished or failed on is never reused later
+        moreData = null;
+        if (continuationOpt.isPresent()) {
+            final PositionRange continuation = continuationOpt.get();
+            log.debug("continuing within the previous range {}", continuation);
+            try {
+                return retrieveJournal(previousPosition, continuation);
+            }
+            catch (LostJournalException | InvalidJournalRangeException e) {
+                // a stale range resolves to CPF7053/CPF9801/CPF7054, none of which mean the data is gone and
+                // all of which would cost a re-snapshot: recalculate instead, so a bad guess can never be
+                // mistaken for data loss. Only the speculative refresh at the start of a block is skipped,
+                // never the corrective re-read of the receiver list that findRange does before declaring a
+                // position unresolvable (issue #30). Nothing else is caught: cancelled jobs and connection
+                // failures also surface here and retrying them fights the cancellation, while the streaming
+                // loop already recovers from them by pausing and refetching with a recalculated range
+                log.warn("failed to continue within the previous range {}, recalculating the range", continuation, e);
+            }
+        }
 
         final Optional<PositionRange> rangeOpt = journalReceivers.findRange(config.as400().connection(), previousPosition);
-        return rangeOpt.map(range -> {
+        if (rangeOpt.isPresent()) {
             try {
-                return retrieveJournal(previousPosition, range);
+                // don't wrap in a RuntimeException, callers recover from the fatal journal exceptions
+                final RetrievalState state = retrieveJournal(previousPosition, rangeOpt.get());
+                invalidRanges = 0;
+                return state;
             }
-            catch (Exception e) {
-                throw new RuntimeException(e);
+            catch (InvalidJournalRangeException e) {
+                return rangeRejected(rangeOpt.get(), e);
             }
-        }).orElse(RetrievalState.NotCalled);
+        }
+        return RetrievalState.NotCalled;
+    }
+
+    /**
+     * A range we resolved ourselves and the server refused (CPF7054). The position is left alone and no
+     * state is committed from it: the next poll resolves the range again, by which time the delayed journal
+     * head has moved on and the range that crossed a receiver roll is forward again (issue #79).
+     *
+     * <p>Swallowing it forever would freeze the connector silently on the other reading of CPF7054 - an
+     * offset that genuinely does not belong to the journal - so once the same rejection has survived
+     * {@value #MAX_INVALID_RANGES} polls it is handed to the caller, which can tell the two apart by
+     * looking the position up in the receiver list.</p>
+     */
+    private RetrievalState rangeRejected(PositionRange range, InvalidJournalRangeException e)
+            throws InvalidJournalRangeException {
+        invalidRanges++;
+        if (invalidRanges >= MAX_INVALID_RANGES) {
+            log.error("the journal range {} has been refused by the server {} polls running, it is not the transient "
+                    + "disagreement between the receiver list and the delayed journal head", range, invalidRanges);
+            invalidRanges = 0;
+            throw e;
+        }
+        log.warn("the journal range {} was refused by the server, recalculating it on the next poll", range, e);
+        return RetrievalState.NotCalled;
+    }
+
+    /** where a call that ran out of buffer said to carry on from, and the end of the range it was given */
+    record MoreData(JournalProcessedPosition continuation, JournalPosition end) {
+    }
+
+    /**
+     * @return what to carry on from when the server left the range unfinished, otherwise null - the range was
+     *         read to its end and where to go next has to be worked out from the journal again
+     */
+    static MoreData moreDataAfter(FirstHeader header, PositionRange range) {
+        if (!header.hasFutureDataAvailable()) {
+            return null;
+        }
+        // copy the continuation, the header is only kept until the next call replaces it
+        return new MoreData(new JournalProcessedPosition(header.nextPosition()), range.end());
+    }
+
+    /**
+     * When a call ends with MORE_DATA_NEW_OFFSET the server stopped filling the buffer before reaching the
+     * end of the range we asked for, so we already know there is more data waiting and where it ends. Reusing
+     * that range lets us carry on downloading without asking the server for the current journal head and the
+     * receiver list again.
+     *
+     * <p>Only valid when we resume from exactly the continuation offset the server handed back, otherwise we
+     * can't tell whether the position is still inside the range. {@code moreData} is cleared on every call and
+     * only re-armed by a call that again ran out of buffer, so a range is reused at most once: anything
+     * unexpected - a failure, or a position moved by recovery - recalculates it.</p>
+     *
+     * @return the remaining part of the previous range, or empty when the range has to be recalculated
+     */
+    static Optional<PositionRange> continuationRange(MoreData moreData, JournalProcessedPosition previousPosition) {
+        if (moreData == null) {
+            return Optional.empty();
+        }
+        if (!previousPosition.equals(moreData.continuation())) {
+            log.debug("position {} is not the continuation offset {}, refreshing the range", previousPosition,
+                    moreData.continuation());
+            return Optional.empty();
+        }
+        final JournalPosition end = moreData.end();
+        if (previousPosition.getReceiver().equals(end.receiver())
+                && previousPosition.getOffset().compareTo(end.offset()) >= 0) {
+            // nothing left in this range - offsets are only comparable within a receiver, when the continuation
+            // is in an earlier receiver of the range there is by definition still data between it and the end
+            return Optional.empty();
+        }
+        return Optional.of(new PositionRange(false, new JournalProcessedPosition(previousPosition), end));
     }
 
     public void cancelJob() {
+        final Prefetch pending = prefetch;
+        prefetch = null;
+        if (pending != null) {
+            discarded = pending;
+        }
         Job job = ibmiJob.get();
         if (job == null) {
             log.debug("No job to cancel");
             return;
         }
+        AS400 killerAs400 = null;
         try {
             AS400 as400 = config.as400().connection();
-            if (job != null) {
-                Job killer; // create a new instance with a new connection as current connection is tied up with this job
-                if (as400 instanceof SecureAS400) {
-                    killer = new Job(new SecureAS400(as400), job.getName(), job.getUser(), job.getNumber());
-                }
-                else {
-                    killer = new Job(new AS400(as400), job.getName(), job.getUser(), job.getNumber());
-                }
-                log.info("Killing job {}/{}/{}", job.getName(), job.getUser(), job.getNumber());
-                killer.end(0);
-            }
+            killerAs400 = (as400 instanceof SecureAS400) ? new SecureAS400(as400) : new AS400(as400);
+            final Job killer = new Job(killerAs400, job.getName(), job.getUser(), job.getNumber());
+            log.info("Killing job {}/{}/{}", job.getName(), job.getUser(), job.getNumber());
+            killer.end(0);
         }
-        catch (Exception e) {
+        catch (Throwable e) {
             log.error("Failed to cancel job name {} user {} number {}", job.getName(), job.getUser(), job.getNumber(), e);
+        }
+        finally {
+            if (killerAs400 != null) {
+                try {
+                    killerAs400.disconnectAllServices();
+                }
+                catch (Exception e) {
+                    log.warn("Failed to disconnect the job cancellation connection", e);
+                }
+            }
         }
     }
 
@@ -132,6 +319,9 @@ public class RetrieveJournal {
         this.offset = -1;
         this.entryHeader = null;
         this.position = new JournalProcessedPosition(previousPosition);
+        // only set again when this call comes back with more data left in the range, so anything going wrong
+        // here means the next call recalculates the range
+        this.moreData = null;
 
         // will return data for both first entry and last entry
         // but call fails if start == end
@@ -143,11 +333,29 @@ public class RetrieveJournal {
             return RetrievalState.NotCalled;
         }
 
+        awaitDiscarded();
+        final long started = System.nanoTime();
+        final Block block = fetcher.fetch(config.as400().connection(), previousPosition, range);
+        lastWaitMs = elapsedMs(started);
+        return install(block, previousPosition);
+    }
+
+    /** One {@code QjoRetrieveJournalEntries} call, replaceable in tests. */
+    interface BlockFetcher {
+        Block fetch(AS400 as400, JournalProcessedPosition from, PositionRange range) throws Exception;
+    }
+
+    /** What one call brought back; {@code job} is the host server job that ran it. */
+    record Block(byte[] outputData, FirstHeader header, JournalProcessedPosition end, PositionRange range, String job) {
+    }
+
+    /** Runs the call. Touches none of the block being read; {@code as400} is resolved by the caller. */
+    Block fetch(AS400 as400, JournalProcessedPosition from, PositionRange range) throws Exception {
         // TODO end could be optional for filtering or use same mechanism as non
         // filtering?
         final JournalProcessedPosition end = new JournalProcessedPosition(range.end(), Instant.EPOCH, true);
 
-        final ServiceProgramCall spc = new ServiceProgramCall(config.as400().connection());
+        final ServiceProgramCall spc = new ServiceProgramCall(as400);
         spc.getServerJob().setLoggingLevel(0);
         builder.init();
         builder.withBufferLenth(config.journalBufferSize());
@@ -163,36 +371,134 @@ public class RetrieveJournal {
         spc.setProcedureName("QjoRetrieveJournalEntries");
         spc.setAlignOn16Bytes(true);
         spc.setReturnValueFormat(ServiceProgramCall.RETURN_INTEGER);
-        ibmiJob.set(spc.getServerJob()); // capture so we can asynchronously cancel it
-        final boolean success = spc.run();
-        ibmiJob.set(null); // job finished
+        final Job serverJob = spc.getServerJob();
+        final String job = serverJob == null ? null
+                : serverJob.getName() + '/' + serverJob.getUser() + '/' + serverJob.getNumber();
+        ibmiJob.set(serverJob); // capture so we can asynchronously cancel it
+        final long started = System.nanoTime();
+        boolean success;
+        try {
+            success = spc.run();
+        }
+        finally {
+            ibmiJob.set(null); // job finished
+            lastRpcMs = elapsedMs(started);
+        }
         if (success) {
-            outputData = parameters[0].getOutputData();
-            header = firstHeaderDecoder.decode(outputData, end);
-            totalTransferred += header.totalBytes();
-            log.debug("retrieve from {} to {} header {}", range.start(), range.end(), header);
-            offset = -1;
-            if (header.status() == OffsetStatus.MORE_DATA_NEW_OFFSET && header.offset() == 0) {
-                log.error("buffer too small need to skip this entry {}", previousPosition);
-                this.position.setPosition(header.nextPosition());
-            }
-            if (!hasData()) {
-                this.position.setPosition(end);
-            }
+            final byte[] data = parameters[0].getOutputData();
+            return new Block(data, firstHeaderDecoder.decode(data, end), end, range, job);
         }
-        else {
-            log.debug("retrieve from {} to {} status {}", range.start(), range.end(), success);
-            return reThrowIfFatal(previousPosition, spc, end, builder);
-        }
-        if (futureDataAvailable()) {
-            return RetrievalState.MoreDataAvailable;
-        }
-        return RetrievalState.Success;
+        log.debug("retrieve from {} to {} status {}", range.start(), range.end(), success);
+        return reThrowIfFatal(from, spc, end, range, job);
     }
 
-    private RetrievalState reThrowIfFatal(JournalProcessedPosition retrievePosition, final ServiceProgramCall spc,
-                                          JournalProcessedPosition latestJournalPosition, final ParameterListBuilder builder)
-            throws LostJournalException, FatalException {
+    /** Makes the block the one being read and starts fetching the rest of its range, if any. */
+    private RetrievalState install(Block block, JournalProcessedPosition previousPosition) throws IOException {
+        this.offset = -1;
+        this.entryHeader = null;
+        this.position = new JournalProcessedPosition(previousPosition);
+        this.moreData = null;
+        this.outputData = block.outputData();
+        this.header = block.header();
+        // handles belong to this job; if it is not the one that allocated the outstanding ones they
+        // died with their own job and the budget starts again
+        pointerHandles.observeJob(block.job());
+        totalTransferred += header.totalBytes();
+        log.debug("retrieve from {} to {} header {}", block.range().start(), block.range().end(), header);
+        if (header.status() == OffsetStatus.MORE_DATA_NEW_OFFSET && header.offset() == 0) {
+            log.error("buffer too small need to skip this entry {}", previousPosition);
+            this.position.setPosition(header.nextPosition());
+        }
+        if (!hasData()) {
+            this.position.setPosition(block.end());
+        }
+        final MoreData more = moreDataAfter(header, block.range());
+        if (more == null) {
+            return RetrievalState.Success;
+        }
+        if (shouldPrefetch()) {
+            armPrefetch(more);
+        }
+        else {
+            moreData = more;
+        }
+        return RetrievalState.MoreDataAvailable;
+    }
+
+    /** Not while the pointer handle budget is spent: the connection is about to be replaced. */
+    private boolean shouldPrefetch() {
+        return config.prefetch() && !pointerHandles.shouldCycle();
+    }
+
+    private void armPrefetch(MoreData more) throws IOException {
+        final JournalProcessedPosition from = more.continuation();
+        final Optional<PositionRange> rangeOpt = continuationRange(more, from);
+        if (rangeOpt.isEmpty()) {
+            moreData = more;
+            return;
+        }
+        // resolved on the caller's thread, the holder is not thread safe
+        final AS400 as400 = config.as400().connection();
+        final PositionRange range = rangeOpt.get();
+        log.debug("prefetching the rest of the range {}", range);
+        prefetch = Prefetch.start(fetcher, as400, from, range);
+    }
+
+    /** A background call never overlaps with a foreground one. */
+    private void awaitDiscarded() throws InterruptedException {
+        final Prefetch leftover = discarded;
+        if (leftover != null) {
+            leftover.discard();
+            discarded = null;
+        }
+    }
+
+    /** The connection must not be replaced while this is true. */
+    public boolean prefetchInFlight() {
+        final Prefetch pending = prefetch;
+        return pending != null && !pending.task().isDone();
+    }
+
+    /** What the last call took on the wire. */
+    public long lastRpcMs() {
+        return lastRpcMs;
+    }
+
+    /** How long the caller stood still for the last block; the difference with {@link #lastRpcMs()} was hidden. */
+    public long lastWaitMs() {
+        return lastWaitMs;
+    }
+
+    private static long elapsedMs(long startedNanos) {
+        return (System.nanoTime() - startedNanos) / 1_000_000;
+    }
+
+    /** The call for the next block, on a thread of its own. */
+    record Prefetch(JournalProcessedPosition from, PositionRange range, FutureTask<Block> task) {
+
+        static Prefetch start(BlockFetcher fetcher, AS400 as400, JournalProcessedPosition from, PositionRange range) {
+            final FutureTask<Block> task = new FutureTask<>(() -> fetcher.fetch(as400, from, range));
+            // a thread per block: nothing to shut down on reconnect or restart
+            final Thread thread = new Thread(task, "journal-prefetch");
+            thread.setDaemon(true);
+            thread.start();
+            return new Prefetch(from, range, task);
+        }
+
+        /** Waits for the call and drops its block; killing the job would take the shared connection with it. */
+        void discard() throws InterruptedException {
+            try {
+                task.get();
+            }
+            catch (ExecutionException e) {
+                log.debug("discarded prefetch of {} had failed", range, e.getCause());
+            }
+        }
+    }
+
+    private Block reThrowIfFatal(JournalProcessedPosition retrievePosition, final ServiceProgramCall spc,
+                                 JournalProcessedPosition latestJournalPosition, PositionRange range, String job)
+            throws LostJournalException, InvalidJournalRangeException, FatalException {
         for (final AS400Message id : spc.getMessageList()) {
             final String idt = id.getID();
             if (idt == null) {
@@ -209,7 +515,13 @@ public class RetrieveJournal {
                             idt, retrievePosition, builder, getFullAS400MessageText(id)));
                 }
                 case "CPF7054": { // e.g. last < first or using offset that doesn't belong to journal
-                    throw new InvalidPositionException(
+                    // a range the server would not take, which is a bug in the range we resolved rather than a
+                    // pruned receiver - most often an end behind the start, resolved while the receiver list and
+                    // the deliberately delayed journal head disagree at a receiver roll. Reporting it as a lost
+                    // journal is what reset the offset to the earliest retained receiver (issue #79); the caller
+                    // recalculates the range instead, and checks the receiver list before believing the other
+                    // reading of CPF7054, an offset that does not belong to this journal at all
+                    throw new InvalidJournalRangeException(
                             String.format("Call failed position %s parameters %s failed to find offset or invalid offsets: %s",
                                     retrievePosition, builder, id.getText()));
                 }
@@ -222,9 +534,8 @@ public class RetrieveJournal {
                     log.debug("Normal when filtering, call failed position {} parameters {} no data received: {}", retrievePosition, builder,
                             id.getText());
                     // if we're filtering we get no continuation offset just an error
-                    header = new FirstHeader(0, 0, 0, OffsetStatus.NO_DATA, latestJournalPosition);
-                    this.position.setPosition(latestJournalPosition);
-                    return RetrievalState.Success;
+                    return new Block(new byte[0], new FirstHeader(0, 0, 0, OffsetStatus.NO_DATA, latestJournalPosition),
+                            latestJournalPosition, range, job);
                 }
                 default:
                     log.error("Call failed position {} parameters {} with error code {} message {}", retrievePosition, idt,
@@ -284,7 +595,7 @@ public class RetrieveJournal {
         if (offset < 0) {
             if (header.size() > 0) {
                 offset = header.offset();
-                entryHeader = entryHeaderDecoder.decode(outputData, offset);
+                entryHeader = decodeEntryHeader(offset);
                 if (alreadyProcessed(position, entryHeader)) {
                     log.debug("skipping already seen entry {} {}", position, entryHeader);
                     return nextEntry();
@@ -300,7 +611,7 @@ public class RetrieveJournal {
             final long nextOffset = entryHeader.getNextEntryOffset();
             if (nextOffset > 0) {
                 offset += (int) nextOffset;
-                entryHeader = entryHeaderDecoder.decode(outputData, offset);
+                entryHeader = decodeEntryHeader(offset);
                 updatePosition(position, entryHeader);
                 return true;
             }
@@ -308,6 +619,23 @@ public class RetrieveJournal {
             updateOffsetFromContinuation();
             return false;
         }
+    }
+
+    /**
+     * Decodes an entry header and notes any pointer handle it came with. The entry's data is already
+     * copied into our own buffer and the lob data behind the pointer is read back separately, so the
+     * handle itself is of no further use - but the allocation behind it lives until the job ends, so
+     * it is counted towards the budget that decides when to end it. See {@link PointerHandles}.
+     */
+    private EntryHeader decodeEntryHeader(int atOffset) {
+        final EntryHeader decoded = entryHeaderDecoder.decode(outputData, atOffset);
+        pointerHandles.record(decoded.getPointerHandle());
+        return decoded;
+    }
+
+    /** The pointer handle budget, which the caller drains between polls by replacing the connection. */
+    public PointerHandles pointerHandles() {
+        return pointerHandles;
     }
 
     private void updateOffsetFromContinuation() {
@@ -348,6 +676,15 @@ public class RetrieveJournal {
 
     public int getOffset() {
         return offset;
+    }
+
+    /** The current entry's record image as hex, capped at {@code maxBytes}; "" without a current entry. */
+    public String currentRecordImageHex(int maxBytes) {
+        if (entryHeader == null || outputData == null) {
+            return "";
+        }
+        final int start = offset + entryHeader.getEntrySpecificDataOffset() + JournalEntryDeocder.ENTRY_SPECIFIC_DATA_OFFSET;
+        return Diagnostics.hex(outputData, start, entryHeader.getLength() - JournalEntryDeocder.ENTRY_SPECIFIC_DATA_OFFSET, maxBytes);
     }
 
     public <T> T decode(JournalEntryDeocder<T> decoder) throws Exception {

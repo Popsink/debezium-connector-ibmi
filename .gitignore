@@ -15,3 +15,4 @@ journal-parsing/logs/
 
 .idea/
 *.iml
+.tokensave
