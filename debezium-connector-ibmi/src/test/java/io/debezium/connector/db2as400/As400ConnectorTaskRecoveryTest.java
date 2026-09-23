@@ -46,7 +46,7 @@ class As400ConnectorTaskRecoveryTest {
                 .with(CommonConnectorConfig.TOPIC_PREFIX, "serverX")
                 .with(As400ConnectorConfig.DATABASE_NAME, "serverX")
                 .with(As400ConnectorConfig.UNAVAILABLE_POSITION_RECOVERY, recovery)
-                .with(As400ConnectorConfig.ERRORS_TOLERANCE, As400ConnectorConfig.ERRORS_TOLERANCE_ALL)
+                .with(As400ConnectorConfig.ERRORS_TOLERANCE, As400ConnectorConfig.ErrorsTolerance.ALL.getValue())
                 .build());
     }
 

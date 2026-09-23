@@ -6,6 +6,7 @@
 package io.debezium.connector.db2as400.metrics;
 
 import java.math.BigInteger;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import io.debezium.connector.base.ChangeEventQueueMetrics;
@@ -19,6 +20,7 @@ public class As400StreamingChangeEventSourceMetrics extends DefaultStreamingChan
     private final AtomicLong journalBehind = new AtomicLong();
     private final AtomicLong journalOffset = new AtomicLong();
     private final AtomicLong lastProcessedMs = new AtomicLong();
+    private final AtomicInteger journalBehindGrowthSamples = new AtomicInteger();
 
     public <T extends CdcSourceTaskContext> As400StreamingChangeEventSourceMetrics(T taskContext, ChangeEventQueueMetrics changeEventQueueMetrics,
                                                                                    EventMetadataProvider metadataProvider,
@@ -51,5 +53,14 @@ public class As400StreamingChangeEventSourceMetrics extends DefaultStreamingChan
 
     public void setLastProcessedMs(long lastProccessedMs) {
         this.lastProcessedMs.lazySet(lastProccessedMs);
+    }
+
+    @Override
+    public int getJournalBehindGrowthSamples() {
+        return journalBehindGrowthSamples.get();
+    }
+
+    public void setJournalBehindGrowthSamples(int samples) {
+        this.journalBehindGrowthSamples.lazySet(samples);
     }
 }

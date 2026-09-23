@@ -15,6 +15,7 @@ import org.slf4j.LoggerFactory;
 
 import com.ibm.as400.access.AS400;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalCriteria.JournalCode;
 
 public class RetrieveConfigBuilder {
@@ -22,19 +23,31 @@ public class RetrieveConfigBuilder {
     private static final Logger log = LoggerFactory.getLogger(RetrieveConfigBuilder.class);
 
     private Connect<AS400, IOException> as400;
+    private As400TextFactory textFactory = As400TextFactory.localeDefault();
     private JournalInfo journalInfo;
     private File dumpFolder;
     private int journalBufferSize = ParameterListBuilder.DEFAULT_JOURNAL_BUFFER_SIZE;
     private JournalCode[] filterCodes = new JournalCode[]{};
     private List<FileFilter> includeFiles = Collections.<FileFilter> emptyList();
     private int maxServerSideEntries = RetrieveConfig.DEFAULT_MAX_SERVER_SIDE_ENTRIES;
+    private long pointerHandleThreshold = PointerHandles.DEFAULT_THRESHOLD;
     private boolean filtering;
+    private boolean prefetch = true;
 
     public RetrieveConfigBuilder() {
     }
 
     public RetrieveConfigBuilder withAs400(Connect<AS400, IOException> as400) {
         this.as400 = as400;
+        return this;
+    }
+
+    /**
+     * Pins character conversion to the remote system's CCSID; without it jt400 guesses one from the
+     * local default locale.
+     */
+    public RetrieveConfigBuilder withTextFactory(As400TextFactory textFactory) {
+        this.textFactory = textFactory;
         return this;
     }
 
@@ -94,6 +107,14 @@ public class RetrieveConfigBuilder {
         return this;
     }
 
+    /** How many pointer handles may accumulate before the connection is replaced to free them. */
+    public RetrieveConfigBuilder withPointerHandleThreshold(Long pointerHandleThreshold) {
+        if (pointerHandleThreshold != null && pointerHandleThreshold.longValue() > 0) {
+            this.pointerHandleThreshold = pointerHandleThreshold.longValue();
+        }
+        return this;
+    }
+
     public RetrieveConfigBuilder withMaxServerSideEntries(Integer maxServerSideEntries) {
         if (maxServerSideEntries != null) {
             this.maxServerSideEntries = maxServerSideEntries.intValue();
@@ -101,7 +122,17 @@ public class RetrieveConfigBuilder {
         return this;
     }
 
+    /**
+     * Whether to fetch the next block of the journal while the current one is being read - see
+     * {@link RetrieveJournal}. On by default; off falls back to one retrieve at a time.
+     */
+    public RetrieveConfigBuilder withPrefetch(boolean prefetch) {
+        this.prefetch = prefetch;
+        return this;
+    }
+
     public RetrieveConfig build() {
-        return new RetrieveConfig(as400, journalInfo, journalBufferSize, filtering, filterCodes, includeFiles, maxServerSideEntries, dumpFolder);
+        return new RetrieveConfig(as400, textFactory, journalInfo, journalBufferSize, filtering, filterCodes, includeFiles, maxServerSideEntries, dumpFolder,
+                pointerHandleThreshold, prefetch);
     }
 }

@@ -21,6 +21,7 @@ import java.util.TreeSet;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -38,6 +39,7 @@ import com.ibm.as400.access.ProgramParameter;
 import com.ibm.as400.access.QSYSObjectPathName;
 import com.ibm.as400.access.ServiceProgramCall;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.exception.JournalReceiverNotFoundException;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.DetailedJournalReceiver;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.JournalReceiverInfo;
@@ -69,11 +71,12 @@ public class JournalInfoRetrieval {
      */
     static final Set<String> RECEIVER_NOT_FOUND_MESSAGE_IDS = Set.of("CPF9801", "CPF9810", "CPF9812", "CPF7025");
 
-    private static final byte[] EMPTY_AS400_TEXT = new AS400Text(0).toBytes("");
-    private final AS400Text as400Text8 = new AS400Text(8);
-    private final AS400Text as400Text20 = new AS400Text(20);
-    private final AS400Text as400Text1 = new AS400Text(1);
-    private final AS400Text as400Text10 = new AS400Text(10);
+    private final As400TextFactory textFactory;
+    private final byte[] emptyAs400Text;
+    private final AS400Text as400Text8;
+    private final AS400Text as400Text20;
+    private final AS400Text as400Text1;
+    private final AS400Text as400Text10;
     private final AS400Bin8 as400Bin8 = new AS400Bin8();
     private final AS400Bin4 as400Bin4 = new AS400Bin4();
     private static final int KEY_HEADER_LENGTH = 20;
@@ -84,8 +87,15 @@ public class JournalInfoRetrieval {
     private final long additionalJournalDelay;
     private final long pollInterval;
 
-    public JournalInfoRetrieval(long journalCacheDelay, long additionalJournalDelay, long pollInterval) {
+    public JournalInfoRetrieval(As400TextFactory textFactory, long journalCacheDelay, long additionalJournalDelay,
+                                long pollInterval) {
         super();
+        this.textFactory = textFactory;
+        this.emptyAs400Text = textFactory.text(0).toBytes("");
+        this.as400Text8 = textFactory.text(8);
+        this.as400Text20 = textFactory.text(20);
+        this.as400Text1 = textFactory.text(1);
+        this.as400Text10 = textFactory.text(10);
         this.journalCacheDelay = journalCacheDelay;
         this.additionalJournalDelay = additionalJournalDelay;
         this.pollInterval = pollInterval;
@@ -183,28 +193,69 @@ public class JournalInfoRetrieval {
      *         than one journal
      */
     public JournalInfo getJournal(AS400 as400, String schema, List<FileFilter> includes) throws IllegalStateException {
+        return resolveJournal(as400, schema, includes, false).journalInfo();
+    }
+
+    /** The journal shared by the included tables, and the filters that resolved to it. */
+    public record ResolvedJournal(JournalInfo journalInfo, List<FileFilter> includes) {
+    }
+
+    /**
+     * Resolve the journal shared by all included tables, as {@link #getJournal(AS400, String, List)}, but
+     * optionally tolerating tables that have no journal.
+     *
+     * @param skipUncapturable when true ({@code errors.tolerance=all}) a table whose journal cannot be
+     *        retrieved is logged at ERROR level and left out of the returned filters instead of failing;
+     *        the multi-journal case and an include list where nothing resolves stay fatal either way
+     */
+    public ResolvedJournal resolveJournal(AS400 as400, String schema, List<FileFilter> includes, boolean skipUncapturable)
+            throws IllegalStateException {
         if (includes.isEmpty()) {
-            return getJournal(as400, schema);
+            return new ResolvedJournal(getJournal(as400, schema), includes);
         }
         final Set<JournalInfo> jis = new HashSet<>();
         final Set<String> libraries = new TreeSet<>();
-        try {
-            for (final FileFilter f : includes) {
-                libraries.add(f.schema());
-                jis.add(getJournal(as400, f.schema(), f.table()));
+        final List<FileFilter> journaled = new ArrayList<>();
+        final Map<JournalInfo, List<String>> tablesByJournal = new HashMap<>();
+        for (final FileFilter f : includes) {
+            libraries.add(f.schema());
+            try {
+                final JournalInfo ji = getJournal(as400, f.schema(), f.table());
+                jis.add(ji);
+                tablesByJournal.computeIfAbsent(ji, k -> new ArrayList<>()).add(f.schema() + "." + f.table());
+                journaled.add(f);
+            }
+            catch (final Exception e) {
+                if (!skipUncapturable) {
+                    throw new IllegalStateException(String.format(
+                            "unable to retrieve journal details for %s.%s - set errors.tolerance=all to skip it and "
+                                    + "capture the remaining tables",
+                            f.schema(), f.table()), e);
+                }
+                log.error("errors.tolerance=all: dropping {}.{} from the journal filters, it has no journal - "
+                        + "nothing will be captured for it", f.schema(), f.table(), e);
             }
         }
-        catch (final Exception e) {
-            throw new IllegalStateException("unable to retrieve journal details", e);
-        }
         if (jis.size() > 1) {
+            log.debug("tables span more than one journal, full breakdown of tables by journal: {}", tablesByJournal);
+            final String breakdown = tablesByJournal.entrySet().stream()
+                    .map(e -> String.format("%s/%s: %d tables (%s%s)",
+                            e.getKey().journalLibrary(), e.getKey().journalName(), e.getValue().size(),
+                            String.join(", ", e.getValue().subList(0, Math.min(5, e.getValue().size()))),
+                            e.getValue().size() > 5 ? ", ..." : ""))
+                    .collect(Collectors.joining("; "));
             throw new IllegalStateException(String.format(
                     "tables span more than one journal, which is not supported: a single connector must "
                             + "capture tables that all journal to the same journal. Libraries requested: %s; "
-                            + "distinct journals found: %s",
-                    libraries, jis));
+                            + "tables by journal : %s",
+                    libraries, breakdown));
         }
-        return jis.iterator().next();
+        if (jis.isEmpty()) {
+            throw new IllegalStateException(String.format(
+                    "none of the included tables has a journal, there is nothing to capture. Libraries requested: %s",
+                    libraries));
+        }
+        return new ResolvedJournal(jis.iterator().next(), journaled);
     }
 
     public JournalInfo getJournal(AS400 as400, String schema, String table) throws Exception {
@@ -296,13 +347,13 @@ public class JournalInfoRetrieval {
         private final ArrayList<AS400DataType> structure = new ArrayList<>();
         private final ArrayList<Object> data = new ArrayList<>();
 
-        public JournalRetrievalCriteria() {
+        public JournalRetrievalCriteria(As400TextFactory textFactory) {
             // first element is the number of variable length records
             structure.add(new AS400Bin4());
             structure.add(new AS400Bin4());
             structure.add(new AS400Bin4());
             structure.add(new AS400Bin4());
-            structure.add(new AS400Text(1));
+            structure.add(textFactory.text(1));
             data.add(ONE_INT); // number of records
             data.add(TWELVE_INT); // data length
             data.add(ONE_INT); // 1 = journal directory info
@@ -351,7 +402,7 @@ public class JournalInfoRetrieval {
                 new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, as400Bin4.toBytes(rcvLen / 4096)),
                 new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, as400Text20.toBytes(jrnLib)),
                 new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, as400Text8.toBytes(format)),
-                new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, EMPTY_AS400_TEXT),
+                new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, emptyAs400Text),
                 new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, as400Bin4.toBytes(0)) };
 
         return callServiceProgram(as400, JOURNAL_SERVICE_LIB, "QjoRetrieveJournalInformation", parameters, f::apply);
@@ -361,7 +412,7 @@ public class JournalInfoRetrieval {
         final String jrnLib = padRight(journalLib.journalName(), 10) + padRight(journalLib.journalLibrary(), 10);
         final String format = "RJRN0200";
 
-        final JournalRetrievalCriteria criteria = new JournalRetrievalCriteria();
+        final JournalRetrievalCriteria criteria = new JournalRetrievalCriteria(textFactory);
         final byte[] toRetrieve = new AS400Structure(criteria.getStructure()).toBytes(criteria.getObject());
         final ProgramParameter[] parameters = new ProgramParameter[]{
                 new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, bufSize),
@@ -416,7 +467,7 @@ public class JournalInfoRetrieval {
             final KeyHeader kheader = keyDecoder.decode(data, keyOffset + k * KEY_HEADER_LENGTH);
             if (kheader.getKey() == 1) {
 
-                final ReceiverDecoder dec = new ReceiverDecoder();
+                final ReceiverDecoder dec = new ReceiverDecoder(textFactory);
                 for (int i = 0; i < kheader.getNumberOfEntries(); i++) {
                     final int kioffset = keyOffset + kheader.getOffset() + kheader.getLengthOfHeader()
                             + i * kheader.getLengthOfKeyInfo();
@@ -572,9 +623,9 @@ public class JournalInfoRetrieval {
         return Long.valueOf(as400Bin8.toLong(b));
     }
 
-    public static String decodeString(byte[] data, int offset, int length) {
+    public String decodeString(byte[] data, int offset, int length) {
         final byte[] b = Arrays.copyOfRange(data, offset, offset + length);
-        return StringHelpers.safeTrim((String) new AS400Text(length).toObject(b));
+        return StringHelpers.safeTrim(textFactory.decode(b, 0, length));
     }
 
     public static String padRight(String s, int n) {

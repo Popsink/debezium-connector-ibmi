@@ -69,7 +69,7 @@ class JournalBufferFullIT {
         final Connect<Connection, SQLException> jdbcCon = connector.getJdbc();
         setupTables(jdbcCon.connection());
         final long cacheWait = JournalInfoRetrieval.getJournalCacheDurationInMilliseconds(jdbcCon);
-        final JournalInfoRetrieval journalInfoRetrieval = new JournalInfoRetrieval(cacheWait, 0, 2000);
+        final JournalInfoRetrieval journalInfoRetrieval = new JournalInfoRetrieval(connector.getTextFactory(), cacheWait, 0, 2000);
         journal = journalInfoRetrieval.getJournal(connector.getAs400().connection(), SCHEMA, includes);
         log.debug("journal {}", journal);
 

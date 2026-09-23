@@ -13,8 +13,11 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -53,9 +56,37 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
 
     private static final String GET_DATABASE_NAME = "values ( CURRENT_SERVER )";
     private static final String GET_SYSTEM_TABLE_NAME = "select trim(system_table_name) from qsys2.systables where system_table_schema=? AND table_name=?";
-    private static final String GET_ALL_SYSTEM_TABLE_NAME = "select trim(system_table_name), trim(table_name) from qsys2.systables where system_table_schema=?";
+    /**
+     * Matches on either name, as loosely as {@link #GET_TABLE_TYPE}: the captured set may name a table by
+     * its long or its system name, and {@code SYSTEM_TABLE_NAME} comes back delimited when it is not an
+     * ordinary identifier. The placeholder list is bound twice, once per column. The type comes along so the
+     * same round trip also answers {@link #getTableType}.
+     */
+    private static final String GET_SYSTEM_TABLE_NAMES = """
+            select trim(system_table_name), trim(table_name), trim(table_type) from qsys2.systables
+            where system_table_schema=?
+            and (upper(table_name) in (%1$s) or upper(replace(system_table_name, '"', '')) in (%1$s))
+            """;
+    /** Table names per {@code IN} list, two bind parameters each, so a whole-library include list stays inside any statement limit. */
+    private static final int SYSTEM_NAME_BATCH_SIZE = 500;
 
     private static final String GET_TABLE_NAME = "select trim(table_name) from qsys2.systables where system_table_schema=? AND system_table_name=?";
+    /**
+     * Deliberately the loosest of the catalog lookups here, because a miss drops the table: the include list
+     * may name a table by its long or its system name, in any case (the journal RPC calls upper-case it
+     * anyway), and {@code SYSTEM_TABLE_NAME} comes back delimited - {@code "Vue10002"} - when it is not an
+     * ordinary identifier.
+     */
+    private static final String GET_TABLE_TYPE = """
+            select trim(table_type) from qsys2.systables
+            where upper(system_table_schema)=upper(?)
+            AND (upper(table_name)=upper(?) OR upper(replace(system_table_name, '"', ''))=upper(?))
+            """;
+    /** One row per member; both names returned, matching as loose as {@link #GET_TABLE_TYPE} because a miss can drop the table. */
+    private static final String TABLES_WITH_MEMBERS = """
+            select distinct upper(table_name), upper(replace(system_table_name, '"', ''))
+            from qsys2.syspartitionstat where upper(system_table_schema)=upper(?)
+            """;
     private static final String GET_INDEXES = """
             SELECT c.column_name FROM qsys.QADBKATR k
                   INNER JOIN qsys2.SYSCOLUMNS c on c.table_schema=k.dbklib and c.system_table_name=k.dbkfil AND c.system_column_name=k.DBKFLD
@@ -69,6 +100,8 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
 
     private final Map<String, String> systemToLongTableName = new HashMap<>();
     private final Map<String, Optional<String>> longToSystemTableName = new HashMap<>();
+    /** {@code TABLE_TYPE} by upper-cased {@code schema.name}, under both names, as {@link #GET_TABLE_TYPE} matches. */
+    private final Map<String, String> tableTypeByUpperName = new HashMap<>();
     private final String realDatabaseName;
 
     /**
@@ -113,13 +146,22 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
         return this.connectionString(URL_PATTERN);
     }
 
-    public List<FileFilter> shortIncludes(String schema, String includes) {
+    /**
+     * Translate {@code table.include.list} into the journal's raw schema.table filters.
+     *
+     * <p>An entry that does not exist is dropped whatever {@code errors.tolerance} says, because Debezium
+     * ignores include-list entries with no matching table everywhere else; the journal path must not be the
+     * one component that refuses to start over it.</p>
+     *
+     * @param skipUncapturable when true ({@code errors.tolerance=all}) an SQL view is dropped too; when
+     *        false it is passed through and fails later, when its journal is resolved
+     */
+    public List<FileFilter> shortIncludes(String schema, String includes, boolean skipUncapturable) {
         if (includes == null || includes.isBlank()) {
             return Collections.<FileFilter> emptyList();
         }
-        final String[] incs = includes.split(",");
-        final List<FileFilter> r = new ArrayList<>();
-        for (String tableName : incs) {
+        final List<IncludeEntry> entries = new ArrayList<>();
+        for (String tableName : includes.split(",")) {
             String schemaName = "";
             int o = tableName.lastIndexOf('.');
             if (o > 0) {
@@ -139,11 +181,110 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
                 schemaName = schema;
             }
 
-            final String tableSchema = schemaName;
             // AS400 does not handle double-quote escaping, so remove them before building FileFilter object
-            getSystemName(tableSchema, tableName.replaceAll("\"", "")).map(x -> r.add(new FileFilter(tableSchema, x)));
+            entries.add(new IncludeEntry(schemaName, tableName.replaceAll("\"", "")));
+        }
+
+        // One round trip per schema; the per-table lookups below used to cost two each, serially, which put a
+        // hard ceiling on the include list at the task-start budget (issue #71). They remain the fallback.
+        final Map<String, List<String>> tablesBySchema = new LinkedHashMap<>();
+        for (final IncludeEntry entry : entries) {
+            tablesBySchema.computeIfAbsent(entry.schema(), k -> new ArrayList<>()).add(entry.table());
+        }
+        for (final Map.Entry<String, List<String>> perSchema : tablesBySchema.entrySet()) {
+            try {
+                getAllSystemNames(perSchema.getKey(), perSchema.getValue());
+            }
+            catch (final SQLException e) {
+                log.warn("failed to prefetch the catalog entries of schema {}, resolving its tables one by one", perSchema.getKey(), e);
+            }
+            catch (final InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("interrupted while prefetching the catalog entries of schema {}", perSchema.getKey(), e);
+            }
+        }
+
+        final List<FileFilter> r = new ArrayList<>();
+        for (final IncludeEntry entry : entries) {
+            final String tableSchema = entry.schema();
+            final String bareTableName = entry.table();
+            final IncludedObject included = classify(tableSchema, bareTableName);
+            if (included == IncludedObject.MISSING) {
+                log.error("dropping {}.{} from the journal filters, no such table - nothing will be captured for it",
+                        tableSchema, bareTableName);
+                continue;
+            }
+            if (included == IncludedObject.VIEW && skipUncapturable) {
+                log.error("errors.tolerance=all: dropping SQL view {}.{} from the journal filters, a view has no "
+                        + "journal of its own - nothing will be captured for it", tableSchema, bareTableName);
+                continue;
+            }
+            getSystemName(tableSchema, bareTableName).map(x -> r.add(new FileFilter(tableSchema, x)));
         }
         return r;
+    }
+
+    private record IncludeEntry(String schema, String table) {
+    }
+
+    /** What the SQL catalog says about an entry of {@code table.include.list}. */
+    private enum IncludedObject {
+        CAPTURABLE,
+        VIEW,
+        MISSING
+    }
+
+    /**
+     * Classify an included table from the SQL catalog. A failure of the lookup itself counts as
+     * {@link IncludedObject#CAPTURABLE}, so a catalog hiccup cannot drop a table that is perfectly fine.
+     */
+    private IncludedObject classify(String schemaName, String tableName) {
+        final String tableType;
+        try {
+            tableType = getTableType(schemaName, tableName);
+        }
+        catch (final SQLException e) {
+            log.error("failed to look up the type of {}.{}, keeping it in the journal filters", schemaName, tableName, e);
+            return IncludedObject.CAPTURABLE;
+        }
+        if (tableType == null) {
+            return IncludedObject.MISSING;
+        }
+        return "V".equals(tableType) ? IncludedObject.VIEW : IncludedObject.CAPTURABLE;
+    }
+
+    /** The {@code TABLE_TYPE} of a table named by its long or system name, null when there is no such object. */
+    String getTableType(String schemaName, String tableName) throws SQLException {
+        final String cached = tableTypeByUpperName.get(typeKey(schemaName, tableName));
+        if (cached != null) {
+            return cached;
+        }
+        return prepareQueryAndMap(GET_TABLE_TYPE,
+                call -> {
+                    call.setString(1, schemaName);
+                    call.setString(2, tableName);
+                    call.setString(3, tableName);
+                },
+                singleResultMapper(rs -> rs.getString(1).trim(), (String) null,
+                        String.format("no entry in qsys2.systables for %s.%s", schemaName, tableName)));
+    }
+
+    private static String typeKey(String schemaName, String tableName) {
+        return String.format("%s.%s", schemaName.toUpperCase(), tableName.toUpperCase());
+    }
+
+    /** Upper-cased long and system names of every file in the schema that still has a member; a file without one fails any SQL access with {@code SQL0204}. */
+    public Set<String> tablesWithMembers(String schemaName) throws SQLException {
+        return prepareQueryAndMap(TABLES_WITH_MEMBERS,
+                call -> call.setString(1, schemaName),
+                rs -> {
+                    final Set<String> names = new HashSet<>();
+                    while (rs.next()) {
+                        names.add(rs.getString(1).trim());
+                        names.add(rs.getString(2).trim());
+                    }
+                    return names;
+                });
     }
 
     public String getRealDatabaseName() {
@@ -237,22 +378,61 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
         return columnsByTable;
     }
 
-    public void getAllSystemNames(String schemaName) throws SQLException, InterruptedException {
-        prepareQueryWithBlockingConsumer(GET_ALL_SYSTEM_TABLE_NAME, call -> {
-            call.setString(1, schemaName);
-        },
+    /**
+     * Warms the long-name/system-name caches for the given tables of a schema, in one round trip per batch
+     * rather than the one-per-table lookups {@link #getSystemName} and {@link #getLongName} would otherwise
+     * each make on a cache miss.
+     * <p>
+     * Scoped to the tables asked for, not to the whole schema. Only captured tables are ever looked up
+     * afterwards, so fetching a mapping for every table in the library made schema discovery scale with the
+     * size of the source rather than with {@code table.include.list} - hundreds of rows and tens of seconds
+     * on every connector start on a long-lived IBM i system, undoing the scoping the column read before it
+     * already applies. A table missing from the result is not an error: it resolves lazily on first use.
+     * Tables an earlier call already resolved are not asked about again.
+     */
+    public void getAllSystemNames(String schemaName, Collection<String> tableNames) throws SQLException, InterruptedException {
+        final List<String> names = tableNames.stream().map(String::toUpperCase).distinct()
+                .filter(name -> !tableTypeByUpperName.containsKey(typeKey(schemaName, name)))
+                .toList();
+        if (names.isEmpty()) {
+            return;
+        }
+        int fetched = 0;
+        for (int from = 0; from < names.size(); from += SYSTEM_NAME_BATCH_SIZE) {
+            fetched += fetchSystemNames(schemaName, names.subList(from, Math.min(from + SYSTEM_NAME_BATCH_SIZE, names.size())));
+        }
+        log.info("fetched {} name mappings for the {} captured tables of schema {}", fetched, names.size(), schemaName);
+    }
+
+    private int fetchSystemNames(String schemaName, List<String> tableNames) throws SQLException, InterruptedException {
+        final String placeholders = tableNames.stream().map(n -> "?").collect(Collectors.joining(", "));
+        // the blocking consumer returns nothing, so the row count comes back in a holder
+        final int[] fetched = { 0 };
+        prepareQueryWithBlockingConsumer(String.format(GET_SYSTEM_TABLE_NAMES, placeholders),
+                call -> {
+                    call.setString(1, schemaName);
+                    for (int i = 0; i < tableNames.size(); i++) {
+                        call.setString(i + 2, tableNames.get(i));
+                        call.setString(i + 2 + tableNames.size(), tableNames.get(i));
+                    }
+                },
                 rs -> {
                     while (rs.next()) {
                         final String systemName = rs.getString(1);
                         final String tableName = rs.getString(2);
+                        final String tableType = rs.getString(3);
                         final String longKey = String.format("%s.%s", schemaName, tableName);
                         longToSystemTableName.put(longKey, Optional.of(systemName));
                         final String shortKey = String.format("%s.%s", schemaName, systemName);
                         systemToLongTableName.put(shortKey, tableName);
-
+                        if (tableType != null) {
+                            tableTypeByUpperName.put(typeKey(schemaName, tableName), tableType);
+                            tableTypeByUpperName.put(typeKey(schemaName, systemName.replace("\"", "")), tableType);
+                        }
+                        fetched[0]++;
                     }
                 });
-        log.info("fetched {} long names", longToSystemTableName.size());
+        return fetched[0];
     }
 
     public Optional<String> getSystemName(String schemaName, String longTableName) {
@@ -420,6 +600,11 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
         // first-row plan and keeps the estimate under QQRYTIMLMT. Mirrors the buildSelectWithRowLimits
         // hint used for incremental chunks above.
         return super.buildSelectPrimaryKeyBoundaries(tableId, size, projection, orderBy) + " OPTIMIZE FOR 1 ROW";
+    }
+
+    // Quote qualified name to handle special chars in table name
+    public String getQualifiedTableName(TableId tableId) {
+        return "\"" + tableId.schema() + "\".\"" + tableId.table() + "\"";
     }
 
 }

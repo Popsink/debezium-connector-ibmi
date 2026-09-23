@@ -9,21 +9,20 @@ import java.util.ArrayList;
 
 import com.ibm.as400.access.AS400DataType;
 import com.ibm.as400.access.AS400Structure;
-import com.ibm.as400.access.AS400Text;
-import com.ibm.as400.access.CharacterFieldDescription;
 import com.ibm.as400.access.FieldDescription;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.rjne0200.EntryHeader;
 
 public class JournalRecordDecoder implements JournalEntryDeocder<JournalReceiver> {
     final AS400Structure structure;
 
-    public JournalRecordDecoder() {
+    public JournalRecordDecoder(As400TextFactory textFactory) {
         FieldDescription[] fds = new FieldDescription[]{
-                new CharacterFieldDescription(new AS400Text(10), "start journal"),
-                new CharacterFieldDescription(new AS400Text(10), "start lib"),
-                new CharacterFieldDescription(new AS400Text(10), "end journal"),
-                new CharacterFieldDescription(new AS400Text(10), "end lib")
+                textFactory.charField(10, "start journal"),
+                textFactory.charField(10, "start lib"),
+                textFactory.charField(10, "end journal"),
+                textFactory.charField(10, "end lib")
         };
         ArrayList<AS400DataType> dataTypes = new ArrayList<AS400DataType>();
         for (int i = 0; i < fds.length; i++) {

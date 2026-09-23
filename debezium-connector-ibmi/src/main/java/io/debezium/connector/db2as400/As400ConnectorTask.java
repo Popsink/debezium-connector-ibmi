@@ -5,6 +5,7 @@
  */
 package io.debezium.connector.db2as400;
 
+import java.sql.SQLException;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -30,6 +31,7 @@ import io.debezium.connector.db2as400.metrics.As400StreamingChangeEventSourceMet
 import io.debezium.document.DocumentReader;
 import io.debezium.ibmi.db2.journal.retrieve.FileFilter;
 import io.debezium.ibmi.db2.journal.retrieve.JournalInfoRetrieval;
+import io.debezium.ibmi.db2.journal.retrieve.JournalLobFetcher;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.jdbc.DefaultMainConnectionProvidingConnectionFactory;
 import io.debezium.jdbc.MainConnectionProvidingConnectionFactory;
@@ -58,6 +60,8 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
     private ErrorHandler errorHandler;
     private As400ConnectorConfig connectorConfig;
     private CdcSourceTaskContext<As400ConnectorConfig> taskContext;
+    private As400JdbcConnection jdbcConnection;
+    private As400RpcConnection rpcConnection;
 
     @Override
     public String version() {
@@ -89,7 +93,7 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
 
         final MainConnectionProvidingConnectionFactory<As400JdbcConnection> jdbcConnectionFactory = new DefaultMainConnectionProvidingConnectionFactory<>(
                 () -> new As400JdbcConnection(connectorConfig.getJdbcConfig()));
-        final As400JdbcConnection jdbcConnection = jdbcConnectionFactory.mainConnection();
+        this.jdbcConnection = jdbcConnectionFactory.mainConnection();
         registerServiceProviders(connectorConfig.getServiceRegistry());
 
         CustomConverterRegistry customConverterRegistry = connectorConfig.getServiceRegistry().tryGetService(CustomConverterRegistry.class);
@@ -118,7 +122,7 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
                 .pollInterval(connectorConfig.getPollInterval())
                 .loggingContextSupplier(() -> taskContext.configureLoggingContext(CONTEXT_NAME)).build();
 
-        errorHandler = new ErrorHandler(As400RpcConnector.class, connectorConfig, queue, null);
+        errorHandler = new As400ErrorHandler(connectorConfig, queue, errorHandler);
 
         final SnapshotterService snapshotterService = connectorConfig.getServiceRegistry().tryGetService(SnapshotterService.class);
 
@@ -140,12 +144,31 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
         }
 
         final List<FileFilter> shortIncludes = jdbcConnection.shortIncludes(schema.getSchemaName(),
-                configuredIncludes);
+                configuredIncludes, connectorConfig.skipUncapturableTables());
+        // No filters means "no include list", i.e. read the whole library's journal - which every configured
+        // table having been dropped must not silently turn into.
+        if (!Strings.isNullOrBlank(configuredIncludes) && shortIncludes.isEmpty()) {
+            throw new DebeziumException("none of the included tables exists, there is nothing to capture. Tables "
+                    + "requested: " + configuredIncludes);
+        }
 
         final long cacheWait = JournalInfoRetrieval.getJournalCacheDurationInMilliseconds(jdbcConnection);
 
-        final As400RpcConnection rpcConnection = new As400RpcConnection(connectorConfig, streamingMetrics,
+        this.rpcConnection = new As400RpcConnection(connectorConfig, streamingMetrics,
                 shortIncludes, cacheWait);
+
+        // the journal is only resolved once the rpc connection is up, and lob data can only be read
+        // back out of the journal it was written to
+        if (connectorConfig.isLobFetchEnabled()) {
+            rpcConnection.getJournalInfo().ifPresentOrElse(
+                    journalInfo -> schema.getFileDecoder()
+                            .setLobFetcher(new JournalLobFetcher(jdbcConnection, journalInfo)),
+                    // without this the only clue is the decoder's own warning, which points at the
+                    // lob.fetch setting - the one thing that is not the problem here
+                    () -> LOGGER.warn("lob.fetch is enabled but the journal could not be resolved, so lob "
+                            + "columns will stream as null. The lob.fetch setting is not the cause; see "
+                            + "the earlier failure to resolve the journal for {}", connectorConfig.getSchema()));
+        }
 
         // Detect and recover from a stored position whose receiver has been pruned, before Debezium
         // core turns an unavailable position into a generic crash-loop.
@@ -195,6 +218,9 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
      * the configured {@link As400ConnectorConfig.UnavailablePositionRecovery} strategy instead of letting
      * Debezium core throw a generic, retried-to-death engine failure. Transient validation failures are
      * left to propagate so the engine restart is a legitimate retry.
+     * <p>
+     * A receiver can also be pruned once streaming is under way; that is handled by the equivalent recovery
+     * in {@code As400StreamingChangeEventSource.applyUnavailablePositionRecovery}.
      */
     static void applyUnavailablePositionRecovery(As400ConnectorConfig connectorConfig, As400RpcConnection rpcConnection,
                                                  Offsets<As400Partition, As400OffsetContext> previousOffsets) {
@@ -214,7 +240,8 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
                                     + "(pruned receiver). Reset the offset and trigger a snapshot, or set "
                                     + "'" + As400ConnectorConfig.UNAVAILABLE_POSITION_RECOVERY.name()
                                     + "' to 'snapshot' or 'earliest' to auto-recover, or to 'latest' together with '"
-                                    + As400ConnectorConfig.ERRORS_TOLERANCE + "=" + As400ConnectorConfig.ERRORS_TOLERANCE_ALL
+                                    + As400ConnectorConfig.ERRORS_TOLERANCE.name() + "="
+                                    + As400ConnectorConfig.ErrorsTolerance.ALL.getValue()
                                     + "' to accept the declared gap.");
                 case SNAPSHOT:
                     LOGGER.warn("Stored journal position {} is no longer available (pruned receiver); resetting the offset so "
@@ -276,6 +303,25 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
 
     @Override
     protected void doStop() {
+        if (rpcConnection != null) {
+            rpcConnection.close();
+            rpcConnection = null;
+        }
+
+        try {
+            if (jdbcConnection != null) {
+                jdbcConnection.close();
+                jdbcConnection = null;
+            }
+        }
+        catch (final SQLException e) {
+            LOGGER.error("Exception while closing JDBC connection", e);
+        }
+
+        if (schema != null) {
+            schema.close();
+            schema = null;
+        }
     }
 
     @Override

@@ -21,6 +21,7 @@ import org.slf4j.LoggerFactory;
 
 import com.ibm.as400.access.AS400;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.Connect;
 import io.debezium.ibmi.db2.journal.retrieve.FileFilter;
 import io.debezium.ibmi.db2.journal.retrieve.JdbcFileDecoder;
@@ -63,20 +64,20 @@ public class ITRetrievalHelper {
         this.maxEntries = maxEntries;
         this.journalEntryFunction = journalEntryFunction;
         tables = includes.stream().map(FileFilter::table).collect(Collectors.toSet());
-        fileDecoder = new JdbcFileDecoder(connector.getJdbc(), "databasename", schemaCache, -1, -1);
+        fileDecoder = new JdbcFileDecoder(connector.getJdbc(), "databasename", schemaCache, As400TextFactory.forConnection(connector.getJdbc()), -1, -1);
         this.fetchedEntries = fetchedEntries;
         final RetrieveConfig config = new RetrieveConfigBuilder().withAs400(connector.getAs400())
                 .withJournalInfo(journal).withJournalBufferSize(bufferSize).withServerFiltering(true)
                 .withIncludeFiles(includes).withMaxServerSideEntries(maxEntries).build();
         final long cacheWait = JournalInfoRetrieval.getJournalCacheDurationInMilliseconds(connector.getJdbc());
-        final JournalInfoRetrieval journalInfoRetrieval = new JournalInfoRetrieval(cacheWait, 0, 2000);
+        final JournalInfoRetrieval journalInfoRetrieval = new JournalInfoRetrieval(As400TextFactory.forConnection(connector.getJdbc()), cacheWait, 0, 2000);
         rj = new RetrieveJournal(config, journalInfoRetrieval);
     }
 
     public void setStartPositionToNow() throws Exception {
         final Connect<AS400, IOException> as400Connect = connector.getAs400();
         final long cacheWait = JournalInfoRetrieval.getJournalCacheDurationInMilliseconds(connector.getJdbc());
-        final JournalInfoRetrieval journalInfoRetrieval = new JournalInfoRetrieval(cacheWait, 0, 2000);
+        final JournalInfoRetrieval journalInfoRetrieval = new JournalInfoRetrieval(As400TextFactory.forConnection(connector.getJdbc()), cacheWait, 0, 2000);
         final JournalPosition endPosition = journalInfoRetrieval.getCurrentPosition(as400Connect.connection(), journal);
         nextPosition = new JournalProcessedPosition(endPosition, Instant.now(), true);
     }

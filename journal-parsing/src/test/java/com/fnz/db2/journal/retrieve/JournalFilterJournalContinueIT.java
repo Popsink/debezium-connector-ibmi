@@ -62,7 +62,7 @@ class JournalFilterJournalContinueIT {
         final Connect<Connection, SQLException> sqlConnect = connector.getJdbc();
         setupTables(sqlConnect.connection());
         final long cacheWait = JournalInfoRetrieval.getJournalCacheDurationInMilliseconds(sqlConnect);
-        final JournalInfoRetrieval journalInfoRetrieval = new JournalInfoRetrieval(cacheWait, 0, 2000);
+        final JournalInfoRetrieval journalInfoRetrieval = new JournalInfoRetrieval(connector.getTextFactory(), cacheWait, 0, 2000);
 
         journal = journalInfoRetrieval.getJournal(connector.getAs400().connection(), SCHEMA, includes);
         log.debug("journal {}", journal);

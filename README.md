@@ -74,7 +74,19 @@ REPLICATION_FACTOR=3
 * TODO integrate with exit program to prevent journal loss https://github.com/jhc-systems/debezium-ibmi-exitpgm
 * Limited support for table changes - the journal entries for table changes are not documented so rely on fetching table structure at runtime and refetching when table change detected
 * No support for remote journals and fail over
-* No support for clobs/xml and similar large text/blobs
+* CLOB, DBCLOB, BLOB and XML columns are captured, but a journal entry carries no lob data - only a
+  pointer into the journal receiver that can only be followed on the IBM i itself - so the values are
+  read back with `QSYS2.DISPLAY_JOURNAL`. Entries are read a run at a time, so the first lob entry of
+  a batch pays for the ones behind it rather than each costing a query of its own. Set
+  `lob.fetch=false` to skip the reads entirely: lob columns then stream as null, no extra query is
+  made, and the rest of the table is unaffected.
+* Every journal entry of a table with a lob column also arrives owning a pointer handle on the IBM i,
+  whether or not the lob data is read. Handles are only released when the job that requested them
+  ends, and returning them individually would cost a round trip per entry, so they are counted and
+  freed together once `journal.pointer.handle.threshold` (default 50000) have accumulated, by
+  replacing the connection so that the next retrieve runs in a different host server job. Nothing on
+  the system is cancelled or ended - the connection is simply re-established, transparently. Lower it
+  on a system with a constrained job storage limit.
 
 # Problems
 
@@ -94,28 +106,47 @@ If running natively import the cert
 
 ## Journals deleted
 
-If the journal is deleted *while streaming* it logs an error ("Lost journal at position xxx") and resets to the earliest available journal receiver.
-
-### Stored offset no longer available at startup
+### Journal position no longer available
 
 If the connector has been down longer than the source keeps its journal receivers, its committed offset
 points at a receiver that has since been pruned/rotated. On restart the connector cannot resolve that
 position. This is a **non-transient** condition — the receiver will never come back — so retrying the
 engine only delays an inevitable failure.
 
-Two things are done to keep this from turning into a silent crash-loop:
+The same thing happens *while streaming*, e.g. when the journal or its receivers are deleted under a
+running connector. Both cases apply the same recovery strategy; earlier versions silently reset
+streaming to the earliest available receiver instead, which lost data without failing.
+
+Three things are done to keep this from turning into a silent crash-loop:
 
 * A pruned receiver is told apart from a transient RPC/connection error. Only the former is treated as
   "position lost"; a transient failure is retried as before.
+* **Nothing resets the offset until the position is confirmed gone.** Before any mid-stream recovery the
+  position is looked up in the journal's live receiver chain; if its receiver is still there and the
+  offset falls inside that receiver, the poll is simply retried. A range the connector resolved badly
+  reports itself exactly like a pruned receiver does (the server answers `CPF7054`, "last < first, or an
+  offset that does not belong to the journal"), and recovering from one of those re-reads the whole
+  retained journal to recover nothing — which is what used to throw a caught-up connector tens of
+  millions of entries back every time a journal receiver rolled. A refused range is now recalculated on
+  the next poll instead, and only reaches recovery if the receiver chain says the position really has
+  gone. A failure to read the chain counts as "still available", so a connection problem can never
+  produce a reset.
 * The `journal.unavailable.position.recovery` option controls what happens when the stored position is
   gone:
 
   | value | behaviour |
   | --- | --- |
   | `fail` (default) | Stop with a distinct, non-transient error (marker `IBMI_OFFSET_NO_LONGER_AVAILABLE`) so an orchestrator can reset the offset / trigger a snapshot / alert, rather than retry to death. |
-  | `snapshot` | Reset the offset and let the configured `snapshot.mode` take a fresh snapshot to re-establish table state, then resume streaming from the current journal position. Use with `snapshot.mode=initial`/`always`/`when_needed`. |
+  | `snapshot` | Reset the offset and let the configured `snapshot.mode` take a fresh snapshot to re-establish table state, then resume streaming from the current journal position. Use with `snapshot.mode=initial`/`always`/`when_needed`. A snapshot cannot be started from the streaming thread, so when the position is lost mid-stream the task fails with the same marker and the snapshot is taken by the startup recovery on the next start. |
   | `earliest` | Reset streaming to the earliest available journal receiver and continue. Intended for streaming-only / `no_data` connectors. Changes between the lost position and the earliest available receiver are **unrecoverable** and a loud warning is logged. Its cost scales with retention x journal rate: everything already delivered is re-read. On a busy journal this is effectively a denial of service against yourself - see below. |
   | `latest` | Reset streaming to the current journal head and continue, replaying nothing. Recommended for streaming-only / `no_data` connectors. Changes between the lost position and the head are **unrecoverable** and a loud warning is logged - exactly the same gap as `earliest`, without the replay. Requires `errors.tolerance=all` - see below. |
+
+  Mid-stream recovery is bounded: 20 consecutive failed polls fail the task rather than looping forever.
+  A lost connection (`IOException`, or the jt400 driver's `SQLNonTransientConnectionException`) is
+  classified as retriable, so hitting the bound restarts the connector — unlimited by default, see
+  `errors.max.retries` — rather than stopping the task. A position that no longer exists is not retriable
+  and stops the task; to have the engine restart on that too, set `errors.max.retries` together with
+  `custom.retriable.exception=.*IBMI_OFFSET_NO_LONGER_AVAILABLE.*`.
 
   Setting `snapshot.mode=when_needed` also triggers Debezium core's own re-snapshot-on-data-error path,
   which is equivalent to `journal.unavailable.position.recovery=snapshot`.
@@ -138,8 +169,105 @@ measured deployment with 2.7 days of retention and ~15 000 entries/s, `earliest`
 retention window, so it could never catch up. Prefer `latest` unless the journal is low-volume and you
 specifically want the retained entries replayed.
 
+### Blocking-snapshot pause safety
+
+An ad-hoc **blocking** snapshot is a cooperative handshake: the coordinator pauses streaming and waits
+for the streaming thread to acknowledge before the snapshot starts, then resumes it when the snapshot
+finishes. The streaming thread only reaches those handshake points between journal polls, so three wedges
+are possible while the connector still reports `live`: a requested pause is never honored (the thread
+keeps draining a large shared-journal block, issue #27), a finished snapshot never resumes streaming
+(#27), or both sides sit on "paused" with no snapshot running at all (#74). Three safeguards prevent
+this:
+
+* The journal-drain loop breaks out as soon as a blocking-snapshot pause is requested, so the pause is
+  honored within one journal entry rather than after a whole block.
+* While paused, the streaming thread polls the coordinator's pause flag and re-acknowledges the pause
+  every 250 ms instead of parking on the coordinator's condition variable. Parking there deadlocks when
+  the orchestrator queues per-table backfills: the single-threaded blocking-snapshot executor starts the
+  next queued snapshot before the woken streaming thread can re-read the flag, so the thread parks again
+  while that snapshot waits forever for an acknowledgement it will never get. Re-acknowledging also means
+  a snapshot requested while streaming is already paused still runs, instead of being silently dropped.
+* `blocking.snapshot.pause.timeout.ms` (default `120000`) bounds how long the handshake may stay stuck in
+  any of the three states above — including "paused with no snapshot running", which is invisible to a
+  check that only compares the two views against each other. Past that, the `WatchDog` fails the task
+  with a retriable error and Debezium restarts it (bounded by `errors.max.retries`), clearing the wedge
+  instead of stalling silently — a loud, logged restart rather than an in-place rescue, because
+  interrupting the wedged thread cannot reliably resync the handshake. The snapshot itself is never
+  bounded by this timeout: a blocking snapshot may run for hours.
+
 > Not to be confused with a stale JDBC connection detected mid-snapshot, which is a connection-liveness
 > issue rather than offset/position recovery.
+
+## Tables that cannot be captured
+
+A table listed in `table.include.list` cannot be streamed at all when it does not exist, when it has no
+journal (never `STRJRNPF`'d), or when it is an **SQL view** — a view has no journal of its own and the
+IBM i journal RPC calls only accept physical files. Every case below is logged at **ERROR** level.
+
+**A table that does not exist is always dropped**, whatever `errors.tolerance` is set to, because
+Debezium ignores `table.include.list` entries with no matching table everywhere else (the snapshot
+discovers tables from the catalog).
+
+For a table that *does* exist but has no journal, `errors.tolerance` decides:
+
+| value | behaviour |
+| --- | --- |
+| `none` (default) | Startup fails, so the misconfiguration has to be fixed (or the table removed from the include list) rather than silently never streaming. |
+| `all` | The table is left out of the journal filters; the remaining tables stream as usual. |
+
+Two things stay fatal even with `all`, because they are not "one bad table": tables spanning more than
+one journal (the offset model is single-journal), and an include list where *no* table can be captured —
+an empty filter list would otherwise be read as "no include list", i.e. stream the whole library.
+
+Missing tables and views come from `QSYS2.SYSTABLES` before any RPC call (`TABLE_TYPE = 'V'` is a view);
+an unjournaled table shows up when its journal is resolved. That catalog lookup is deliberately loose —
+long or system name, any case, and `SYSTEM_TABLE_NAME` may come back delimited (`"Vue10002"`) — because a
+miss drops the table. If the lookup itself fails the table is kept, so a catalog hiccup cannot silently
+stop a healthy table from being captured.
+
+Snapshots already skipped both (table discovery asks for `TABLE` only), so this is about the streaming
+side.
+
+> `errors.tolerance` is the same property name and the same `none`/`all` values as Kafka Connect's own,
+> which governs converter/transform/producer errors; the setting is shared and the intent is the same.
+
+## Catching up
+
+The journal is read a block at a time with `QjoRetrieveJournalEntries`; a call takes longer the more
+bytes it returns (about 3 MB/s on a good link, under 300 KB/s seen in production).
+
+* `buffer.size` (default 131072): bytes one call may return. A block that comes back full
+  (`MORE_DATA_NEW_OFFSET` in the diagnostics) means the buffer, not the journal, ran out.
+* `max.journal.timeout` (default 60000 ms): how long the streaming thread may go without progress,
+  which bounds one call. A buffer that cannot be filled within it never delivers, so raise the two
+  together (16 MiB at 300 KB/s needs about 60 s; give it 120 s).
+* `journal.prefetch` (default true): the call for the next block is issued in the background while the
+  current one is decoded and dispatched, hiding the round trip behind the processing for a second
+  buffer's worth of heap.
+
+The `Current position diagnostics` line, every five minutes, shows for the last block `rpc` (the call),
+`waited` (how long the streaming thread actually stood still) and `consumed` (walking and dispatching
+the previous block). `waited` close to `rpc` means the read is wire bound; `consumed` dominating means
+the pipeline works and the downstream is the limit. The same line times a `small call` (all round
+trip) and derives the `link rate` and the bytes `in flight per round trip`: a low rate with tens of KB
+in flight over a long round trip is a TCP window, not a slow network. An IBM i ships with 64 KiB
+buffers (`CHGTCPA TCPSNDBUF`/`TCPRCVBUF`), about 320 KB/s at 200 ms whatever `buffer.size` is; raise
+them on the host.
+
+When the lag (`behind`, `JournalBehind`) has grown for three consecutive samples with a full buffer
+every call, the connector logs `CANNOT CATCH UP` at WARN and exposes the count as
+`JournalBehindGrowthSamples`: it reads as fast as the buffer and link allow and the journal still
+grows faster, so it will drift out of the retained receivers (see "Journals deleted").
+### Journal entries that cannot be processed
+
+A journal entry the connector cannot decode or dispatch is skipped with one **ERROR** line naming the offset,
+table, RRN, journal code and entry type, and the position moves past it. A single field that cannot be decoded
+(a blank-filled numeric, say) does not cost the row: it is read as null and logged at **WARN** with the column
+name, once per row-count decade. Both lines end with the row's **record image in hex** (the bytes after the
+journal entry's 16-byte length prefix, capped at 4 KiB), so the offending column can be checked by hand from the
+log alone: slice `2 * byteLength` hex characters per column in table-format order. `4040…` is an uninitialised
+field, random bytes are corruption, a valid-looking pattern that is shifted means the table format changed
+after the entry was journaled. The RRN is what the customer needs to locate the row.
 
 ## Memory
 
@@ -220,6 +348,21 @@ Optional:
 the above help with connections that can be blocked (firewalled) or dropped due to vpn issues
 
 ## CCSID
+
+Character conversion is always done against the CCSID of the **remote IBM i**, never one inferred from
+the connector's own locale. jt400's `new AS400Text(length)` constructor falls back to
+`ExecutionEnvironment.getBestGuessAS400Ccsid()`, which derives a CCSID from the JVM's default locale -
+so a connector container defaulting to `en_US` reading a French or Japanese system would encode journal
+API parameters with the wrong EBCDIC page and decode journal headers and record images into mojibake.
+Every character `AS400DataType` is therefore built through `As400TextFactory`, which pins the CCSID the
+system itself reports at sign-on (`AS400.getCcsid()`).
+
+CCSIDs are resolved in this order:
+
+1. the column's own CCSID from `qsys2.syscolumns` (remapped by `from.ccsid`/`to.ccsid` if configured);
+2. the remote system CCSID, for API parameters and headers, and for any column the catalogue has no
+   CCSID for (or that is tagged 65535, meaning "no translation");
+3. the local locale guess - only if the system could not be reached to ask, which is logged as an error.
 
 Unusually we have the incorrect CCSID on all our tables and the data is forced into the tables with the wrong encoding
 

@@ -18,6 +18,7 @@ import com.ibm.as400.access.AS400;
 import com.ibm.as400.access.AS400JDBCConnectionForcedCcsid;
 import com.ibm.as400.access.AS400JDBCDriverRegistration;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.Connect;
 
 public class TestConnector {
@@ -78,6 +79,10 @@ public class TestConnector {
 
     public Connect<Connection, SQLException> getJdbc() {
         return sqlConnect;
+    }
+
+    public As400TextFactory getTextFactory() throws IOException {
+        return As400TextFactory.forSystem(as400Connect.connection());
     }
 
     /**

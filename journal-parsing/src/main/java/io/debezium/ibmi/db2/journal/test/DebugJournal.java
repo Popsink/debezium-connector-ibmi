@@ -16,6 +16,7 @@ import org.slf4j.LoggerFactory;
 
 import com.ibm.as400.access.AS400;
 
+import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.data.types.Diagnostics;
 import io.debezium.ibmi.db2.journal.retrieve.Connect;
 import io.debezium.ibmi.db2.journal.retrieve.JournalInfo;
@@ -38,11 +39,13 @@ public class DebugJournal {
         final Connect<AS400, IOException> as400Connect = connector.getAs400();
         final Connect<Connection, SQLException> sqlConnect = connector.getJdbc();
         final String schema = connector.getSchema();
-        JournalInfoRetrieval jir = new JournalInfoRetrieval(30000, 5000, 2000);
+        final As400TextFactory textFactory = connector.getTextFactory();
+        JournalInfoRetrieval jir = new JournalInfoRetrieval(textFactory, 30000, 5000, 2000);
 
         final byte[] data = Files.readAllBytes(Paths.get("C:\\dev\\kafka\\journal-parsing\\good-journal\\201218-0616-0"));
         final JournalInfo journal = jir.getJournal(as400Connect.connection(), schema);
-        final RetrieveConfig config = new RetrieveConfigBuilder().withAs400(as400Connect).withJournalInfo(journal).build();
+        final RetrieveConfig config = new RetrieveConfigBuilder().withAs400(as400Connect).withTextFactory(textFactory)
+                .withJournalInfo(journal).build();
         final RetrieveJournal rnj = new RetrieveJournal(config, jir);
 
         rnj.setOutputData(data,
@@ -54,7 +57,7 @@ public class DebugJournal {
             log.info("code: {}", code);
             switch (code) {
                 case "J NR":
-                    final JournalReceiver receiver = rnj.decode(new JournalRecordDecoder());
+                    final JournalReceiver receiver = rnj.decode(new JournalRecordDecoder(textFactory));
                     log.info("receiver {}", receiver);
                     break;
                 default:
@@ -65,7 +68,7 @@ public class DebugJournal {
             rnj.dumpEntry();
             log.info("dump from entry start");
             log.info(Diagnostics.binAsHex(data, rnj.getOffset() + rnj.getEntryHeader().getEntrySpecificDataOffset(), rnj.getEntryHeader().getLength()));
-            log.info(Diagnostics.binAsEbcdic(data, rnj.getOffset() + rnj.getEntryHeader().getEntrySpecificDataOffset(), rnj.getEntryHeader().getLength()));
+            log.info(Diagnostics.binAsEbcdic(textFactory, data, rnj.getOffset() + rnj.getEntryHeader().getEntrySpecificDataOffset(), rnj.getEntryHeader().getLength()));
 
             rnj.dumpEntry();
         }
