@@ -108,13 +108,15 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
         }
     }
 
-    private void cacheBefore(TableId tableId, Object[] dataBefore) {
-        final String key = String.format("%s-%s", tableId.schema(), tableId.table());
+    // keyed per member: members of one file interleave in the journal, and a before-image must only pair
+    // with the after-image of the same member
+    private void cacheBefore(TableId tableId, String member, Object[] dataBefore) {
+        final String key = String.format("%s-%s-%s", tableId.schema(), tableId.table(), member);
         beforeMap.put(key, dataBefore);
     }
 
-    private Object[] getBefore(TableId tableId) {
-        final String key = String.format("%s-%s", tableId.schema(), tableId.table());
+    private Object[] getBefore(TableId tableId, String member) {
+        final String key = String.format("%s-%s-%s", tableId.schema(), tableId.table(), member);
         final Object[] dataBefore = beforeMap.remove(key);
         if (dataBefore == null) {
             log.debug("before image not found for {}", key);
@@ -465,16 +467,16 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         // before image
                         final Object[] dataBefore = r.decode(schema.getFileDecoder());
 
-                        cacheBefore(tableId, dataBefore);
+                        cacheBefore(tableId, eheader.getMember(), dataBefore);
                     }
                         break;
                     case AFTER_IMAGE: {
                         // after image
                         // before image is meant to have been immediately before
-                        final Object[] dataBefore = getBefore(tableId);
+                        final Object[] dataBefore = getBefore(tableId, eheader.getMember());
                         final Object[] dataNext = r.decode(schema.getFileDecoder());
 
-                        offsetContext.updateSourceInfo(eheader.getTime(), eheader.getRelativeRecordNumber());
+                        offsetContext.updateSourceInfo(eheader.getTime(), eheader.getRelativeRecordNumber(), eheader.getMember());
 
                         final String txId = eheader.getCommitCycle().toString();
 
@@ -509,7 +511,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                     case ADD_ROW1, ADD_ROW2: {
                         // record added
                         final Object[] dataNext = r.decode(schema.getFileDecoder());
-                        offsetContext.updateSourceInfo(eheader.getTime(), eheader.getRelativeRecordNumber());
+                        offsetContext.updateSourceInfo(eheader.getTime(), eheader.getRelativeRecordNumber(), eheader.getMember());
 
                         final String txId = eheader.getCommitCycle().toString();
 
@@ -546,7 +548,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         // record deleted
                         final Object[] dataBefore = r.decode(schema.getFileDecoder());
 
-                        offsetContext.updateSourceInfo(eheader.getTime(), eheader.getRelativeRecordNumber());
+                        offsetContext.updateSourceInfo(eheader.getTime(), eheader.getRelativeRecordNumber(), eheader.getMember());
 
                         final String txId = eheader.getCommitCycle().toString();
 

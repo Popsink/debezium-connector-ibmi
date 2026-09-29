@@ -137,12 +137,17 @@ public class As400OffsetContext extends CommonOffsetContext<SourceInfo> {
         return sourceInfo.schema();
     }
 
-    public void updateSourceInfo(Instant timestamp, BigInteger rrn) {
+    /**
+     * @param member the physical file member the entry belongs to; an empty name (entry with no member) is
+     *            published as {@code null}
+     */
+    public void updateSourceInfo(Instant timestamp, BigInteger rrn, String member) {
         sourceInfo.setSourceTime(timestamp);
         sourceInfo.setReceiver(position.getReceiver().name());
         sourceInfo.setReceiverLib(position.getReceiver().library());
         sourceInfo.setSequence(position.getOffset().toString());
         sourceInfo.setRrn(String.valueOf(rrn));
+        sourceInfo.setMember(member == null || member.isEmpty() ? null : member);
     }
 
     @Override
