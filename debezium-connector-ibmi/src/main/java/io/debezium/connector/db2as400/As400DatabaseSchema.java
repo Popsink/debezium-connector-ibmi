@@ -53,6 +53,7 @@ public class As400DatabaseSchema extends RelationalDatabaseSchema implements Sch
                 As400TextFactory.forConnection(jdbcConnection),
                 config.getFromCcsid(),
                 config.getToCcsid());
+        fileDecoder.setRequireUniqueDdsKey(config.isUniqueDdsKeyRequired());
 
         schemaInfoConversion = new SchemaInfoConversion(fileDecoder);
     }

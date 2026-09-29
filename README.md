@@ -27,6 +27,7 @@ Patches that upstream accepts are dropped from the fork at the next rebase. Upst
 | Recovery from a pruned journal receiver (#14) | Candidate for upstream (#93) |
 | `latest` journal position recovery strategy (#84) | Candidate for upstream (#93) |
 | SLF4J placeholder mismatches (#56) | Candidate for upstream (#93) |
+| A DDS keyed access path only keys records when the file requires unique keys, `dds.key.require.unique` (#96) | Candidate for upstream (#93) |
 
 Already accepted upstream and no longer carried here: persist and load the incremental snapshot status (debezium/dbz#1861) and the reliable connection close that clears the prepared-statement cache (debezium/dbz#2204).
 
@@ -80,6 +81,18 @@ REPLICATION_FACTOR=3
   a batch pays for the ones behind it rather than each costing a query of its own. Set
   `lob.fetch=false` to skip the reads entirely: lob columns then stream as null, no extra query is
   made, and the rest of the table is unaffected.
+* A file created in DDS has no SQL primary key, only the keyed access path of its `K` specifications.
+  That access path is an ordering, not an identity: unless the file was created with `UNIQUE`, IBM i
+  accepts any number of records sharing one key value, and keying records on it makes every keyed
+  destination - a compacted topic, a merged table - keep one record per key value and drop the rest.
+  The access path is therefore only used as the record key when `QSYS.QADBXREF.DBXUNQ` reports that
+  the file requires unique keys; a file that allows duplicates streams without a record key, and the
+  decision is logged per table. Set `dds.key.require.unique=false` to key records on a
+  duplicate-allowing access path anyway, which is only safe when the key is known to be unique in
+  practice. Files with a real SQL primary key are unaffected. Note that a table that loses its key
+  changes the key of its topic, so a destination loaded from it has to be re-loaded, and its records
+  are no longer pinned to one partition by key - check that the affected topics are single-partition
+  if update ordering per record matters.
 * Every journal entry of a table with a lob column also arrives owning a pointer handle on the IBM i,
   whether or not the lob data is read. Handles are only released when the job that requested them
   ends, and returning them individually would cost a round trip per entry, so they are counted and

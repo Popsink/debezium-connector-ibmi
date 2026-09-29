@@ -60,11 +60,6 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
     private final AS400Bin2 as400Bin2 = new AS400Bin2();
     private final AS400Boolean as400Boolean = new AS400Boolean();
     private static final String GET_DATABASE_NAME = "values ( CURRENT_SERVER )";
-    private static final String UNIQUE_KEYS = """
-            SELECT c.column_name FROM qsys.QADBKATR k
-                  INNER JOIN qsys2.SYSCOLUMNS c on c.table_schema=k.dbklib and c.system_table_name=k.dbkfil AND c.system_column_name=k.DBKFLD
-                  WHERE k.dbklib=? AND k.dbkfil=? ORDER BY k.DBKPOS ASC
-                 """;
 
     private final Connect<Connection, SQLException> jdbcConnect;
     private final String databaseName;
@@ -75,6 +70,8 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
     private final As400TextFactory textFactory;
     /** Only known once the journal has been resolved, and null when lob fetching is turned off. */
     private JournalLobFetcher lobFetcher;
+    /** See {@link #setRequireUniqueDdsKey}; the safe resolution unless an operator opts out. */
+    private boolean requireUniqueDdsKey = true;
     /** Both hold the tables already logged about, so a per-entry problem is reported once, not per row. */
     private final Set<String> lobsUnfetchedLogged = ConcurrentHashMap.newKeySet();
     private final Set<String> recordLengthLogged = ConcurrentHashMap.newKeySet();
@@ -100,6 +97,15 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
      */
     public void setLobFetcher(JournalLobFetcher lobFetcher) {
         this.lobFetcher = lobFetcher;
+    }
+
+    /**
+     * Whether the DDS keyed access path of a file with no SQL primary key is only used as the record key
+     * when the file requires unique key values. Set false to key records on a keyed access path that
+     * allows duplicates, as the decoder did unconditionally before - see {@link DdsKeys}.
+     */
+    public void setRequireUniqueDdsKey(boolean requireUniqueDdsKey) {
+        this.requireUniqueDdsKey = requireUniqueDdsKey;
     }
 
     /*
@@ -524,21 +530,21 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
         return Optional.empty();
     }
 
-    private List<String> ddsPrimaryKeys(String table, String schema) throws SQLException {
-        final List<String> primaryKeys = new ArrayList<>();
+    /**
+     * The DDS keyed access path of a file that has no SQL primary key, used as the record key only when
+     * the file requires unique key values - see {@link DdsKeys}.
+     */
+    // package private so the uniqueness decision can be driven from a test without a live IBM i
+    List<String> ddsPrimaryKeys(String table, String schema) throws SQLException {
         final Connection con = jdbcConnect.connection();
 
-        try (PreparedStatement ps = con.prepareStatement(UNIQUE_KEYS)) {
+        try (PreparedStatement ps = con.prepareStatement(DdsKeys.KEY_COLUMNS)) {
             ps.setString(1, schema);
             ps.setString(2, table);
             try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    final String columnName = StringHelpers.safeTrim(rs.getString(1));
-                    primaryKeys.add(columnName);
-                }
+                return DdsKeys.read(rs).asRecordKey(requireUniqueDdsKey, schema, table);
             }
         }
-        return primaryKeys;
     }
 
     private List<String> primaryKeysFromMeta(String table, String schema, String databaseCatalog,

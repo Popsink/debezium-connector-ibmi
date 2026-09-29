@@ -32,6 +32,8 @@ import com.ibm.as400.access.AS400JDBCDriverRegistration;
 
 import io.debezium.config.Configuration;
 import io.debezium.ibmi.db2.journal.retrieve.Connect;
+import io.debezium.ibmi.db2.journal.retrieve.DdsKeys;
+import io.debezium.ibmi.db2.journal.retrieve.DdsKeys.DdsKey;
 import io.debezium.ibmi.db2.journal.retrieve.FileFilter;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.jdbc.JdbcConnection;
@@ -48,6 +50,8 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
     private final JdbcConfiguration config;
     private final int fromCcsid;
     private final int toCcsid;
+    /** See {@link As400ConnectorConfig#DDS_KEY_REQUIRE_UNIQUE}. */
+    private final boolean requireUniqueDdsKey;
     private boolean registered = false;
 
     /** Skip the {@link Connection#isValid} liveness round-trip if we validated within this window. */
@@ -87,11 +91,6 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
             select distinct upper(table_name), upper(replace(system_table_name, '"', ''))
             from qsys2.syspartitionstat where upper(system_table_schema)=upper(?)
             """;
-    private static final String GET_INDEXES = """
-            SELECT c.column_name FROM qsys.QADBKATR k
-                  INNER JOIN qsys2.SYSCOLUMNS c on c.table_schema=k.dbklib and c.system_table_name=k.dbkfil AND c.system_column_name=k.DBKFLD
-                  WHERE k.dbklib=? AND k.dbkfil=? ORDER BY k.DBKPOS ASC
-                 """;
     private static final String GET_LONG_COLUMN_NAMES = """
             SELECT COLUMN_NAME
             FROM qsys2.SYSCOLUMNS2 WHERE SYSTEM_TABLE_SCHEMA=? AND TABLE_NAME=?
@@ -124,6 +123,7 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
         super(withDefaults(config), FACTORY, "\"", "\"");
         this.fromCcsid = config.getInteger(As400ConnectorConfig.FROM_CCSID);
         this.toCcsid = config.getInteger(As400ConnectorConfig.TO_CCSID);
+        this.requireUniqueDdsKey = config.getBoolean(As400ConnectorConfig.DDS_KEY_REQUIRE_UNIQUE);
         this.config = config;
         realDatabaseName = retrieveRealDatabaseName();
         log.debug("connection: {}", connectionString());
@@ -303,26 +303,44 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
 
     @Override
     protected List<String> readPrimaryKeyOrUniqueIndexNames(DatabaseMetaData metadata, TableId id) throws SQLException {
-        List<String> pkColumnNames = readPrimaryKeyNames(metadata, id);
-        if (pkColumnNames.isEmpty()) {
-            pkColumnNames = readAs400PrimaryKeys(id);
+        final List<String> pkColumnNames = readPrimaryKeyNames(metadata, id);
+        if (!pkColumnNames.isEmpty()) {
+            return pkColumnNames;
         }
-        if (pkColumnNames.isEmpty()) {
-            pkColumnNames = readTableUniqueIndices(metadata, id);
-            if (!pkColumnNames.isEmpty()) {
-                pkColumnNames = mapSystemColumnNamesToLongNames(id, pkColumnNames);
-            }
+
+        final DdsKey ddsKey = readDdsKey(id);
+        final List<String> ddsColumnNames = ddsKey.asRecordKey(isUniqueDdsKeyRequired(), id.schema(), id.table());
+        if (!ddsColumnNames.isEmpty()) {
+            return ddsColumnNames;
         }
-        return pkColumnNames;
+        // Only a file with no keyed access path at all falls through to the unique indices. A file whose
+        // access path was refused for allowing duplicates stays unkeyed instead, because the journal
+        // decoder resolves the key of the same table without this fallback: keying the snapshot of a
+        // table differently from the stream that continues it is worse than leaving it unkeyed.
+        if (!ddsKey.columns().isEmpty()) {
+            return ddsColumnNames;
+        }
+
+        final List<String> uniqueIndexNames = readTableUniqueIndices(metadata, id);
+        return uniqueIndexNames.isEmpty() ? uniqueIndexNames : mapSystemColumnNamesToLongNames(id, uniqueIndexNames);
     }
 
-    protected List<String> readAs400PrimaryKeys(TableId id) throws SQLException {
-        return prepareQueryAndMap(GET_INDEXES,
+    /** See {@link As400ConnectorConfig#DDS_KEY_REQUIRE_UNIQUE}. */
+    protected boolean isUniqueDdsKeyRequired() {
+        return requireUniqueDdsKey;
+    }
+
+    /**
+     * The keyed access path of a file, with the uniqueness that decides whether it can be its primary
+     * key - see {@link DdsKeys}. A file created in SQL has none and reads empty.
+     */
+    protected DdsKey readDdsKey(TableId id) throws SQLException {
+        return prepareQueryAndMap(DdsKeys.KEY_COLUMNS,
                 call -> {
                     call.setString(1, id.schema());
                     call.setString(2, id.table());
                 },
-                this::extractResultSet);
+                DdsKeys::read);
     }
 
     protected List<String> mapSystemColumnNamesToLongNames(TableId id, List<String> systemColumnNames) throws SQLException {

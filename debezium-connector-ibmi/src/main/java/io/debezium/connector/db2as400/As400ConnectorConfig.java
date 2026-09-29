@@ -209,6 +209,22 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                     + "dispatched, at the cost of a second buffer of buffer.size bytes. Set to false to read one block at a time.",
             DEFAULT_JOURNAL_PREFETCH);
 
+    public static final boolean DEFAULT_DDS_KEY_REQUIRE_UNIQUE = true;
+
+    public static final Field DDS_KEY_REQUIRE_UNIQUE = Field.create("dds.key.require.unique",
+            "only key records on a DDS access path that requires unique keys",
+            "A file created in DDS has no SQL primary key, only the keyed access path of its K "
+                    + "specifications, which the connector falls back on to key its records. That key is an "
+                    + "ordering, not an identity: unless the file was created with UNIQUE, IBM i accepts any "
+                    + "number of records sharing one key value, and keying records on it makes every keyed "
+                    + "destination - a compacted topic, a merged table - keep only the last record of each key "
+                    + "value and silently drop the rest. By default the access path is therefore only used when "
+                    + "QSYS.QADBXREF.DBXUNQ reports the file requires unique keys, and a file that allows "
+                    + "duplicates streams without a record key. Set to false to key records on a duplicate-"
+                    + "allowing access path anyway, which is only safe when the key is known to be unique in "
+                    + "practice. Files with a real SQL primary key are unaffected either way.",
+            DEFAULT_DDS_KEY_REQUIRE_UNIQUE);
+
     public static final Field TOPIC_NAMING_STRATEGY = Field.create("topic.naming.strategy")
             .withDisplayName("Topic naming strategy class")
             .withType(Type.CLASS)
@@ -508,6 +524,10 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
         return config.getBoolean(JOURNAL_PREFETCH);
     }
 
+    public boolean isUniqueDdsKeyRequired() {
+        return config.getBoolean(DDS_KEY_REQUIRE_UNIQUE);
+    }
+
     public JournalProcessedPosition getOffset() {
         final String receiver = config.getString(As400OffsetContext.RECEIVER);
         final String lib = config.getString(As400OffsetContext.RECEIVER_LIBRARY);
@@ -546,7 +566,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
             MAX_SERVER_SIDE_ENTRIES, TOPIC_NAMING_STRATEGY, FROM_CCSID, TO_CCSID, SECURE,
             DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
             UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
-            ERRORS_TOLERANCE, LOB_FETCH, POINTER_HANDLE_THRESHOLD, JOURNAL_PREFETCH);
+            ERRORS_TOLERANCE, LOB_FETCH, POINTER_HANDLE_THRESHOLD, JOURNAL_PREFETCH, DDS_KEY_REQUIRE_UNIQUE);
 
     public static ConfigDef configDef() {
         final ConfigDef c = RelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
@@ -557,7 +577,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                         DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
                         UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
                         LOB_FETCH,
-                        POINTER_HANDLE_THRESHOLD, JOURNAL_PREFETCH)
+                        POINTER_HANDLE_THRESHOLD, JOURNAL_PREFETCH, DDS_KEY_REQUIRE_UNIQUE)
                 .connector(
                         SCHEMA_NAME_ADJUSTMENT_MODE)
                 .events(
