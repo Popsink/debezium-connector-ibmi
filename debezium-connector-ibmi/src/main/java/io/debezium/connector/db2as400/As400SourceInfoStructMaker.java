@@ -5,6 +5,7 @@
  */
 package io.debezium.connector.db2as400;
 
+import static io.debezium.connector.db2as400.SourceInfo.MEMBER_KEY;
 import static io.debezium.connector.db2as400.SourceInfo.RECEIVER_KEY;
 import static io.debezium.connector.db2as400.SourceInfo.RECEIVER_LIBRARY_KEY;
 import static io.debezium.connector.db2as400.SourceInfo.RRN_KEY;
@@ -29,6 +30,7 @@ public class As400SourceInfoStructMaker extends AbstractSourceInfoStructMaker<So
                 .field(RECEIVER_KEY, Schema.OPTIONAL_STRING_SCHEMA)
                 .field(RECEIVER_LIBRARY_KEY, Schema.OPTIONAL_STRING_SCHEMA)
                 .field(RRN_KEY, Schema.OPTIONAL_STRING_SCHEMA)
+                .field(MEMBER_KEY, Schema.OPTIONAL_STRING_SCHEMA)
                 .build();
     }
 
@@ -45,6 +47,7 @@ public class As400SourceInfoStructMaker extends AbstractSourceInfoStructMaker<So
         ret.put(RECEIVER_KEY, sourceInfo.getReceiver());
         ret.put(RECEIVER_LIBRARY_KEY, sourceInfo.getReceiverLib());
         ret.put(RRN_KEY, sourceInfo.getRrn());
+        ret.put(MEMBER_KEY, sourceInfo.getMember());
         return ret;
     }
 }

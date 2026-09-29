@@ -25,12 +25,14 @@ public class SourceInfo extends BaseSourceInfo {
     public static final String RECEIVER_KEY = "receiver";
     public static final String RECEIVER_LIBRARY_KEY = "receiver_library";
     public static final String RRN_KEY = "rrn";
+    public static final String MEMBER_KEY = "member";
     private Instant sourceTime;
     private String databaseName;
     private String receiver;
     private String receiverLib;
     private String sequence;
     private String rrn;
+    private String member;
 
     protected SourceInfo(As400ConnectorConfig connectorConfig) {
         super(connectorConfig);
@@ -82,5 +84,13 @@ public class SourceInfo extends BaseSourceInfo {
 
     public void setRrn(String rrn) {
         this.rrn = rrn;
+    }
+
+    public String getMember() {
+        return member;
+    }
+
+    public void setMember(String member) {
+        this.member = member;
     }
 }

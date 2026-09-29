@@ -5,6 +5,7 @@
  */
 package io.debezium.connector.db2as400;
 
+import static io.debezium.connector.db2as400.SourceInfo.MEMBER_KEY;
 import static io.debezium.connector.db2as400.SourceInfo.RECEIVER_KEY;
 import static io.debezium.connector.db2as400.SourceInfo.RECEIVER_LIBRARY_KEY;
 import static io.debezium.connector.db2as400.SourceInfo.RRN_KEY;
@@ -41,6 +42,7 @@ public class SourceInfoTest {
         source.setReceiverLib("RCV_LIB");
         source.setSequence("82");
         source.setRrn("4");
+        source.setMember("MBRA");
     }
 
     @Test
@@ -79,6 +81,11 @@ public class SourceInfoTest {
     }
 
     @Test
+    public void shouldHaveMember() {
+        assertThat(source.struct().getString(MEMBER_KEY)).isEqualTo("MBRA");
+    }
+
+    @Test
     public void schemaIsCorrect() {
         final Schema schema = SchemaBuilder.struct()
                 .name("io.debezium.connector.db2as400.Source")
@@ -95,6 +102,7 @@ public class SourceInfoTest {
                 .field(RECEIVER_KEY, Schema.OPTIONAL_STRING_SCHEMA)
                 .field(RECEIVER_LIBRARY_KEY, Schema.OPTIONAL_STRING_SCHEMA)
                 .field(RRN_KEY, Schema.OPTIONAL_STRING_SCHEMA)
+                .field(MEMBER_KEY, Schema.OPTIONAL_STRING_SCHEMA)
                 .build();
 
         VerifyRecord.assertConnectSchemasAreEqual(null, source.struct().schema(), schema);
