@@ -20,6 +20,7 @@ import java.util.TimeZone;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -91,6 +92,10 @@ public class RetrieveJournal {
     private long lastWaitMs;
     /** consecutive polls whose resolved range the server refused, see {@link #rangeRejected} */
     private int invalidRanges = 0;
+    private final JournalInfoRetrieval journalInfoRetrieval;
+    private final LongSupplier clockMs;
+    /** when the current run of refusals began, meaningful only while {@link #invalidRanges} is not zero */
+    private long firstInvalidRangeMs;
 
     public RetrieveJournal(RetrieveConfig config, JournalInfoRetrieval journalRetrieval) {
         this(config, journalRetrieval, null);
@@ -98,7 +103,14 @@ public class RetrieveJournal {
 
     /** @param fetcher stands in for the real call in tests */
     RetrieveJournal(RetrieveConfig config, JournalInfoRetrieval journalRetrieval, BlockFetcher fetcher) {
+        this(config, journalRetrieval, fetcher, System::currentTimeMillis);
+    }
+
+    /** @param clockMs stands in for the wall clock in tests */
+    RetrieveJournal(RetrieveConfig config, JournalInfoRetrieval journalRetrieval, BlockFetcher fetcher, LongSupplier clockMs) {
         this.config = config;
+        this.journalInfoRetrieval = journalRetrieval;
+        this.clockMs = clockMs;
         this.fetcher = fetcher == null ? this::fetch : fetcher;
         firstHeaderDecoder = new FirstHeaderDecoder(config.textFactory());
         entryHeaderDecoder = new EntryHeaderDecoder(config.textFactory(), systemTimeZone(config));
@@ -215,20 +227,35 @@ public class RetrieveJournal {
      * head has moved on and the range that crossed a receiver roll is forward again (issue #79).
      *
      * <p>Swallowing it forever would freeze the connector silently on the other reading of CPF7054 - an
-     * offset that genuinely does not belong to the journal - so once the same rejection has survived
-     * {@value #MAX_INVALID_RANGES} polls it is handed to the caller, which can tell the two apart by
-     * looking the position up in the receiver list.</p>
+     * offset that genuinely does not belong to the journal - so it is handed to the caller, which can tell
+     * the two apart by looking the position up in the receiver list, once it has survived
+     * {@value #MAX_INVALID_RANGES} polls <em>and</em> outlasted twice the head delay. A count alone undercut
+     * the window: at the default 5 s delay and 500 ms poll the inversion holds for ~10 polls, so every
+     * receiver roll escalated to ERROR and a streaming retry.</p>
      */
     private RetrievalState rangeRejected(PositionRange range, InvalidJournalRangeException e)
             throws InvalidJournalRangeException {
+        final long now = clockMs.getAsLong();
+        if (invalidRanges == 0) {
+            firstInvalidRangeMs = now;
+        }
         invalidRanges++;
-        if (invalidRanges >= MAX_INVALID_RANGES) {
-            log.error("the journal range {} has been refused by the server {} polls running, it is not the transient "
-                    + "disagreement between the receiver list and the delayed journal head", range, invalidRanges);
+        final long refusedForMs = now - firstInvalidRangeMs;
+        final long windowMs = 2 * journalInfoRetrieval.headDelayMs(config.journalInfo());
+        if (invalidRanges >= MAX_INVALID_RANGES && refusedForMs >= windowMs) {
+            log.error("the journal range {} has been refused by the server {} polls running over {}ms, longer than the "
+                    + "transient disagreement between the receiver list and the delayed journal head ({}ms)",
+                    range, invalidRanges, refusedForMs, windowMs);
             invalidRanges = 0;
             throw e;
         }
-        log.warn("the journal range {} was refused by the server, recalculating it on the next poll", range, e);
+        if (invalidRanges == 1) {
+            log.warn("the journal range {} was refused by the server, recalculating it on the next poll", range, e);
+        }
+        else {
+            log.debug("the journal range {} was refused again ({} polls, {}ms), recalculating it on the next poll",
+                    range, invalidRanges, refusedForMs);
+        }
         return RetrievalState.NotCalled;
     }
 
