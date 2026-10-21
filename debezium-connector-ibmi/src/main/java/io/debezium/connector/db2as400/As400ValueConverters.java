@@ -18,7 +18,6 @@ import org.slf4j.LoggerFactory;
 
 import io.debezium.config.CommonConnectorConfig.BinaryHandlingMode;
 import io.debezium.jdbc.JdbcValueConverters;
-import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.relational.Column;
 
 /**
@@ -30,8 +29,14 @@ public class As400ValueConverters extends JdbcValueConverters {
     private final As400ConnectorConfig config;
     private static final byte[] EMPTY_BYTES = new byte[0];
 
+    /**
+     * Honours {@code time.precision.mode}, which this used to pin to {@code adaptive}. Under adaptive a
+     * DB2 for i {@code TIMESTAMP(6)} reports length 26, so it is sized as a {@code NanoTimestamp} whose
+     * INT64 stops at 1677 and 2262: the {@code 0001-01-01} an IBM i application writes for "not set" then
+     * converts to null and a NOT NULL column drops the whole event (Popsink/data-plane#4904).
+     */
     public As400ValueConverters(DecimalMode decimalMode, As400ConnectorConfig config) {
-        super(decimalMode, TemporalPrecisionMode.ADAPTIVE, ZoneOffset.UTC, null, null, null);
+        super(decimalMode, config.getTemporalPrecisionMode(), ZoneOffset.UTC, null, null, null);
         this.config = config;
     }
 
