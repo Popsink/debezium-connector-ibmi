@@ -8,7 +8,6 @@ package io.debezium.ibmi.db2.journal.retrieve;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
@@ -33,8 +32,9 @@ import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.JournalReceiverInfo;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.JournalStatus;
 
 /**
- * On a caching journal the range end is the newest head the server has proven readable, not a head aged
- * by the cache wait time (issue #104).
+ * On a caching journal the range end is the newest entry the server has proven readable, not a head aged
+ * by the cache wait time (issue #104): the stretch from the proven head to live is asked for and the last
+ * entry returned becomes the proven head.
  */
 @ExtendWith(MockitoExtension.class)
 class JournalInfoRetrievalVerifiedHeadTest {
@@ -63,108 +63,135 @@ class JournalInfoRetrievalVerifiedHeadTest {
         doReturn(head).when(retrieval).getCurrentDetailedJournalReceiver(as400, caching);
     }
 
-    private void readable(DetailedJournalReceiver head, boolean readable) throws Exception {
-        doReturn(readable).when(retrieval).isEntryRetrievable(as400, caching, head.info().receiver(), head.end());
+    /** what the server returns for the unfiltered stretch {@code [from, to]}: the newest entry flushed, or nothing */
+    private void flushedUpTo(JournalReceiver rcv, long from, long to, Long newest) throws Exception {
+        doReturn(Optional.ofNullable(newest).map(BigInteger::valueOf)).when(retrieval)
+                .newestRetrievable(as400, caching, rcv, BigInteger.valueOf(from), BigInteger.valueOf(to));
+    }
+
+    private BigInteger end(Optional<DetailedJournalReceiver> head) {
+        return head.orElseThrow().end();
     }
 
     @Test
-    void aReadableLiveHeadIsUsedAsIsWithNoDelay() throws Exception {
+    void aFlushedLiveHeadIsUsedAsIsWithNoDelay() throws Exception {
         final DetailedJournalReceiver live = head(100);
         live(live);
-        readable(live, true);
+        flushedUpTo(receiver, 100, 100, 100L);
 
         assertEquals(Optional.of(live), retrieval.getDelayedDetailedJournalReceiver(as400, caching));
     }
 
     @Test
-    void aCachedLiveHeadFallsBackToThePreviousPollsHead() throws Exception {
+    void aCachedLiveHeadIsReadUpToTheNewestEntryFlushed() throws Exception {
         final DetailedJournalReceiver first = head(100);
         live(first);
-        readable(first, true);
+        flushedUpTo(receiver, 100, 100, 100L);
         retrieval.getDelayedDetailedJournalReceiver(as400, caching);
 
         final DetailedJournalReceiver second = head(120);
         live(second);
-        readable(second, false);
-        // the head of the previous poll is already proven: no second probe, and no step back
-        assertEquals(Optional.of(first), retrieval.getDelayedDetailedJournalReceiver(as400, caching));
-        verify(retrieval, times(1)).isEntryRetrievable(eq(as400), eq(caching), any(), eq(BigInteger.valueOf(100)));
+        flushedUpTo(receiver, 101, 120, 112L);
+        // the stretch above the proven head is asked for once; the range grows to the last entry it held
+        final Optional<DetailedJournalReceiver> grown = retrieval.getDelayedDetailedJournalReceiver(as400, caching);
+        assertEquals(BigInteger.valueOf(112), end(grown));
+        assertTrue(grown.get().isSameReceiver(second));
 
         final DetailedJournalReceiver third = head(140);
         live(third);
-        readable(third, false);
-        readable(second, true);
-        // the live head is still cached, the one before it has flushed meanwhile: the range grows to it
-        assertEquals(Optional.of(second), retrieval.getDelayedDetailedJournalReceiver(as400, caching));
+        flushedUpTo(receiver, 113, 140, 140L);
+        // everything below the live head has flushed meanwhile: the range reaches it
+        assertEquals(BigInteger.valueOf(140), end(retrieval.getDelayedDetailedJournalReceiver(as400, caching)));
+        verify(retrieval, times(3)).newestRetrievable(any(), any(), any(), any(), any());
     }
 
     @Test
-    void nothingProvenYetMeansNothingToRead() throws Exception {
-        final DetailedJournalReceiver live = head(100);
-        live(live);
-        readable(live, false);
-
+    void nothingProvenYetMeansNothingToReadUntilTheFirstHeadSeenFlushes() throws Exception {
+        final DetailedJournalReceiver first = head(100);
+        live(first);
+        flushedUpTo(receiver, 100, 100, null);
         assertTrue(retrieval.getDelayedDetailedJournalReceiver(as400, caching).isEmpty());
-        // one probe only: there is no previous head to try
-        verify(retrieval, times(1)).isEntryRetrievable(any(), any(), any(), any());
+
+        // the stretch keeps starting at the first head seen until something in it flushes
+        final DetailedJournalReceiver second = head(120);
+        live(second);
+        flushedUpTo(receiver, 100, 120, null);
+        assertTrue(retrieval.getDelayedDetailedJournalReceiver(as400, caching).isEmpty());
+
+        flushedUpTo(receiver, 100, 120, 110L);
+        assertEquals(BigInteger.valueOf(110), end(retrieval.getDelayedDetailedJournalReceiver(as400, caching)));
     }
 
     @Test
-    void anUnmovedHeadIsNotProbedAgainOnceProven() throws Exception {
+    void anUnmovedHeadIsNotAskedForAgainOnceProven() throws Exception {
         final DetailedJournalReceiver live = head(100);
         live(live);
-        readable(live, true);
+        flushedUpTo(receiver, 100, 100, 100L);
         retrieval.getDelayedDetailedJournalReceiver(as400, caching);
 
         live(head(100));
-        assertEquals(BigInteger.valueOf(100), retrieval.getDelayedDetailedJournalReceiver(as400, caching).get().end());
-        verify(retrieval, times(1)).isEntryRetrievable(any(), any(), any(), any());
+        assertEquals(BigInteger.valueOf(100), end(retrieval.getDelayedDetailedJournalReceiver(as400, caching)));
+        verify(retrieval, times(1)).newestRetrievable(any(), any(), any(), any(), any());
     }
 
     @Test
-    void theProvenHeadIsKeptWhileBothCandidatesAreStillCached() throws Exception {
+    void theProvenHeadIsKeptWhileNothingAboveItHasFlushed() throws Exception {
         final DetailedJournalReceiver first = head(100);
         live(first);
-        readable(first, true);
+        flushedUpTo(receiver, 100, 100, 100L);
         retrieval.getDelayedDetailedJournalReceiver(as400, caching);
 
         final DetailedJournalReceiver second = head(120);
         live(second);
-        readable(second, false);
+        flushedUpTo(receiver, 101, 120, null);
+        assertEquals(Optional.of(first), retrieval.getDelayedDetailedJournalReceiver(as400, caching));
+    }
+
+    @Test
+    void aStretchCutShortByTheBufferStillAdvancesAndIsAskedForAgain() throws Exception {
+        final DetailedJournalReceiver first = head(100);
+        live(first);
+        flushedUpTo(receiver, 100, 100, 100L);
         retrieval.getDelayedDetailedJournalReceiver(as400, caching);
 
-        final DetailedJournalReceiver third = head(140);
-        live(third);
-        readable(third, false);
-        readable(second, false);
-        assertEquals(Optional.of(first), retrieval.getDelayedDetailedJournalReceiver(as400, caching));
+        final DetailedJournalReceiver burst = head(1000);
+        live(burst);
+        flushedUpTo(receiver, 101, 1000, 500L);
+        assertEquals(BigInteger.valueOf(500), end(retrieval.getDelayedDetailedJournalReceiver(as400, caching)));
+
+        // the head has not moved but is not proven yet: the rest of the stretch is asked for on the next poll
+        flushedUpTo(receiver, 501, 1000, 1000L);
+        assertEquals(BigInteger.valueOf(1000), end(retrieval.getDelayedDetailedJournalReceiver(as400, caching)));
     }
 
     @Test
     void aRolledReceiverStartsProvingAgainOnTheNewOne() throws Exception {
         final DetailedJournalReceiver old = head(100);
         live(old);
-        readable(old, true);
+        flushedUpTo(receiver, 100, 100, 100L);
         retrieval.getDelayedDetailedJournalReceiver(as400, caching);
 
         final JournalReceiver next = new JournalReceiver("RCV2", "LIB");
         final DetailedJournalReceiver rolled = head(next, 5);
         live(rolled);
-        readable(rolled, false);
-        // the previous head is on another receiver: it cannot stand in, the old proven head is kept
+        flushedUpTo(next, 5, 5, null);
+        // the proven head is on another receiver and cannot anchor a stretch on this one: it is kept as is
         assertEquals(Optional.of(old), retrieval.getDelayedDetailedJournalReceiver(as400, caching));
-        verify(retrieval, times(1)).isEntryRetrievable(as400, caching, receiver, BigInteger.valueOf(100));
 
-        readable(rolled, true);
-        assertEquals(Optional.of(rolled), retrieval.getDelayedDetailedJournalReceiver(as400, caching));
+        final DetailedJournalReceiver grown = head(next, 50);
+        live(grown);
+        flushedUpTo(next, 5, 50, 30L);
+        final Optional<DetailedJournalReceiver> proven = retrieval.getDelayedDetailedJournalReceiver(as400, caching);
+        assertEquals(BigInteger.valueOf(30), end(proven));
+        assertTrue(proven.get().isSameReceiver(grown));
     }
 
     @Test
-    void aJournalThatDoesNotCacheIsNotProbed() throws Exception {
+    void aJournalThatDoesNotCacheIsNotAskedAnything() throws Exception {
         final JournalInfo plain = new JournalInfo("JRN", "LIB", false);
         doReturn(head(100)).when(retrieval).getCurrentDetailedJournalReceiver(as400, plain);
 
         retrieval.getDelayedDetailedJournalReceiver(as400, plain);
-        verify(retrieval, never()).isEntryRetrievable(any(), any(), any(), any());
+        verify(retrieval, never()).newestRetrievable(any(), any(), any(), any(), any());
     }
 }
