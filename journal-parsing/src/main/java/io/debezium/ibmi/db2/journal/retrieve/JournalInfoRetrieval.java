@@ -101,6 +101,14 @@ public class JournalInfoRetrieval {
         this.pollInterval = pollInterval;
     }
 
+    /**
+     * How far behind live {@link #getDelayedDetailedJournalReceiver} holds the journal head. The cache wait
+     * only counts for a journal that caches, so zeroing the additional delay does not switch it off.
+     */
+    public long headDelayMs(JournalInfo journalLib) {
+        return additionalJournalDelay + (journalLib.isCaching() ? journalCacheDelay : 0L);
+    }
+
     public JournalPosition getCurrentPosition(AS400 as400, JournalInfo journalLib) throws Exception {
         final JournalReceiver ji = getReceiver(as400, journalLib);
         final BigInteger offset = getOffset(as400, ji).end();
@@ -134,7 +142,7 @@ public class JournalInfoRetrieval {
     public Optional<DetailedJournalReceiver> getDelayedDetailedJournalReceiver(AS400 as400, JournalInfo journalLib)
             throws Exception {
         DetailedJournalReceiver dr = getCurrentDetailedJournalReceiver(as400, journalLib);
-        long totalDelay = additionalJournalDelay + (journalLib.isCaching() ? journalCacheDelay : 0l);
+        long totalDelay = headDelayMs(journalLib);
         if (totalDelay > 0) {
             if (!delayedCache.containsKey(journalLib)) {
                 DelayedDetailedJournalReceiver ddr = new DelayedDetailedJournalReceiver(totalDelay, pollInterval);

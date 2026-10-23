@@ -19,6 +19,7 @@ import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.LongSupplier;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -57,13 +58,17 @@ class RetrieveJournalInvalidRangeTest {
 
     /** Every call is refused by the server, as an inverted range is. */
     private RetrieveJournal retrieveJournal() {
+        return retrieveJournal(System::currentTimeMillis);
+    }
+
+    private RetrieveJournal retrieveJournal(LongSupplier clockMs) {
         final RetrieveConfig config = new RetrieveConfigBuilder().withAs400(() -> mock(AS400.class))
                 .withJournalInfo(new JournalInfo("JRN", "LIB", false)).withPrefetch(false)
                 .build();
         return new RetrieveJournal(config, journalInfoRetrieval, (as400, from, range) -> {
             calls++;
             throw new InvalidJournalRangeException("Call failed position " + from + " failed to find offset or invalid offsets: CPF7054");
-        });
+        }, clockMs);
     }
 
     private static JournalProcessedPosition position() {
@@ -93,6 +98,28 @@ class RetrieveJournalInvalidRangeTest {
         // from a range that was resolved badly, by looking the position up in the receiver list
         assertThrows(InvalidJournalRangeException.class, () -> rj.retrieveJournal(position()));
         assertEquals(5, calls);
+    }
+
+    @Test
+    void refusalsInsideTheDelayedHeadWindowNeverReachTheCaller() throws Exception {
+        // Given the default 5 s head delay polled every 500 ms: after a receiver roll the delayed head stays
+        // behind the position for ~10 polls, every one of them refused (issue #79)
+        when(journalInfoRetrieval.headDelayMs(any())).thenReturn(5_000L);
+        final long[] now = { 0 };
+        final RetrieveJournal rj = retrieveJournal(() -> now[0]);
+
+        // When the refusals last as long as the delay window itself
+        for (int i = 0; i < 10; i++) {
+            final int poll = i;
+            // Then none of them is escalated: the count alone would have raised the fifth
+            assertEquals(RetrievalState.NotCalled, assertDoesNotThrow(() -> rj.retrieveJournal(position()),
+                    "poll " + poll + " is still inside the delay window, the inversion is the expected transient"));
+            now[0] += 500;
+        }
+
+        // And once the refusal has outlasted the window by far, the caller decides what it means
+        now[0] += 10_000;
+        assertThrows(InvalidJournalRangeException.class, () -> rj.retrieveJournal(position()));
     }
 
     @Test
