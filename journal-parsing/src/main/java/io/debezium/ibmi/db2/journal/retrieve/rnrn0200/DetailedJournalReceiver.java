@@ -27,6 +27,11 @@ public record DetailedJournalReceiver(JournalReceiverInfo info, BigInteger start
                 this.maxEntryLength, this.numberOfEntries);
     }
 
+    /** This receiver seen only up to {@code end}: the head the journal cache has flushed, below the live one. */
+    public DetailedJournalReceiver withEnd(BigInteger end) {
+        return new DetailedJournalReceiver(info, start, end, nextReceiver, maxEntryLength, numberOfEntries);
+    }
+
     public boolean isSameReceiver(JournalProcessedPosition position) {
         if (info == null || position == null) {
             return false;
