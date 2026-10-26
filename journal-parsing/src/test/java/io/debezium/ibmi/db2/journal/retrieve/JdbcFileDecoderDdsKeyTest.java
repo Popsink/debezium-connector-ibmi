@@ -32,7 +32,7 @@ class JdbcFileDecoderDdsKeyTest {
 
     private final PreparedStatement statement = mock(PreparedStatement.class);
 
-    private JdbcFileDecoder decoderReturning(String dbxunq, String... keyColumns) throws Exception {
+    private JdbcFileDecoder decoderReturning(String accessPathType, String... keyColumns) throws Exception {
         final ResultSet rs = mock(ResultSet.class);
         final Boolean[] more = new Boolean[keyColumns.length];
         for (int i = 0; i < keyColumns.length; i++) {
@@ -44,7 +44,7 @@ class JdbcFileDecoderDdsKeyTest {
             rest[i - 1] = keyColumns[i];
         }
         when(rs.getString(1)).thenReturn(keyColumns[0], rest);
-        when(rs.getString(2)).thenReturn(dbxunq);
+        when(rs.getString(2)).thenReturn(accessPathType);
         when(statement.executeQuery()).thenReturn(rs);
 
         final Connection con = mock(Connection.class);
@@ -54,7 +54,7 @@ class JdbcFileDecoderDdsKeyTest {
 
     @Test
     void aUniqueDdsKeyKeysTheRecordsAndTheFileIsBoundByLibraryAndSystemName() throws Exception {
-        final JdbcFileDecoder decoder = decoderReturning("U", "ORDER_NO");
+        final JdbcFileDecoder decoder = decoderReturning("KEYED UNIQUE", "ORDER_NO");
 
         assertEquals(List.of("ORDER_NO"), decoder.ddsPrimaryKeys("ORDRS", "MYLIB"));
         verify(statement).setString(1, "MYLIB");
@@ -63,14 +63,14 @@ class JdbcFileDecoderDdsKeyTest {
 
     @Test
     void aDuplicateAllowingDdsKeyLeavesTheRecordsUnkeyed() throws Exception {
-        final JdbcFileDecoder decoder = decoderReturning("D", "ACCOUNT", "POSTED_ON");
+        final JdbcFileDecoder decoder = decoderReturning("KEYED NO ORDER", "ACCOUNT", "POSTED_ON");
 
         assertEquals(List.of(), decoder.ddsPrimaryKeys("GLDTL", "MYLIB"));
     }
 
     @Test
     void theDuplicateAllowingKeyIsKeptOnceUniquenessIsNoLongerRequired() throws Exception {
-        final JdbcFileDecoder decoder = decoderReturning("D", "ACCOUNT", "POSTED_ON");
+        final JdbcFileDecoder decoder = decoderReturning("KEYED NO ORDER", "ACCOUNT", "POSTED_ON");
         decoder.setRequireUniqueDdsKey(false);
 
         assertEquals(List.of("ACCOUNT", "POSTED_ON"), decoder.ddsPrimaryKeys("GLDTL", "MYLIB"));

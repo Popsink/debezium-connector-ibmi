@@ -85,11 +85,13 @@ REPLICATION_FACTOR=3
   That access path is an ordering, not an identity: unless the file was created with `UNIQUE`, IBM i
   accepts any number of records sharing one key value, and keying records on it makes every keyed
   destination - a compacted topic, a merged table - keep one record per key value and drop the rest.
-  The access path is therefore only used as the record key when `QSYS.QADBXREF.DBXUNQ` reports that
-  the file requires unique keys; a file that allows duplicates streams without a record key, and the
-  decision is logged per table. Set `dds.key.require.unique=false` to key records on a
-  duplicate-allowing access path anyway, which is only safe when the key is known to be unique in
-  practice. Files with a real SQL primary key are unaffected. Note that a table that loses its key
+  The access path is therefore only used as the record key when `QSYS2.SYSFILES.ACCESS_PATH_TYPE`
+  reports `KEYED UNIQUE` (IBM i 7.4 TR7 / 7.5 TR1 and later; `QSYS.QADBXREF.DBXUNQ` holds the same
+  flag but reading it needs an authority the connector user often lacks); a file that allows
+  duplicates streams without a record key, and the decision is logged per table. Set
+  `dds.key.require.unique=false` to key records on a duplicate-allowing access path anyway, which
+  is only safe when the key is known to be unique in practice. Files with a real SQL primary key
+  are unaffected. Note that a table that loses its key
   changes the key of its topic, so a destination loaded from it has to be re-loaded, and its records
   are no longer pinned to one partition by key - check that the affected topics are single-partition
   if update ordering per record matters.
