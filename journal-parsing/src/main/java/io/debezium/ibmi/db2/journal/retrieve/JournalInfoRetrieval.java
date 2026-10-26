@@ -83,6 +83,7 @@ public class JournalInfoRetrieval {
     private final DetailedJournalReceiverCache cache = new DetailedJournalReceiverCache();
     private Map<String, Boolean> isJournalCaching = new HashMap<>();
     private Map<JournalInfo, DelayedDetailedJournalReceiver> delayedCache = new HashMap<>();
+    private final Map<JournalInfo, VerifiedHead> verifiedHeads = new HashMap<>();
     private final long journalCacheDelay;
     private final long additionalJournalDelay;
     private final long pollInterval;
@@ -102,8 +103,9 @@ public class JournalInfoRetrieval {
     }
 
     /**
-     * How far behind live {@link #getDelayedDetailedJournalReceiver} holds the journal head. The cache wait
-     * only counts for a journal that caches, so zeroing the additional delay does not switch it off.
+     * How far behind live {@link #getDelayedDetailedJournalReceiver} may hold the journal head: the configured
+     * additional delay for a journal that does not cache, plus the cache wait time for one that does, whose
+     * head is proven readable rather than aged (see {@link #verifiedHead}) and can lag live by up to that long.
      */
     public long headDelayMs(JournalInfo journalLib) {
         return additionalJournalDelay + (journalLib.isCaching() ? journalCacheDelay : 0L);
@@ -139,9 +141,24 @@ public class JournalInfoRetrieval {
         throw new IllegalStateException("Journal not found");
     }
 
+    /**
+     * The head of the journal that it is safe to read up to.
+     *
+     * <p>On a caching journal the receiver reports entries as soon as they are deposited, but
+     * {@code QjoRetrieveJournalEntries} only returns them once the cache has been written to disk, up to the
+     * system's cache wait time later, and answers "no entries" in between (issue #104). The head is therefore
+     * not aged by a timer but proven: see {@link #verifiedHead}. The cache wait time and
+     * {@code journal.additional.delay} are not applied to it.</p>
+     *
+     * <p>A journal that does not cache has nothing to wait for; the configured additional delay is still
+     * honoured for it as before.</p>
+     */
     public Optional<DetailedJournalReceiver> getDelayedDetailedJournalReceiver(AS400 as400, JournalInfo journalLib)
             throws Exception {
         DetailedJournalReceiver dr = getCurrentDetailedJournalReceiver(as400, journalLib);
+        if (journalLib.isCaching()) {
+            return verifiedHead(as400, journalLib, dr);
+        }
         long totalDelay = headDelayMs(journalLib);
         if (totalDelay > 0) {
             if (!delayedCache.containsKey(journalLib)) {
@@ -155,6 +172,100 @@ public class JournalInfoRetrieval {
         else {
             return Optional.of(dr);
         }
+    }
+
+    /** what the server has proven readable for one caching journal, and the head seen on the previous poll */
+    static final class VerifiedHead {
+        DetailedJournalReceiver proven;
+        DetailedJournalReceiver previous;
+    }
+
+    /**
+     * The newest head the server has proven it can read, for a caching journal.
+     *
+     * <p>Entries are written from the cache to the receiver in sequence order, so if the entry at a head
+     * is retrievable every entry below it is too, and a range ending there can be trusted when the server
+     * says it is exhausted. The live head is probed first; under a steady workload its last entry usually
+     * still sits in the cache, so the head seen on the previous poll is probed next, which keeps the range
+     * end one poll behind live rather than a cache wait behind it. When neither is readable yet - a burst
+     * followed by silence leaves its tail cached for up to the cache wait time - the last proven head is
+     * kept, and the range simply does not grow until the cache is flushed. At most two small calls per
+     * poll, none when the head has not moved past what is already proven.</p>
+     *
+     * @return the head to resolve the range against, empty until a first head has been proven
+     */
+    Optional<DetailedJournalReceiver> verifiedHead(AS400 as400, JournalInfo journal, DetailedJournalReceiver live)
+            throws Exception {
+        final VerifiedHead state = verifiedHeads.computeIfAbsent(journal, j -> new VerifiedHead());
+        final DetailedJournalReceiver previous = state.previous;
+        state.previous = live;
+        if (isProvenUpTo(state.proven, live)) {
+            return Optional.of(state.proven);
+        }
+        if (isEntryRetrievable(as400, journal, live.info().receiver(), live.end())) {
+            state.proven = live;
+            return Optional.of(live);
+        }
+        if (previous != null && previous.isSameReceiver(live) && !isProvenUpTo(state.proven, previous)
+                && isEntryRetrievable(as400, journal, previous.info().receiver(), previous.end())) {
+            log.debug("journal head {} is still in the cache, reading up to the previous head {}", live.end(), previous.end());
+            state.proven = previous;
+            return Optional.of(previous);
+        }
+        if (state.proven == null) {
+            log.debug("journal head {} is still in the cache and no earlier head has been proven readable yet", live.end());
+            return Optional.empty();
+        }
+        log.debug("journal head {} is still in the cache, reading up to the proven head {}", live.end(), state.proven.end());
+        return Optional.of(state.proven);
+    }
+
+    private static boolean isProvenUpTo(DetailedJournalReceiver proven, DetailedJournalReceiver head) {
+        return proven != null && proven.isSameReceiver(head) && proven.end().compareTo(head.end()) >= 0;
+    }
+
+    /**
+     * Whether the journal entry at {@code sequence} can be retrieved now: one unfiltered
+     * {@code QjoRetrieveJournalEntries} call for that single entry, in the {@code RJNE0100} format so that
+     * an entry with lob data allocates no pointer handle in the host job. "No entries" (CPF7062) means the
+     * entry is still in the journal cache; a sequence the receiver does not hold (CPF7053) is not readable
+     * either and is left to the receiver-chain checks to explain. Anything else is a failure.
+     */
+    boolean isEntryRetrievable(AS400 as400, JournalInfo journal, JournalReceiver receiver, BigInteger sequence)
+            throws Exception {
+        final int bufferLength = 4096; // too small for a big entry is still a found entry: the API says so, successfully
+        final RetrievalCriteria criteria = new RetrievalCriteria(textFactory);
+        criteria.reset();
+        criteria.withReceiverRange(receiver.name(), receiver.library(), receiver.name(), receiver.library());
+        criteria.withFromEnt(sequence);
+        criteria.withEnd(sequence);
+        criteria.withMaxEntriesToReturn(1);
+        final String journalName = padRight(journal.journalName(), 10) + padRight(journal.journalLibrary(), 10);
+        final ProgramParameter[] parameters = new ProgramParameter[]{
+                new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, bufferLength),
+                new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, as400Bin4.toBytes(bufferLength)),
+                new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, as400Text20.toBytes(journalName)),
+                new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, as400Text8.toBytes("RJNE0100")),
+                new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE,
+                        new AS400Structure(criteria.getStructure()).toBytes(criteria.getObject())),
+                new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, as400Bin4.toBytes(0)) };
+        final ServiceProgramCall spc = new ServiceProgramCall(as400);
+        spc.getServerJob().setLoggingLevel(0);
+        spc.setProgram(JOURNAL_SERVICE_LIB, parameters);
+        spc.setProcedureName("QjoRetrieveJournalEntries");
+        spc.setAlignOn16Bytes(true);
+        spc.setReturnValueFormat(ServiceProgramCall.RETURN_INTEGER);
+        if (spc.run()) {
+            return true;
+        }
+        for (final AS400Message message : spc.getMessageList()) {
+            final String id = message.getID();
+            if ("CPF7062".equals(id) || "CPF7053".equals(id)) {
+                log.debug("entry {} of {} is not retrievable yet: {} {}", sequence, receiver, id, message.getText());
+                return false;
+            }
+        }
+        throw classifyServiceProgramFailure(JOURNAL_SERVICE_LIB, "QjoRetrieveJournalEntries", spc.getMessageList());
     }
 
     public static long getJournalCacheDurationInMilliseconds(Connect<Connection, SQLException> jdbcConnection) {

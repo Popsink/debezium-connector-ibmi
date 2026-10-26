@@ -132,7 +132,7 @@ public class RetrievalCriteria {
      * @param eKey
      * @param value
      */
-    private void withMaxEntriesToReturn(Integer value) {
+    public void withMaxEntriesToReturn(Integer value) {
         addStructureData(RetrieveKey.NBRENT, new AS400Bin4(), value);
     }
 
