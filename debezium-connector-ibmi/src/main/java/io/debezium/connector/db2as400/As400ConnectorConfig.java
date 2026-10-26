@@ -219,7 +219,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                     + "number of records sharing one key value, and keying records on it makes every keyed "
                     + "destination - a compacted topic, a merged table - keep only the last record of each key "
                     + "value and silently drop the rest. By default the access path is therefore only used when "
-                    + "QSYS.QADBXREF.DBXUNQ reports the file requires unique keys, and a file that allows "
+                    + "QSYS2.SYSFILES.ACCESS_PATH_TYPE reports KEYED UNIQUE, and a file that allows "
                     + "duplicates streams without a record key. Set to false to key records on a duplicate-"
                     + "allowing access path anyway, which is only safe when the key is known to be unique in "
                     + "practice. Files with a real SQL primary key are unaffected either way.",

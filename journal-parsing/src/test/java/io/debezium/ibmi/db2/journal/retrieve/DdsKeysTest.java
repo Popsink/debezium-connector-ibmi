@@ -27,8 +27,12 @@ import io.debezium.ibmi.db2.journal.retrieve.DdsKeys.DdsKey;
  */
 class DdsKeysTest {
 
-    /** One key field of a file whose {@code QADBXREF.DBXUNQ} is {@code unq}, as the catalog returns it (blank padded). */
-    private static ResultSet keyedFile(String unq, String... columns) throws SQLException {
+    /** Access path types as {@code SYSFILES.ACCESS_PATH_TYPE} spells them; any keyed type but UNIQUE allows duplicates. */
+    private static final String UNIQUE = "KEYED UNIQUE";
+    private static final String NO_ORDER = "KEYED NO ORDER";
+
+    /** One key field of a file whose {@code SYSFILES.ACCESS_PATH_TYPE} is {@code type}, as the catalog returns it. */
+    private static ResultSet keyedFile(String type, String... columns) throws SQLException {
         final ResultSet rs = mock(ResultSet.class);
         final Boolean[] more = new Boolean[columns.length];
         for (int i = 0; i < columns.length; i++) {
@@ -44,24 +48,30 @@ class DdsKeysTest {
             rest[i - 1] = columns[i] + "   ";
         }
         when(rs.getString(1)).thenReturn(columns[0] + "   ", rest);
-        when(rs.getString(2)).thenReturn(unq);
+        when(rs.getString(2)).thenReturn(type);
         return rs;
     }
 
     @Test
-    void theQueryFiltersNothingButCarriesTheUniquenessAttribute() {
-        // The filtering is done in Java so the rejected key can be named in the log; the attribute must
+    void theQueryFiltersNothingButCarriesTheAccessPathType() {
+        // The filtering is done in Java so the rejected key can be named in the log; the type must
         // therefore travel with the key columns rather than being read in a second round trip.
-        assertTrue(DdsKeys.KEY_COLUMNS.contains("qsys.QADBXREF"));
-        assertTrue(DdsKeys.KEY_COLUMNS.contains("x.DBXUNQ"));
-        assertTrue(DdsKeys.KEY_COLUMNS.contains("x.DBXLIB=k.DBKLIB"));
-        assertTrue(DdsKeys.KEY_COLUMNS.contains("x.DBXFIL=k.DBKFIL"));
+        assertTrue(DdsKeys.KEY_COLUMNS.contains("qsys2.SYSFILES"));
+        assertTrue(DdsKeys.KEY_COLUMNS.contains("f.ACCESS_PATH_TYPE"));
+        assertTrue(DdsKeys.KEY_COLUMNS.contains("f.SYSTEM_TABLE_SCHEMA=k.DBKLIB"));
+        assertTrue(DdsKeys.KEY_COLUMNS.contains("f.SYSTEM_TABLE_NAME=k.DBKFIL"));
         assertTrue(DdsKeys.KEY_COLUMNS.contains("ORDER BY k.DBKPOS ASC"));
+    }
+
+    /** QADBXREF holds the same flag but needs an authority on the cross-reference file that PUB400, for one, refuses (SQL0551). */
+    @Test
+    void theQueryNeverTouchesTheCrossReferenceFile() {
+        assertFalse(DdsKeys.KEY_COLUMNS.toUpperCase().contains("QADBXREF"));
     }
 
     @Test
     void readsTheKeyColumnsInKeyOrderTrimmed() throws Exception {
-        final DdsKey key = DdsKeys.read(keyedFile("U", "COMPANY", "ORDER_NO", "LINE_NO"));
+        final DdsKey key = DdsKeys.read(keyedFile(UNIQUE, "COMPANY", "ORDER_NO", "LINE_NO"));
 
         assertEquals(List.of("COMPANY", "ORDER_NO", "LINE_NO"), key.columns());
         assertTrue(key.unique());
@@ -69,7 +79,7 @@ class DdsKeysTest {
 
     @Test
     void aFileWithNoKeyedAccessPathReadsEmpty() throws Exception {
-        final DdsKey key = DdsKeys.read(keyedFile("U"));
+        final DdsKey key = DdsKeys.read(keyedFile(UNIQUE));
 
         assertEquals(List.of(), key.columns());
         assertFalse(key.unique());
@@ -77,10 +87,10 @@ class DdsKeysTest {
         assertEquals(List.of(), key.asRecordKey(false, "LIB", "FILE"));
     }
 
-    /** {@code DBXUNQ='U'}: the key is an identity, so it keys the records whatever the setting says. */
+    /** {@code KEYED UNIQUE}: the key is an identity, so it keys the records whatever the setting says. */
     @Test
     void aUniqueKeyIsAlwaysUsed() throws Exception {
-        final DdsKey key = DdsKeys.read(keyedFile("U", "ORDER_NO"));
+        final DdsKey key = DdsKeys.read(keyedFile(UNIQUE, "ORDER_NO"));
 
         assertTrue(key.unique());
         assertEquals(List.of("ORDER_NO"), key.asRecordKey(true, "LIB", "ORDERS"));
@@ -88,13 +98,13 @@ class DdsKeysTest {
     }
 
     /**
-     * {@code DBXUNQ='D'}: the regression this guards. Keying on it told every destination that records
+     * {@code KEYED NO ORDER}: the regression this guards. Keying on it told every destination that records
      * sharing the key value were versions of one row, so a merged table kept one of them - on the worst
      * file measured, 1.5 M rows out of 716.9 M records.
      */
     @Test
     void aDuplicateAllowingKeyIsDroppedByDefault() throws Exception {
-        final DdsKey key = DdsKeys.read(keyedFile("D", "ACCOUNT", "POSTED_ON"));
+        final DdsKey key = DdsKeys.read(keyedFile(NO_ORDER, "ACCOUNT", "POSTED_ON"));
 
         assertFalse(key.unique());
         assertEquals(List.of("ACCOUNT", "POSTED_ON"), key.columns());
@@ -104,15 +114,19 @@ class DdsKeysTest {
     /** The escape hatch, for an operator who knows the duplicate-allowing key is unique in practice. */
     @Test
     void aDuplicateAllowingKeyIsKeptWhenUniquenessIsNotRequired() throws Exception {
-        final DdsKey key = DdsKeys.read(keyedFile("D", "ACCOUNT", "POSTED_ON"));
+        final DdsKey key = DdsKeys.read(keyedFile(NO_ORDER, "ACCOUNT", "POSTED_ON"));
 
         assertEquals(List.of("ACCOUNT", "POSTED_ON"), key.asRecordKey(false, "LIB", "GLDETAIL"));
     }
 
-    /** The attribute comes back CHAR(1) blank padded, and a file with no uniqueness attribute at all is not unique. */
+    /** Only the UNIQUE path is an identity: the ordered duplicate-allowing kinds, a blank and a null type are not. */
     @Test
-    void theUniquenessAttributeIsTrimmedAndAnythingButUIsDuplicateAllowing() throws Exception {
-        assertTrue(DdsKeys.read(keyedFile("U ", "K")).unique());
+    void theAccessPathTypeIsTrimmedAndAnythingButKeyedUniqueIsDuplicateAllowing() throws Exception {
+        assertTrue(DdsKeys.read(keyedFile("KEYED UNIQUE ", "K")).unique());
+        assertTrue(DdsKeys.read(keyedFile("keyed unique", "K")).unique());
+        assertFalse(DdsKeys.read(keyedFile("KEYED FIFO", "K")).unique());
+        assertFalse(DdsKeys.read(keyedFile("KEYED LIFO", "K")).unique());
+        assertFalse(DdsKeys.read(keyedFile("KEYED FCFO", "K")).unique());
         assertFalse(DdsKeys.read(keyedFile(" ", "K")).unique());
         assertFalse(DdsKeys.read(keyedFile(null, "K")).unique());
     }
