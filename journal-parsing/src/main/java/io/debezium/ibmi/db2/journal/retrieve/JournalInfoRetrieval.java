@@ -174,46 +174,64 @@ public class JournalInfoRetrieval {
         }
     }
 
-    /** what the server has proven readable for one caching journal, and the head seen on the previous poll */
+    /**
+     * What the server has proven readable for one caching journal, and where the search for more starts
+     * while nothing on the current receiver is proven yet (the head first seen on it).
+     */
     static final class VerifiedHead {
         DetailedJournalReceiver proven;
-        DetailedJournalReceiver previous;
+        DetailedJournalReceiver anchor;
     }
+
+    /**
+     * Receiver variable of the stretch retrieve in {@link #newestRetrievable}, in bytes. It returns the
+     * flushed entries themselves, so this bounds how far the proven head can move per call. The cache is
+     * written out a whole buffer at a time (850 entries of a small row on PUB400, 285 KB in this format,
+     * every 9-13 s at 100 rows/s), so a call that takes one flush whole keeps the head one poll behind the
+     * flush; a block cut short still ends on a readable entry and the rest comes with the next poll.
+     * Allocated per call, and only when the head has moved past what is proven.
+     */
+    static final int RANGE_PROBE_BUFFER = 1024 * 1024;
 
     /**
      * The newest head the server has proven it can read, for a caching journal.
      *
-     * <p>Entries are written from the cache to the receiver in sequence order, so if the entry at a head
-     * is retrievable every entry below it is too, and a range ending there can be trusted when the server
-     * says it is exhausted. The live head is probed first; under a steady workload its last entry usually
-     * still sits in the cache, so the head seen on the previous poll is probed next, which keeps the range
-     * end one poll behind live rather than a cache wait behind it. When neither is readable yet - a burst
-     * followed by silence leaves its tail cached for up to the cache wait time - the last proven head is
-     * kept, and the range simply does not grow until the cache is flushed. At most two small calls per
-     * poll, none when the head has not moved past what is already proven.</p>
+     * <p>Entries are written from the cache to the receiver in sequence order, so if an entry is
+     * retrievable every entry below it is too, and a range ending there can be trusted when the server
+     * says it is exhausted. The server is asked for the whole stretch from the proven head to live,
+     * unfiltered: it returns the entries flushed so far and stops at the cache, and the last entry it
+     * returns is the newest readable one. No entry is guessed at and probed on its own: the cache is
+     * flushed a whole buffer at a time, and the newest entry deposited is held back until the journal has
+     * been idle for a while (~23 s on PUB400), so while anything is being written the live head is
+     * almost never readable and no fixed point below it can be trusted either. When nothing has flushed
+     * since the previous poll the proven head is kept, and the range simply does not grow until the cache
+     * is flushed. One call per poll, none when the head has not moved past what is already proven.</p>
      *
      * @return the head to resolve the range against, empty until a first head has been proven
      */
     Optional<DetailedJournalReceiver> verifiedHead(AS400 as400, JournalInfo journal, DetailedJournalReceiver live)
             throws Exception {
         final VerifiedHead state = verifiedHeads.computeIfAbsent(journal, j -> new VerifiedHead());
-        final DetailedJournalReceiver previous = state.previous;
-        state.previous = live;
         if (isProvenUpTo(state.proven, live)) {
             return Optional.of(state.proven);
         }
-        if (isEntryRetrievable(as400, journal, live.info().receiver(), live.end())) {
-            state.proven = live;
-            return Optional.of(live);
+        if (state.anchor == null || !state.anchor.isSameReceiver(live)) {
+            state.anchor = live;
         }
-        if (previous != null && previous.isSameReceiver(live) && !isProvenUpTo(state.proven, previous)
-                && isEntryRetrievable(as400, journal, previous.info().receiver(), previous.end())) {
-            log.debug("journal head {} is still in the cache, reading up to the previous head {}", live.end(), previous.end());
-            state.proven = previous;
-            return Optional.of(previous);
+        final BigInteger from = (state.proven != null && state.proven.isSameReceiver(live))
+                ? state.proven.end().add(BigInteger.ONE)
+                : state.anchor.end();
+        final Optional<BigInteger> newest = newestRetrievable(as400, journal, live.info().receiver(), from, live.end());
+        if (newest.isPresent()) {
+            if (newest.get().compareTo(live.end()) < 0) {
+                log.debug("journal head {} is still in the cache, reading up to {}, the newest entry flushed", live.end(),
+                        newest.get());
+            }
+            state.proven = live.withEnd(newest.get());
+            return Optional.of(state.proven);
         }
         if (state.proven == null) {
-            log.debug("journal head {} is still in the cache and no earlier head has been proven readable yet", live.end());
+            log.debug("journal head {} is still in the cache and nothing below it has been proven readable yet", live.end());
             return Optional.empty();
         }
         log.debug("journal head {} is still in the cache, reading up to the proven head {}", live.end(), state.proven.end());
@@ -225,21 +243,49 @@ public class JournalInfoRetrieval {
     }
 
     /**
-     * Whether the journal entry at {@code sequence} can be retrieved now: one unfiltered
-     * {@code QjoRetrieveJournalEntries} call for that single entry, in the {@code RJNE0100} format so that
-     * an entry with lob data allocates no pointer handle in the host job. "No entries" (CPF7062) means the
-     * entry is still in the journal cache; a sequence the receiver does not hold (CPF7053) is not readable
-     * either and is left to the receiver-chain checks to explain. Anything else is a failure.
+     * The newest entry in {@code [from, to]} the server can retrieve now: one unfiltered
+     * {@code QjoRetrieveJournalEntries} call over the range, which returns the entries already flushed from
+     * the journal cache and stops at the first that is not, so the last entry returned is the answer. Empty
+     * when none of the range has flushed yet. A block cut short by {@link #RANGE_PROBE_BUFFER} still ends on
+     * a readable entry; it is just not the newest.
      */
-    boolean isEntryRetrievable(AS400 as400, JournalInfo journal, JournalReceiver receiver, BigInteger sequence)
+    Optional<BigInteger> newestRetrievable(AS400 as400, JournalInfo journal, JournalReceiver receiver, BigInteger from,
+                                           BigInteger to)
             throws Exception {
-        final int bufferLength = 4096; // too small for a big entry is still a found entry: the API says so, successfully
+        final Optional<byte[]> data = retrieveUnfiltered(as400, journal, receiver, from, to, RANGE_PROBE_BUFFER);
+        if (data.isEmpty()) {
+            return Optional.empty();
+        }
+        // RJNE0100: offset to the first entry header at 4, entries retrieved at 8; each entry header holds the
+        // displacement to the next at 0 and, after four displacements, the sequence number as 20 characters
+        // at 16 (RJNE0200 has six displacements and its sequence number at 24: the two formats differ here)
+        final byte[] block = data.get();
+        final int entries = decodeInt(block, 8);
+        int offset = decodeInt(block, 4);
+        if (entries == 0 || offset <= 0) {
+            return Optional.empty();
+        }
+        for (int i = 1; i < entries; i++) {
+            offset += decodeInt(block, offset);
+        }
+        return Optional.of(decodeBigIntFromString(block, offset + 16));
+    }
+
+    /**
+     * One unfiltered {@code QjoRetrieveJournalEntries} call over {@code [from, to]} of {@code receiver}, in
+     * the {@code RJNE0100} format so that an entry with lob data allocates no pointer handle in the host job.
+     * "No entries" (CPF7062) means the range is still in the journal cache; a sequence the receiver does not
+     * hold (CPF7053) is not readable either and is left to the receiver-chain checks to explain. Both come
+     * back empty; anything else is a failure.
+     */
+    private Optional<byte[]> retrieveUnfiltered(AS400 as400, JournalInfo journal, JournalReceiver receiver, BigInteger from,
+                                                BigInteger to, int bufferLength)
+            throws Exception {
         final RetrievalCriteria criteria = new RetrievalCriteria(textFactory);
         criteria.reset();
         criteria.withReceiverRange(receiver.name(), receiver.library(), receiver.name(), receiver.library());
-        criteria.withFromEnt(sequence);
-        criteria.withEnd(sequence);
-        criteria.withMaxEntriesToReturn(1);
+        criteria.withFromEnt(from);
+        criteria.withEnd(to);
         final String journalName = padRight(journal.journalName(), 10) + padRight(journal.journalLibrary(), 10);
         final ProgramParameter[] parameters = new ProgramParameter[]{
                 new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, bufferLength),
@@ -256,13 +302,13 @@ public class JournalInfoRetrieval {
         spc.setAlignOn16Bytes(true);
         spc.setReturnValueFormat(ServiceProgramCall.RETURN_INTEGER);
         if (spc.run()) {
-            return true;
+            return Optional.of(parameters[0].getOutputData());
         }
         for (final AS400Message message : spc.getMessageList()) {
             final String id = message.getID();
             if ("CPF7062".equals(id) || "CPF7053".equals(id)) {
-                log.debug("entry {} of {} is not retrievable yet: {} {}", sequence, receiver, id, message.getText());
-                return false;
+                log.debug("entries {}-{} of {} are not retrievable yet: {} {}", from, to, receiver, id, message.getText());
+                return Optional.empty();
             }
         }
         throw classifyServiceProgramFailure(JOURNAL_SERVICE_LIB, "QjoRetrieveJournalEntries", spc.getMessageList());
