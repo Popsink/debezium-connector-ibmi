@@ -19,7 +19,6 @@ import java.util.Optional;
 import java.util.TimeZone;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 
@@ -97,10 +96,6 @@ public class RetrieveJournal {
     private final LongSupplier clockMs;
     /** when the current run of refusals began, meaningful only while {@link #invalidRanges} is not zero */
     private long firstInvalidRangeMs;
-    /** times the position moved to the end of the range asked for, see {@link #jumpToRangeEnd} */
-    private final AtomicLong rangeEndJumps = new AtomicLong();
-    /** those of {@link #rangeEndJumps} to an end the server had not proven readable */
-    private final AtomicLong unprovenRangeEndJumps = new AtomicLong();
 
     public RetrieveJournal(RetrieveConfig config, JournalInfoRetrieval journalRetrieval) {
         this(config, journalRetrieval, null);
@@ -442,7 +437,6 @@ public class RetrieveJournal {
             this.position.setPosition(header.nextPosition());
         }
         if (!hasData()) {
-            jumpToRangeEnd(previousPosition, block.end());
             this.position.setPosition(block.end());
         }
         final MoreData more = moreDataAfter(header, block.range());
@@ -675,41 +669,7 @@ public class RetrieveJournal {
         // after we hit the end use the continuation header for the next offset
         final JournalProcessedPosition nextOffset = header.nextPosition();
         log.debug("Setting continuation offset {}", nextOffset);
-        if (!header.hasFutureDataAvailable()) {
-            // no continuation: the next position is the end of the range asked for, not one the server gave
-            jumpToRangeEnd(position, nextOffset);
-        }
         position.setPosition(nextOffset);
-    }
-
-    /**
-     * The position is about to move to the end of the range asked for, past whatever the server did not
-     * return: nothing matched the filters there, which is the normal case at the head, or the server could
-     * not read it yet, which loses those entries for good (issue #103). Every jump is counted; one to an end
-     * the server had not proven readable is the second case and is logged at WARN.
-     */
-    private void jumpToRangeEnd(JournalProcessedPosition from, JournalProcessedPosition end) {
-        rangeEndJumps.incrementAndGet();
-        if (!journalInfoRetrieval.isProvenReadable(config.journalInfo(), end)) {
-            final long unproven = unprovenRangeEndJumps.incrementAndGet();
-            log.warn("moving the position from {} to the end of the range asked for {}, which the server has not proven "
-                    + "readable on the caching journal {}/{}: any entry still in the journal cache up to it is skipped "
-                    + "(issue #103), {} such jumps since start", from, end, config.journalInfo().journalLibrary(),
-                    config.journalInfo().journalName(), unproven);
-        }
-        else {
-            log.debug("moving the position from {} to the end of the range asked for {}", from, end);
-        }
-    }
-
-    /** How many times the position moved to the end of the range asked for, past entries the server did not return. */
-    public long rangeEndJumps() {
-        return rangeEndJumps.get();
-    }
-
-    /** How many of {@link #rangeEndJumps()} went to an end the server had not proven readable; should stay 0. */
-    public long unprovenRangeEndJumps() {
-        return unprovenRangeEndJumps.get();
     }
 
     static boolean alreadyProcessed(JournalProcessedPosition position, EntryHeader entryHeader) {

@@ -82,12 +82,15 @@ public class JournalInfoRetrieval {
     private final AS400Bin4 as400Bin4 = new AS400Bin4();
     private static final int KEY_HEADER_LENGTH = 20;
     private final DetailedJournalReceiverCache cache = new DetailedJournalReceiverCache();
-    private Map<String, Boolean> isJournalCaching = new HashMap<>();
+    /** the caching flag as last read from the server: at startup, then with every poll's attached receiver */
+    private final Map<String, Boolean> isJournalCaching = new ConcurrentHashMap<>();
     private Map<JournalInfo, DelayedDetailedJournalReceiver> delayedCache = new HashMap<>();
     private final Map<JournalInfo, VerifiedHead> verifiedHeads = new HashMap<>();
-    /** the caching flag read along with the attached receiver, so it follows a CHGJRN JRNCACHE while running */
-    private final Map<String, Boolean> observedCaching = new ConcurrentHashMap<>();
-    /** whether {@link #getDelayedDetailedJournalReceiver} last read the journal as caching, to notice a change */
+    /**
+     * the regime {@link #getDelayedDetailedJournalReceiver} last chose for the journal: a snapshot of
+     * {@link #isJournalCaching}, taken once per resolved range, so that a flag read in between (by
+     * {@link #getCurrentPosition} for instance) changes nothing until the next range is resolved
+     */
     private final Map<String, Boolean> cachingInForce = new HashMap<>();
     private final long journalCacheDelay;
     private final long additionalJournalDelay;
@@ -117,50 +120,36 @@ public class JournalInfoRetrieval {
     }
 
     /**
-     * Whether the journal caches now: the flag read with its attached receiver on the latest poll, or the one
-     * read at startup until a poll has read it. A journal switched to {@code JRNCACHE(*YES)} while the connector
-     * runs and still read on the timer loses the cached tail of every range (issue #103).
+     * Whether the journal is read as caching: the regime chosen when the current range was resolved, or the
+     * flag read at startup until a range has been.
      */
-    public boolean isCaching(JournalInfo journal) {
-        return observedCaching.getOrDefault(journalKey(journal), journal.isCaching());
+    private boolean isCaching(JournalInfo journal) {
+        return cachingInForce.getOrDefault(journalKey(journal.journalName(), journal.journalLibrary()), journal.isCaching());
     }
 
-    /** Records the journal's caching flag as just read from the server. */
+    /**
+     * Records the journal's caching flag as just read from the server. It takes effect with the next range
+     * resolved, see {@link #cachingRegime}.
+     */
     void observeCaching(JournalInfo journal, boolean caching) {
-        observedCaching.put(journalKey(journal), caching);
+        isJournalCaching.put(journalKey(journal.journalName(), journal.journalLibrary()), caching);
     }
 
-    private static String journalKey(JournalInfo journal) {
-        return journal.journalLibrary() + "/" + journal.journalName();
-    }
-
-    /**
-     * Whether the server has proven it can read the journal up to {@code end}: always for a journal that does
-     * not cache, and for one that does only up to the head {@link #verifiedHead} proved. An end on another
-     * receiver than the proven head is on an older one, since the range is resolved against that head, and a
-     * detached receiver has been written out whole.
-     */
-    public boolean isProvenReadable(JournalInfo journal, JournalProcessedPosition end) {
-        if (!isCaching(journal)) {
-            return true;
-        }
-        final VerifiedHead state = verifiedHeads.get(journal);
-        if (state == null || state.proven == null) {
-            return false;
-        }
-        if (!state.proven.isSameReceiver(end)) {
-            return true;
-        }
-        return end.getOffset().compareTo(state.proven.end()) <= 0;
+    private static String journalKey(String journalName, String journalLib) {
+        return journalName + journalLib;
     }
 
     /**
-     * The regime to read the journal head with, logging a switch between the two. What either regime knew
-     * about the head is dropped on a switch: the timer starts again from now, the proven head from nothing.
+     * The regime to read the journal head with for the range being resolved: the caching flag read with this
+     * poll's attached receiver, so that a journal switched to {@code JRNCACHE(*YES)} while the connector runs
+     * is no longer read on the timer, which loses the cached tail of every range (issue #103). A switch either
+     * way is logged, and what the other regime knew about the head is dropped: the timer starts again from
+     * now, the proven head from nothing, and nothing is read until the new regime has a head.
      */
     private boolean cachingRegime(JournalInfo journal) {
-        final boolean caching = isCaching(journal);
-        final Boolean previous = cachingInForce.put(journalKey(journal), caching);
+        final String key = journalKey(journal.journalName(), journal.journalLibrary());
+        final boolean caching = isJournalCaching.getOrDefault(key, journal.isCaching());
+        final Boolean previous = cachingInForce.put(key, caching);
         final boolean wasCaching = previous == null ? journal.isCaching() : previous;
         if (caching != wasCaching) {
             verifiedHeads.remove(journal);
@@ -559,7 +548,7 @@ public class JournalInfoRetrieval {
     }
 
     private boolean isJournalCaching(AS400 as400, final String journalName, final String journalLib) throws Exception {
-        String key = journalName + journalLib;
+        String key = journalKey(journalName, journalLib);
         if (isJournalCaching.containsKey(key)) {
             return isJournalCaching.get(key);
         }

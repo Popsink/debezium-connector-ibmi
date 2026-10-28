@@ -19,16 +19,4 @@ public interface As400ChangeEventSourceMetricsMXBean extends StreamingChangeEven
      * full buffer - see {@code CatchUpTrend}. Zero while the connector is keeping up or gaining ground.
      */
     int getJournalBehindGrowthSamples();
-
-    /**
-     * How many times the position moved to the end of the range asked for, past entries the server did not
-     * return. Normal at the head when nothing there matches the filters.
-     */
-    long getRangeEndJumps();
-
-    /**
-     * How many of {@link #getRangeEndJumps()} went to an end the server had not proven readable on a caching
-     * journal, where entries still in the cache are skipped (issue #103). Should stay 0.
-     */
-    long getUnprovenRangeEndJumps();
 }

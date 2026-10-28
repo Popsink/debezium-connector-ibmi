@@ -6,7 +6,6 @@
 package io.debezium.ibmi.db2.journal.retrieve;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doReturn;
@@ -16,7 +15,6 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 import java.math.BigInteger;
-import java.time.Instant;
 import java.util.Date;
 import java.util.Optional;
 
@@ -197,10 +195,6 @@ class JournalInfoRetrievalVerifiedHeadTest {
         verify(retrieval, never()).newestRetrievable(any(), any(), any(), any(), any());
     }
 
-    private static JournalProcessedPosition at(JournalReceiver rcv, long offset) {
-        return new JournalProcessedPosition(BigInteger.valueOf(offset), rcv, Instant.EPOCH, true);
-    }
-
     @Test
     void aJournalSwitchedToCachingWhileRunningIsReadUpToTheProvenHead() throws Exception {
         final JournalInfo startedPlain = new JournalInfo("JRN", "LIB", false);
@@ -218,8 +212,18 @@ class JournalInfoRetrievalVerifiedHeadTest {
 
         assertEquals(Optional.of(live), retrieval.getDelayedDetailedJournalReceiver(as400, startedPlain));
         assertEquals(35_000L, retrieval.headDelayMs(startedPlain));
-        assertTrue(retrieval.isProvenReadable(startedPlain, at(receiver, 120)));
-        assertFalse(retrieval.isProvenReadable(startedPlain, at(receiver, 121)));
+    }
+
+    @Test
+    void aFlagReadBetweenTwoRangesOnlyTakesEffectWithTheNextRange() throws Exception {
+        final JournalInfo startedPlain = new JournalInfo("JRN", "LIB", false);
+        doReturn(head(100)).when(retrieval).getCurrentDetailedJournalReceiver(as400, startedPlain);
+        retrieval.getDelayedDetailedJournalReceiver(as400, startedPlain);
+
+        // e.g. read by getCurrentPosition for the diagnostics while the range resolved on the timer is read
+        retrieval.observeCaching(startedPlain, true);
+        assertEquals(5_000L, retrieval.headDelayMs(startedPlain), "the range in progress keeps the regime it was resolved with");
+        verify(retrieval, never()).newestRetrievable(any(), any(), any(), any(), any());
     }
 
     @Test
@@ -234,20 +238,5 @@ class JournalInfoRetrievalVerifiedHeadTest {
         assertTrue(retrieval.getDelayedDetailedJournalReceiver(as400, caching).isEmpty());
         verify(retrieval, times(1)).newestRetrievable(any(), any(), any(), any(), any());
         assertEquals(5_000L, retrieval.headDelayMs(caching));
-        assertTrue(retrieval.isProvenReadable(caching, at(receiver, 1_000)), "a journal that does not cache has nothing to prove");
-    }
-
-    @Test
-    void onlyARangeEndUpToTheProvenHeadIsProvenReadable() throws Exception {
-        assertFalse(retrieval.isProvenReadable(caching, at(receiver, 100)), "nothing proven yet");
-
-        live(head(100));
-        flushedUpTo(receiver, 100, 100, 100L);
-        retrieval.getDelayedDetailedJournalReceiver(as400, caching);
-
-        assertTrue(retrieval.isProvenReadable(caching, at(receiver, 100)));
-        assertFalse(retrieval.isProvenReadable(caching, at(receiver, 101)));
-        assertTrue(retrieval.isProvenReadable(caching, at(new JournalReceiver("RCV0", "LIB"), 5_000)),
-                "an older receiver has been written out whole");
     }
 }
