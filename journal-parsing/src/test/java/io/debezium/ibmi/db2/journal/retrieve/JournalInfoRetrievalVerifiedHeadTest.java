@@ -194,4 +194,49 @@ class JournalInfoRetrievalVerifiedHeadTest {
         retrieval.getDelayedDetailedJournalReceiver(as400, plain);
         verify(retrieval, never()).newestRetrievable(any(), any(), any(), any(), any());
     }
+
+    @Test
+    void aJournalSwitchedToCachingWhileRunningIsReadUpToTheProvenHead() throws Exception {
+        final JournalInfo startedPlain = new JournalInfo("JRN", "LIB", false);
+        doReturn(head(100)).when(retrieval).getCurrentDetailedJournalReceiver(as400, startedPlain);
+        retrieval.getDelayedDetailedJournalReceiver(as400, startedPlain);
+        verify(retrieval, never()).newestRetrievable(any(), any(), any(), any(), any());
+        assertEquals(5_000L, retrieval.headDelayMs(startedPlain));
+
+        // CHGJRN JRNCACHE(*YES) while running: the flag read with the next poll's receiver switches the regime
+        retrieval.observeCaching(startedPlain, true);
+        final DetailedJournalReceiver live = head(120);
+        doReturn(live).when(retrieval).getCurrentDetailedJournalReceiver(as400, startedPlain);
+        doReturn(Optional.of(BigInteger.valueOf(120))).when(retrieval)
+                .newestRetrievable(as400, startedPlain, receiver, BigInteger.valueOf(120), BigInteger.valueOf(120));
+
+        assertEquals(Optional.of(live), retrieval.getDelayedDetailedJournalReceiver(as400, startedPlain));
+        assertEquals(35_000L, retrieval.headDelayMs(startedPlain));
+    }
+
+    @Test
+    void aFlagReadBetweenTwoRangesOnlyTakesEffectWithTheNextRange() throws Exception {
+        final JournalInfo startedPlain = new JournalInfo("JRN", "LIB", false);
+        doReturn(head(100)).when(retrieval).getCurrentDetailedJournalReceiver(as400, startedPlain);
+        retrieval.getDelayedDetailedJournalReceiver(as400, startedPlain);
+
+        // e.g. read by getCurrentPosition for the diagnostics while the range resolved on the timer is read
+        retrieval.observeCaching(startedPlain, true);
+        assertEquals(5_000L, retrieval.headDelayMs(startedPlain), "the range in progress keeps the regime it was resolved with");
+        verify(retrieval, never()).newestRetrievable(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void aJournalThatStopsCachingWhileRunningGoesBackToTheTimer() throws Exception {
+        live(head(100));
+        flushedUpTo(receiver, 100, 100, 100L);
+        retrieval.getDelayedDetailedJournalReceiver(as400, caching);
+
+        retrieval.observeCaching(caching, false);
+        live(head(120));
+        // the timer starts again from now, so nothing is old enough yet, and nothing is asked of the server
+        assertTrue(retrieval.getDelayedDetailedJournalReceiver(as400, caching).isEmpty());
+        verify(retrieval, times(1)).newestRetrievable(any(), any(), any(), any(), any());
+        assertEquals(5_000L, retrieval.headDelayMs(caching));
+    }
 }

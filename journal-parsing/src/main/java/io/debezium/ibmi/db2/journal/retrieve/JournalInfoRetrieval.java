@@ -18,6 +18,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -81,9 +82,16 @@ public class JournalInfoRetrieval {
     private final AS400Bin4 as400Bin4 = new AS400Bin4();
     private static final int KEY_HEADER_LENGTH = 20;
     private final DetailedJournalReceiverCache cache = new DetailedJournalReceiverCache();
-    private Map<String, Boolean> isJournalCaching = new HashMap<>();
+    /** the caching flag as last read from the server: at startup, then with every poll's attached receiver */
+    private final Map<String, Boolean> isJournalCaching = new ConcurrentHashMap<>();
     private Map<JournalInfo, DelayedDetailedJournalReceiver> delayedCache = new HashMap<>();
     private final Map<JournalInfo, VerifiedHead> verifiedHeads = new HashMap<>();
+    /**
+     * the regime {@link #getDelayedDetailedJournalReceiver} last chose for the journal: a snapshot of
+     * {@link #isJournalCaching}, taken once per resolved range, so that a flag read in between (by
+     * {@link #getCurrentPosition} for instance) changes nothing until the next range is resolved
+     */
+    private final Map<String, Boolean> cachingInForce = new HashMap<>();
     private final long journalCacheDelay;
     private final long additionalJournalDelay;
     private final long pollInterval;
@@ -108,7 +116,54 @@ public class JournalInfoRetrieval {
      * head is proven readable rather than aged (see {@link #verifiedHead}) and can lag live by up to that long.
      */
     public long headDelayMs(JournalInfo journalLib) {
-        return additionalJournalDelay + (journalLib.isCaching() ? journalCacheDelay : 0L);
+        return additionalJournalDelay + (isCaching(journalLib) ? journalCacheDelay : 0L);
+    }
+
+    /**
+     * Whether the journal is read as caching: the regime chosen when the current range was resolved, or the
+     * flag read at startup until a range has been.
+     */
+    private boolean isCaching(JournalInfo journal) {
+        return cachingInForce.getOrDefault(journalKey(journal.journalName(), journal.journalLibrary()), journal.isCaching());
+    }
+
+    /**
+     * Records the journal's caching flag as just read from the server. It takes effect with the next range
+     * resolved, see {@link #cachingRegime}.
+     */
+    void observeCaching(JournalInfo journal, boolean caching) {
+        isJournalCaching.put(journalKey(journal.journalName(), journal.journalLibrary()), caching);
+    }
+
+    private static String journalKey(String journalName, String journalLib) {
+        return journalName + journalLib;
+    }
+
+    /**
+     * The regime to read the journal head with for the range being resolved: the caching flag read with this
+     * poll's attached receiver, so that a journal switched to {@code JRNCACHE(*YES)} while the connector runs
+     * is no longer read on the timer, which loses the cached tail of every range (issue #103). A switch either
+     * way is logged, and what the other regime knew about the head is dropped: the timer starts again from
+     * now, the proven head from nothing, and nothing is read until the new regime has a head.
+     */
+    private boolean cachingRegime(JournalInfo journal) {
+        final String key = journalKey(journal.journalName(), journal.journalLibrary());
+        final boolean caching = isJournalCaching.getOrDefault(key, journal.isCaching());
+        final Boolean previous = cachingInForce.put(key, caching);
+        final boolean wasCaching = previous == null ? journal.isCaching() : previous;
+        if (caching != wasCaching) {
+            verifiedHeads.remove(journal);
+            delayedCache.remove(journal);
+            if (caching) {
+                log.warn("journal {}/{} now caches: reading up to the head the server proves readable instead of {}ms "
+                        + "behind live (issue #103)", journal.journalLibrary(), journal.journalName(), additionalJournalDelay);
+            }
+            else {
+                log.warn("journal {}/{} no longer caches: reading its head {}ms behind live", journal.journalLibrary(),
+                        journal.journalName(), additionalJournalDelay);
+            }
+        }
+        return caching;
     }
 
     public JournalPosition getCurrentPosition(AS400 as400, JournalInfo journalLib) throws Exception {
@@ -156,7 +211,7 @@ public class JournalInfoRetrieval {
     public Optional<DetailedJournalReceiver> getDelayedDetailedJournalReceiver(AS400 as400, JournalInfo journalLib)
             throws Exception {
         DetailedJournalReceiver dr = getCurrentDetailedJournalReceiver(as400, journalLib);
-        if (journalLib.isCaching()) {
+        if (cachingRegime(journalLib)) {
             return verifiedHead(as400, journalLib, dr);
         }
         long totalDelay = headDelayMs(journalLib);
@@ -493,7 +548,7 @@ public class JournalInfoRetrieval {
     }
 
     private boolean isJournalCaching(AS400 as400, final String journalName, final String journalLib) throws Exception {
-        String key = journalName + journalLib;
+        String key = journalKey(journalName, journalLib);
         if (isJournalCaching.containsKey(key)) {
             return isJournalCaching.get(key);
         }
@@ -544,6 +599,8 @@ public class JournalInfoRetrieval {
             // receivers are attached.
             final String journalReceiver = decodeString(b, 200, 10);
             final String journalLibrary = decodeString(b, 210, 10);
+            // journal cache, same field isJournalCaching reads: free to refresh with every poll's receiver
+            observeCaching(journalLib, "1".equals(decodeString(b, 195, 1)));
             return new JournalReceiver(journalReceiver, journalLibrary);
         });
     }
