@@ -442,13 +442,15 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
             final boolean bufferFull = state == RetrievalState.MoreDataAvailable;
             final int growthSamples = catchUpTrend.record(behind, bufferFull);
             streamingMetrics.setJournalBehindGrowthSamples(growthSamples);
+            streamingMetrics.setRangeEndJumps(retrieveJournal.rangeEndJumps(), retrieveJournal.unprovenRangeEndJumps());
             final FirstHeader header = retrieveJournal.getFirstHeader();
             log.info("Current position diagnostics last call {}, header {}, behind {}, parked on receiver {} at offset {}, "
                     + "current receiver {}, last block rpc {}ms waited {}ms consumed {}ms, small call {}ms, {}, "
-                    + "lag growth samples {}", state, header, behind, position.getReceiver(), position.getOffset(),
+                    + "lag growth samples {}, range end jumps {} ({} unproven)", state, header, behind, position.getReceiver(),
+                    position.getOffset(),
                     currentReceiver, retrieveJournal.lastRpcMs(), retrieveJournal.lastWaitMs(), lastConsumedMs,
                     smallCallMs, describeLink(header == null ? 0 : header.totalBytes(), retrieveJournal.lastRpcMs(), smallCallMs),
-                    growthSamples);
+                    growthSamples, retrieveJournal.rangeEndJumps(), retrieveJournal.unprovenRangeEndJumps());
             if (growthSamples >= CatchUpTrend.WARN_AFTER) {
                 log.warn("CANNOT CATCH UP: lag grew for {} consecutive samples (now {} behind) with a full {} byte buffer "
                         + "every call; the journal grows faster than this connection reads it and the position will fall out "
