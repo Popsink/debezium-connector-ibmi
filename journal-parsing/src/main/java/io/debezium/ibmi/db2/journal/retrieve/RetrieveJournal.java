@@ -15,6 +15,7 @@ import java.text.SimpleDateFormat;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Date;
+import java.util.List;
 import java.util.Optional;
 import java.util.TimeZone;
 import java.util.concurrent.ExecutionException;
@@ -117,6 +118,8 @@ public class RetrieveJournal {
         builder = new ParameterListBuilder(config.textFactory());
         pointerHandles = new PointerHandles(config.pointerHandleThreshold());
         journalReceivers = new ReceiverPagination(journalRetrieval, config.maxServerSideEntries(), config.journalInfo());
+        // the head probe asks for no more than the read, or it needs *OBJEXIST on the journal (issue #5680)
+        journalRetrieval.filterHeadProbe(config.filtering() ? config.includeFiles() : List.of());
 
         builder.withJournal(config.journalInfo().journalName(), config.journalInfo().journalLibrary());
     }
