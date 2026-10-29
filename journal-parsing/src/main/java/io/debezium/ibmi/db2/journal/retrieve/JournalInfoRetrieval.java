@@ -41,6 +41,7 @@ import com.ibm.as400.access.QSYSObjectPathName;
 import com.ibm.as400.access.ServiceProgramCall;
 
 import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
+import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalFilterException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.JournalReceiverNotFoundException;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.DetailedJournalReceiver;
 import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.JournalReceiverInfo;
@@ -72,6 +73,9 @@ public class JournalInfoRetrieval {
      */
     static final Set<String> RECEIVER_NOT_FOUND_MESSAGE_IDS = Set.of("CPF9801", "CPF9810", "CPF9812", "CPF7025");
 
+    /** CPF9802 / CPF2189: not authorized to the object, here the journal or a file of the probe's filter */
+    static final Set<String> NOT_AUTHORIZED_MESSAGE_IDS = Set.of("CPF9802", "CPF2189");
+
     private final As400TextFactory textFactory;
     private final byte[] emptyAs400Text;
     private final AS400Text as400Text8;
@@ -92,6 +96,13 @@ public class JournalInfoRetrieval {
      * {@link #getCurrentPosition} for instance) changes nothing until the next range is resolved
      */
     private final Map<String, Boolean> cachingInForce = new HashMap<>();
+    /** caching journals whose head probe the server refused: read on the timer until restart (issue #5680) */
+    private final Set<String> probeRefused = new HashSet<>();
+    /**
+     * the files the head probe is restricted to, the same as the read's: with none, the server requires
+     * {@code *OBJEXIST} on the journal on top of {@code *USE} (QJORJRNE, "Authorities and Locks")
+     */
+    private volatile List<FileFilter> probeFiles = List.of();
     private final long journalCacheDelay;
     private final long additionalJournalDelay;
     private final long pollInterval;
@@ -166,6 +177,14 @@ public class JournalInfoRetrieval {
         return caching;
     }
 
+    /**
+     * Restricts the head probe of a caching journal to the files the read is restricted to, so that it needs
+     * no authority the read does not. Empty when the read is not filtered on the server.
+     */
+    public void filterHeadProbe(List<FileFilter> files) {
+        probeFiles = files == null ? List.of() : List.copyOf(files);
+    }
+
     public JournalPosition getCurrentPosition(AS400 as400, JournalInfo journalLib) throws Exception {
         final JournalReceiver ji = getReceiver(as400, journalLib);
         final BigInteger offset = getOffset(as400, ji).end();
@@ -206,13 +225,27 @@ public class JournalInfoRetrieval {
      * {@code journal.additional.delay} are not applied to it.</p>
      *
      * <p>A journal that does not cache has nothing to wait for; the configured additional delay is still
-     * honoured for it as before.</p>
+     * honoured for it as before. Neither does a caching journal whose probe the server refused: it falls
+     * back to the cache wait plus the additional delay, the timer of before issue #104, rather than
+     * failing every poll (issue #5680).</p>
      */
     public Optional<DetailedJournalReceiver> getDelayedDetailedJournalReceiver(AS400 as400, JournalInfo journalLib)
             throws Exception {
         DetailedJournalReceiver dr = getCurrentDetailedJournalReceiver(as400, journalLib);
-        if (cachingRegime(journalLib)) {
-            return verifiedHead(as400, journalLib, dr);
+        final String key = journalKey(journalLib.journalName(), journalLib.journalLibrary());
+        if (cachingRegime(journalLib) && !probeRefused.contains(key)) {
+            try {
+                return verifiedHead(as400, journalLib, dr);
+            }
+            catch (HeadProbeRefusedException e) {
+                probeRefused.add(key);
+                verifiedHeads.remove(journalLib);
+                log.warn("journal {}/{} caches but the server refused to prove its head: {}. Without a file filter the "
+                        + "probe needs *OBJEXIST on the journal on top of *USE. Reading its head {}ms behind live instead "
+                        + "(cache wait + {}ms journal.additional.delay), which can miss the cached tail of a range (issue "
+                        + "#103); grant the authority and restart to read up to the proven head", journalLib.journalLibrary(),
+                        journalLib.journalName(), e.getMessage(), headDelayMs(journalLib), additionalJournalDelay);
+            }
         }
         long totalDelay = headDelayMs(journalLib);
         if (totalDelay > 0) {
@@ -254,8 +287,9 @@ public class JournalInfoRetrieval {
      * <p>Entries are written from the cache to the receiver in sequence order, so if an entry is
      * retrievable every entry below it is too, and a range ending there can be trusted when the server
      * says it is exhausted. The server is asked for the whole stretch from the proven head to live,
-     * unfiltered: it returns the entries flushed so far and stops at the cache, and the last entry it
-     * returns is the newest readable one. No entry is guessed at and probed on its own: the cache is
+     * filtered as the read is: it returns the entries flushed so far and stops at the cache, and the last
+     * entry it returns is the newest readable one. A stretch where no captured file has an entry proves
+     * nothing, and there is nothing in it to read either (issue #5680). No entry is guessed at and probed on its own: the cache is
      * flushed a whole buffer at a time, and the newest entry deposited is held back until the journal has
      * been idle for a while (~23 s on PUB400), so while anything is being written the live head is
      * almost never readable and no fixed point below it can be trusted either. When nothing has flushed
@@ -298,8 +332,8 @@ public class JournalInfoRetrieval {
     }
 
     /**
-     * The newest entry in {@code [from, to]} the server can retrieve now: one unfiltered
-     * {@code QjoRetrieveJournalEntries} call over the range, which returns the entries already flushed from
+     * The newest entry in {@code [from, to]} the server can retrieve now: one {@code QjoRetrieveJournalEntries}
+     * call over the range, filtered as the read is ({@link #filterHeadProbe}), which returns the entries already flushed from
      * the journal cache and stops at the first that is not, so the last entry returned is the answer. Empty
      * when none of the range has flushed yet. A block cut short by {@link #RANGE_PROBE_BUFFER} still ends on
      * a readable entry; it is just not the newest.
@@ -307,7 +341,7 @@ public class JournalInfoRetrieval {
     Optional<BigInteger> newestRetrievable(AS400 as400, JournalInfo journal, JournalReceiver receiver, BigInteger from,
                                            BigInteger to)
             throws Exception {
-        final Optional<byte[]> data = retrieveUnfiltered(as400, journal, receiver, from, to, RANGE_PROBE_BUFFER);
+        final Optional<byte[]> data = retrieveStretch(as400, journal, receiver, from, to, RANGE_PROBE_BUFFER);
         if (data.isEmpty()) {
             return Optional.empty();
         }
@@ -327,20 +361,15 @@ public class JournalInfoRetrieval {
     }
 
     /**
-     * One unfiltered {@code QjoRetrieveJournalEntries} call over {@code [from, to]} of {@code receiver}, in
-     * the {@code RJNE0100} format so that an entry with lob data allocates no pointer handle in the host job.
-     * "No entries" (CPF7062) means the range is still in the journal cache; a sequence the receiver does not
-     * hold (CPF7053) is not readable either and is left to the receiver-chain checks to explain. Both come
-     * back empty; anything else is a failure.
+     * One {@code QjoRetrieveJournalEntries} call over {@code [from, to]} of {@code receiver}, in the
+     * {@code RJNE0100} format so that an entry with lob data allocates no pointer handle in the host job.
+     * Only the files of {@link #filterHeadProbe} are asked for: entries leave the cache in sequence order, so
+     * a retrievable entry of any file still proves every entry below it.
      */
-    private Optional<byte[]> retrieveUnfiltered(AS400 as400, JournalInfo journal, JournalReceiver receiver, BigInteger from,
-                                                BigInteger to, int bufferLength)
+    private Optional<byte[]> retrieveStretch(AS400 as400, JournalInfo journal, JournalReceiver receiver, BigInteger from,
+                                             BigInteger to, int bufferLength)
             throws Exception {
-        final RetrievalCriteria criteria = new RetrievalCriteria(textFactory);
-        criteria.reset();
-        criteria.withReceiverRange(receiver.name(), receiver.library(), receiver.name(), receiver.library());
-        criteria.withFromEnt(from);
-        criteria.withEnd(to);
+        final RetrievalCriteria criteria = probeCriteria(receiver, from, to);
         final String journalName = padRight(journal.journalName(), 10) + padRight(journal.journalLibrary(), 10);
         final ProgramParameter[] parameters = new ProgramParameter[]{
                 new ProgramParameter(ProgramParameter.PASS_BY_REFERENCE, bufferLength),
@@ -359,14 +388,71 @@ public class JournalInfoRetrieval {
         if (spc.run()) {
             return Optional.of(parameters[0].getOutputData());
         }
-        for (final AS400Message message : spc.getMessageList()) {
-            final String id = message.getID();
-            if ("CPF7062".equals(id) || "CPF7053".equals(id)) {
-                log.debug("entries {}-{} of {} are not retrievable yet: {} {}", from, to, receiver, id, message.getText());
+        final AS400Message[] messages = spc.getMessageList();
+        switch (classifyProbeFailure(messages)) {
+            case NOTHING_PROVEN:
+                log.debug("entries {}-{} of {} are not retrievable yet: {}", from, to, receiver, messagesText(messages));
                 return Optional.empty();
-            }
+            case NOT_AUTHORIZED:
+                throw new HeadProbeRefusedException(messagesText(messages));
+            case FILTER_INVALID:
+                throw new InvalidJournalFilterException(String.format("head probe of %s: object not found or not journaled: %s",
+                        receiver, messagesText(messages)));
+            default:
+                throw classifyServiceProgramFailure(JOURNAL_SERVICE_LIB, "QjoRetrieveJournalEntries", messages);
         }
-        throw classifyServiceProgramFailure(JOURNAL_SERVICE_LIB, "QjoRetrieveJournalEntries", spc.getMessageList());
+    }
+
+    /** The probe's criteria: one receiver, {@code [from, to]}, and the files of {@link #filterHeadProbe} if any. */
+    RetrievalCriteria probeCriteria(JournalReceiver receiver, BigInteger from, BigInteger to) {
+        final RetrievalCriteria criteria = new RetrievalCriteria(textFactory);
+        criteria.reset();
+        criteria.withReceiverRange(receiver.name(), receiver.library(), receiver.name(), receiver.library());
+        criteria.withFromEnt(from);
+        criteria.withEnd(to);
+        if (!probeFiles.isEmpty()) {
+            criteria.withFILE(probeFiles);
+        }
+        return criteria;
+    }
+
+    enum ProbeFailure {
+        NOTHING_PROVEN,
+        NOT_AUTHORIZED,
+        FILTER_INVALID,
+        OTHER
+    }
+
+    /**
+     * Reads a refused probe. Nothing proven: "no entries" (CPF7062), the range is still in the journal cache;
+     * a sequence the receiver does not hold (CPF7053), left to the receiver-chain checks to explain. A filtered
+     * file not journaled (CPF7060) is fatal, as it is to the read: read as "nothing proven" it would stall the
+     * source silently. Not authorized: CPF9802 / CPF2189.
+     */
+    static ProbeFailure classifyProbeFailure(AS400Message[] messages) {
+        boolean notAuthorized = false;
+        for (final AS400Message message : messages) {
+            final String id = message.getID() == null ? "" : message.getID().toUpperCase();
+            if ("CPF7062".equals(id) || "CPF7053".equals(id)) {
+                return ProbeFailure.NOTHING_PROVEN;
+            }
+            if ("CPF7060".equals(id)) {
+                return ProbeFailure.FILTER_INVALID;
+            }
+            notAuthorized |= NOT_AUTHORIZED_MESSAGE_IDS.contains(id);
+        }
+        return notAuthorized ? ProbeFailure.NOT_AUTHORIZED : ProbeFailure.OTHER;
+    }
+
+    private static String messagesText(AS400Message[] messages) {
+        return Arrays.stream(messages).map(m -> m.getID() + " " + m.getText()).collect(Collectors.joining("; "));
+    }
+
+    /** The server refused the head probe for lack of authority: the journal falls back to the timer. */
+    static final class HeadProbeRefusedException extends Exception {
+        HeadProbeRefusedException(String message) {
+            super(message);
+        }
     }
 
     public static long getJournalCacheDurationInMilliseconds(Connect<Connection, SQLException> jdbcConnection) {

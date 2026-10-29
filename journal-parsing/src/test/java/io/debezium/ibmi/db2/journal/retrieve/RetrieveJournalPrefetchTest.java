@@ -11,8 +11,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import java.io.IOException;
@@ -98,7 +98,7 @@ class RetrieveJournalPrefetchTest {
         assertEquals(RetrievalState.Success, rj.retrieveJournal(position(10)));
         assertFalse(rj.prefetchInFlight());
         assertEquals(2, fetcher.ranges.size(), "the block already fetched is used, no third call");
-        verifyNoInteractions(journalInfoRetrieval);
+        verify(journalInfoRetrieval, never()).getDelayedDetailedJournalReceiver(any(), any());
     }
 
     @Test
@@ -143,7 +143,7 @@ class RetrieveJournalPrefetchTest {
         final IOException e = assertThrows(IOException.class, () -> rj.retrieveJournal(position(10)),
                 "unwrapped, so the streaming loop's connection failure handling applies");
         assertEquals("connection reset", e.getMessage());
-        verifyNoInteractions(journalInfoRetrieval);
+        verify(journalInfoRetrieval, never()).getDelayedDetailedJournalReceiver(any(), any());
     }
 
     @Test
@@ -159,7 +159,7 @@ class RetrieveJournalPrefetchTest {
         // the continuation is still remembered and reused without asking the journal (#38)
         assertEquals(RetrievalState.Success, rj.retrieveJournal(position(10)));
         assertEquals(List.of(range(1), range(10)), fetcher.ranges);
-        verifyNoInteractions(journalInfoRetrieval);
+        verify(journalInfoRetrieval, never()).getDelayedDetailedJournalReceiver(any(), any());
     }
 
     @Test
