@@ -35,7 +35,8 @@ class As400TextFactoryTest {
 
     /**
      * A column the catalogue has no CCSID for (or one tagged 65535, which jt400 reads as "guess from
-     * the default locale") must still decode against the system, not the JVM's locale.
+     * the default locale") must still decode against the system, not the JVM's locale; 65535 in the
+     * system CCSID's superset (Popsink/data-plane#5831).
      */
     @Test
     void unknownColumnCcsidFallsBackToTheSystemCcsid() {
@@ -44,6 +45,11 @@ class As400TextFactoryTest {
         assertEquals(EBCDIC_US, factory.text(10, As400TextFactory.UNKNOWN_CCSID).getCcsid());
         assertEquals(EBCDIC_US, factory.text(10, 0).getCcsid());
         assertEquals(EBCDIC_US, factory.text(10, As400TextFactory.NO_CCSID).getCcsid());
+
+        final As400TextFactory chinese = As400TextFactory.forCcsid(935);
+        assertEquals(1388, chinese.text(10, As400TextFactory.NO_CCSID).getCcsid());
+        assertEquals(935, chinese.text(10, As400TextFactory.UNKNOWN_CCSID).getCcsid(),
+                "a column with no CCSID at all keeps the system CCSID");
     }
 
     @Test

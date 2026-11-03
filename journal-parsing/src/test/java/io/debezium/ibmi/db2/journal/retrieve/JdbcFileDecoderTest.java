@@ -27,6 +27,7 @@ import com.ibm.as400.access.AS400Text;
 import com.ibm.as400.access.AS400ZonedDecimal;
 
 import io.debezium.ibmi.db2.journal.data.types.AS400Lob;
+import io.debezium.ibmi.db2.journal.data.types.AS400VarBin;
 import io.debezium.ibmi.db2.journal.data.types.AS400VarChar;
 import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
 import io.debezium.ibmi.db2.journal.retrieve.JournalLobFetcher.LobSegment;
@@ -57,6 +58,46 @@ public class JdbcFileDecoderTest {
     }
 
     private static final JdbcFileDecoder DECODER = new JdbcFileDecoder(null, null, new SchemaCacheHash(), TEXT_FACTORY, -1, -1);
+
+    /** An untagged column decided text decodes as text in that CCSID, in each spelling jt400 uses (#5831). */
+    @Test
+    public void untaggedColumnDecidedTextDecodesAsText() {
+        final UntaggedDecisions decisions = new UntaggedDecisions();
+        decisions.load("S.T.FIXED=1388;S.T.FIXED20=1388;S.T.VAR=1388;S.T.VAR20=1388");
+        final JdbcFileDecoder decoder = new JdbcFileDecoder(null, null, new SchemaCacheHash(), TEXT_FACTORY, -1, -1,
+                decisions);
+
+        final AS400DataType fixed = decoder.toDataType("S", "T", "FIXED", "CHAR () FOR BIT DATA", 10, 0);
+        assertEquals(1388, ((AS400Text) fixed).getCcsid());
+        assertEquals(10, fixed.getByteLength());
+        final AS400DataType fixed20 = decoder.toDataType("S", "T", "FIXED20", "CHAR (20) FOR BIT DATA", 10, 0);
+        assertEquals(1388, ((AS400Text) fixed20).getCcsid());
+        assertEquals(20, fixed20.getByteLength());
+
+        final AS400DataType var = decoder.toDataType("S", "T", "VAR", "VARCHAR () FOR BIT DATA", 10, 0);
+        assertEquals(AS400VarChar.class, var.getClass());
+        assertEquals(12, var.getByteLength(), "a bit column's length is in bytes, plus the 2 byte length");
+        final AS400DataType var20 = decoder.toDataType("S", "T", "VAR20", "VARCHAR (20) FOR BIT DATA", 10, 0);
+        assertEquals(AS400VarChar.class, var20.getClass());
+        assertEquals(22, var20.getByteLength());
+
+        // 'D' 'Z' in CCSID 1388's single-byte range
+        assertEquals("DZ", fixed.toObject(new byte[]{ (byte) 0xC4, (byte) 0xE9, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
+                0x40, 0x40 }).toString().trim());
+    }
+
+    @Test
+    public void untaggedColumnDecidedBinaryStaysBinary() {
+        final UntaggedDecisions decisions = new UntaggedDecisions();
+        decisions.load("S.T.PWD=hex;S.T.VPWD=hex");
+        final JdbcFileDecoder decoder = new JdbcFileDecoder(null, null, new SchemaCacheHash(), TEXT_FACTORY, -1, -1,
+                decisions);
+
+        assertEquals(AS400DataType.TYPE_BYTE_ARRAY,
+                decoder.toDataType("S", "T", "PWD", "CHAR () FOR BIT DATA", 10, 0).getInstanceType());
+        assertEquals(AS400VarBin.class,
+                decoder.toDataType("S", "T", "VPWD", "VARCHAR (20) FOR BIT DATA", 10, 0).getClass());
+    }
 
     // [CHAR(3), DECIMAL(5,0), CHAR(2)] -> 3 + 3 + 2 = 8 bytes
     private static AS400Structure threeFieldStructure() {

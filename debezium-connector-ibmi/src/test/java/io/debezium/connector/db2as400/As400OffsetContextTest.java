@@ -18,6 +18,7 @@ import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.ibmi.db2.journal.retrieve.JournalReceiver;
+import io.debezium.ibmi.db2.journal.retrieve.UntaggedDecisions;
 import io.debezium.pipeline.source.snapshot.incremental.AbstractIncrementalSnapshotContext;
 import io.debezium.pipeline.source.snapshot.incremental.DataCollection;
 import io.debezium.pipeline.source.snapshot.incremental.IncrementalSnapshotContext;
@@ -105,5 +106,23 @@ public class As400OffsetContextTest {
 
         final As400OffsetContext reloaded = new As400OffsetContext.Loader(config).load(offset);
         assertThat(reloaded.getIncrementalSnapshotContext().snapshotRunning()).isFalse();
+    }
+
+    /** A column's text/binary decision survives a restart, so its Kafka type never flips (#5831). */
+    @Test
+    public void untaggedColumnDecisionsSurviveOffsetRoundTrip() {
+        final As400ConnectorConfig config = newConfig();
+        final As400OffsetContext original = new As400OffsetContext(config, newPosition());
+        assertThat(original.getOffset()).doesNotContainKey(As400OffsetContext.UNTAGGED_CCSID);
+
+        config.untaggedDecisions().putIfAbsent("LIB.T.NAME", 1388);
+        config.untaggedDecisions().putIfAbsent("LIB.T.PWD", UntaggedDecisions.HEX);
+        final Map<String, ?> offset = original.getOffset();
+        assertThat(offset.get(As400OffsetContext.UNTAGGED_CCSID)).isEqualTo("LIB.T.NAME=1388;LIB.T.PWD=hex");
+
+        final As400ConnectorConfig restarted = newConfig();
+        new As400OffsetContext.Loader(restarted).load(offset);
+        assertThat(restarted.untaggedDecisions().get("LIB.T.NAME")).hasValue(1388);
+        assertThat(restarted.untaggedDecisions().get("LIB.T.PWD")).hasValue(UntaggedDecisions.HEX);
     }
 }

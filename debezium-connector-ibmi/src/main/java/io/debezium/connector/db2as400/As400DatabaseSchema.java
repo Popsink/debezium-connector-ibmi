@@ -52,7 +52,9 @@ public class As400DatabaseSchema extends RelationalDatabaseSchema implements Sch
         fileDecoder = new JdbcFileDecoder(jdbcConnection, jdbcConnection.getRealDatabaseName(), this,
                 As400TextFactory.forConnection(jdbcConnection),
                 config.getFromCcsid(),
-                config.getToCcsid());
+                config.getToCcsid(),
+                config.untaggedDecisions());
+        jdbcConnection.setUntaggedColumns(fileDecoder.untaggedColumns());
         fileDecoder.setRequireUniqueDdsKey(config.isUniqueDdsKeyRequired());
 
         schemaInfoConversion = new SchemaInfoConversion(fileDecoder);

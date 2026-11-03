@@ -21,6 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -31,10 +32,13 @@ import com.ibm.as400.access.AS400JDBCDriverForcedCcsid;
 import com.ibm.as400.access.AS400JDBCDriverRegistration;
 
 import io.debezium.config.Configuration;
+import io.debezium.connector.db2as400.conversion.UntaggedText;
 import io.debezium.ibmi.db2.journal.retrieve.Connect;
 import io.debezium.ibmi.db2.journal.retrieve.DdsKeys;
 import io.debezium.ibmi.db2.journal.retrieve.DdsKeys.DdsKey;
 import io.debezium.ibmi.db2.journal.retrieve.FileFilter;
+import io.debezium.ibmi.db2.journal.retrieve.JdbcFileDecoder;
+import io.debezium.ibmi.db2.journal.retrieve.UntaggedColumns;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.relational.Column;
@@ -53,6 +57,8 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
     /** See {@link As400ConnectorConfig#DDS_KEY_REQUIRE_UNIQUE}. */
     private final boolean requireUniqueDdsKey;
     private boolean registered = false;
+    /** Set by the schema, which owns the decoder; null until then, when no column is read as text. */
+    private UntaggedColumns untaggedColumns;
 
     /** Skip the {@link Connection#isValid} liveness round-trip if we validated within this window. */
     private static final long VALIDATION_INTERVAL_MS = 2_000;
@@ -585,12 +591,27 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
 
             // Allow implementation to make column changes if required before being added to table
             column = overrideColumn(column);
+            column = untaggedText(column, tableId, untaggedColumns);
 
             // don't fetch defaults or we will send the default value when not set even though the database value is not set
             return Optional.of(column);
         }
 
         return Optional.empty();
+    }
+
+    public void setUntaggedColumns(UntaggedColumns untaggedColumns) {
+        this.untaggedColumns = untaggedColumns;
+    }
+
+    /** An untagged column decided text is typed as text for the snapshot, as the journal path does. */
+    static ColumnEditor untaggedText(ColumnEditor column, TableId tableId, UntaggedColumns untaggedColumns) {
+        final String typeName = column.typeName();
+        if (untaggedColumns == null || !JdbcFileDecoder.isBitData(typeName)) {
+            return column;
+        }
+        final OptionalInt ccsid = untaggedColumns.textCcsid(tableId.schema(), tableId.table(), column.name());
+        return ccsid.isPresent() ? UntaggedText.mark(column, typeName, ccsid.getAsInt()) : column;
     }
 
     @Override

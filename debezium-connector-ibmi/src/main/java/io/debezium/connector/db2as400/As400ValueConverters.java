@@ -11,12 +11,16 @@ import java.sql.SQLException;
 import java.sql.SQLXML;
 import java.sql.Types;
 import java.time.ZoneOffset;
+import java.util.OptionalInt;
 
 import org.apache.kafka.connect.data.Field;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.ibm.as400.access.AS400Text;
+
 import io.debezium.config.CommonConnectorConfig.BinaryHandlingMode;
+import io.debezium.connector.db2as400.conversion.UntaggedText;
 import io.debezium.jdbc.JdbcValueConverters;
 import io.debezium.relational.Column;
 
@@ -50,6 +54,13 @@ public class As400ValueConverters extends JdbcValueConverters {
             // would deliver its toString(), i.e. the object's identity. Streaming has no Clob to
             // materialise, the journal decoder produces the text itself.
             data = materialise(column, clob);
+        }
+        if (data instanceof final byte[] bytes) {
+            // an untagged column read as text: jt400 hands a snapshot its bytes (Popsink/data-plane#5831)
+            final OptionalInt ccsid = UntaggedText.ccsidOf(column);
+            if (ccsid.isPresent()) {
+                data = new AS400Text(bytes.length, ccsid.getAsInt()).toObject(bytes);
+            }
         }
         // an xml column is left alone, which is what trim.non.xml.charsequence.field.mode says. A
         // snapshot reads it as a SQLXML, but the journal decoder produces the document as a String, so
