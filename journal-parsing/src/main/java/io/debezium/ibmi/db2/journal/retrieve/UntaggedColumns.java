@@ -73,9 +73,8 @@ public class UntaggedColumns {
     }
 
     private void decide(String schema, String table) {
-        if (ccsid <= 0 || jdbcConnect == null) {
-            // no system CCSID to read the bytes in, or no connection to sample with (a decoder built
-            // offline): decide nothing, the column stays binary as before
+        if (jdbcConnect == null) {
+            // a decoder built offline: decide nothing, the column stays binary as before
             return;
         }
         final List<String> undecided = new ArrayList<>();
@@ -96,18 +95,39 @@ public class UntaggedColumns {
         }
 
         Map<String, Integer> decided;
+        if (ccsid <= 0) {
+            // a system CCSID of 65535 (QCCSID's shipped default) names no code page; reading the bytes in
+            // the pod's locale guess would differ from the loaders, which keep these columns hex
+            log.warn("the IBM i system ccsid is unknown (65535), so the untagged columns {} of {}.{} stay binary",
+                    undecided, schema, table);
+            decided = allHex(undecided);
+        }
+        else {
+            decided = sampleOrHex(schema, table, undecided);
+        }
+        record(schema, table, decided);
+    }
+
+    private Map<String, Integer> sampleOrHex(String schema, String table, List<String> undecided) {
         try {
-            decided = sample(schema, table, undecided);
+            return sample(schema, table, undecided);
         }
         catch (final SQLException e) {
             log.warn("sampling the untagged columns {} of {}.{} failed, they stay binary", undecided, schema,
                     table, e);
-            decided = new LinkedHashMap<>();
-            for (final String column : undecided) {
-                decided.put(column, UntaggedDecisions.HEX);
-            }
+            return allHex(undecided);
         }
+    }
 
+    private static Map<String, Integer> allHex(List<String> columns) {
+        final Map<String, Integer> decided = new LinkedHashMap<>();
+        for (final String column : columns) {
+            decided.put(column, UntaggedDecisions.HEX);
+        }
+        return decided;
+    }
+
+    private void record(String schema, String table, Map<String, Integer> decided) {
         final StringJoiner text = new StringJoiner(", ");
         for (final Map.Entry<String, Integer> entry : decided.entrySet()) {
             decisions.putIfAbsent(UntaggedDecisions.key(schema, table, entry.getKey()), entry.getValue());

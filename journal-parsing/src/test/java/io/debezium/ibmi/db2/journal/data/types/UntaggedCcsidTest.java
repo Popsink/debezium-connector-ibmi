@@ -24,7 +24,11 @@ class UntaggedCcsidTest {
                 930, 1390, 5026, 1390, 939, 1399, 5035, 1399), UntaggedCcsid.SUPERSET);
         assertEquals(1388, UntaggedCcsid.superset(935));
         assertEquals(1399, UntaggedCcsid.superset(5035));
-        assertEquals(37, UntaggedCcsid.superset(37), "a CCSID with no superset is its own");
+        // the "unchanged" list of the same file
+        for (final int ccsid : new int[]{ 37, 273, 277, 278, 280, 284, 285, 297, 500, 871, 1140, 1141, 1147, 1148, 1388,
+                1399 }) {
+            assertEquals(ccsid, UntaggedCcsid.superset(ccsid), "a CCSID with no superset is its own");
+        }
     }
 
     @Test
@@ -50,6 +54,7 @@ class UntaggedCcsidTest {
         assertFalse(UntaggedCcsid.readsAsText(around(0x1A)), "SUB, what an unmapped EBCDIC byte decodes to");
         assertFalse(UntaggedCcsid.readsAsText(around(0x00)), "C0 control");
         assertFalse(UntaggedCcsid.readsAsText(around(0x1F)), "C0 control");
+        assertFalse(UntaggedCcsid.readsAsText(around(0x7F)), "DEL, an ISO control like the loaders' guard");
         assertFalse(UntaggedCcsid.readsAsText(around(0x85)), "C1 control");
         assertFalse(UntaggedCcsid.readsAsText(around(0x9F)), "C1 control");
         assertTrue(UntaggedCcsid.readsAsText(around(0xA0)), "just past C1 is text");

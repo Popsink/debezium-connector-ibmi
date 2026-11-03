@@ -116,6 +116,17 @@ class UntaggedColumnsTest {
         assertEquals("LIB.T.A=hex;LIB.T.B=hex", decisions.serialized());
     }
 
+    /** An unknown system CCSID names no code page: binary, never the pod's locale guess, as the loaders do. */
+    @Test
+    void anUnknownSystemCcsidKeepsEveryColumnBinary() throws SQLException {
+        table(List.of("C"), List.<byte[][]> of(new byte[][]{ ebcdic("ABC") }));
+        final UntaggedColumns columns = columns(As400TextFactory.NO_CCSID);
+
+        assertTrue(columns.textCcsid("LIB", "T", "C").isEmpty());
+        assertEquals("LIB.T.C=hex", decisions.serialized(), "decided, so a later known CCSID does not flip it");
+        verify(connection, never()).prepareStatement(org.mockito.ArgumentMatchers.startsWith("SELECT "));
+    }
+
     /** What the offset carries is not re-sampled, so a restart never flips a column's type. */
     @Test
     void aPersistedDecisionIsNotResampled() throws SQLException {
