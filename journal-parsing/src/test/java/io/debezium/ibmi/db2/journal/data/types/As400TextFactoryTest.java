@@ -8,6 +8,8 @@ package io.debezium.ibmi.db2.journal.data.types;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
+import java.util.Map;
+
 import org.junit.jupiter.api.Test;
 
 import com.ibm.as400.access.AS400Text;
@@ -78,6 +80,33 @@ class As400TextFactoryTest {
         final AS400VarChar varChar = factory.varChar(5, 2, As400TextFactory.UNKNOWN_CCSID);
 
         assertEquals(12, varChar.getByteLength());
+    }
+
+    /** An untagged column decodes as the system CCSID's superset (Popsink/data-plane#5831). */
+    @Test
+    void untaggedColumnUsesTheSystemCcsidsSuperset() {
+        final As400TextFactory chinese = As400TextFactory.forCcsid(935);
+
+        assertEquals(1388, chinese.text(10, As400TextFactory.NO_CCSID).getCcsid());
+        assertEquals(935, chinese.text(10, As400TextFactory.UNKNOWN_CCSID).getCcsid(),
+                "a column with no CCSID at all keeps the system CCSID");
+        assertEquals(935, chinese.text(10).getCcsid(), "API text stays in the job's CCSID");
+    }
+
+    /** 1371 encodes the euro sign, which 937 itself reads back as the currency sign. */
+    @Test
+    void supersetDecodesWhatTheSystemCcsidCannot() {
+        final byte[] euro = new AS400Text(1, 1371).toBytes("€");
+
+        assertEquals("€", As400TextFactory.forCcsid(937).text(1, As400TextFactory.NO_CCSID).toObject(euro));
+        assertNotEquals("€", new AS400Text(1, 937).toObject(euro));
+    }
+
+    /** The table the data-plane loaders pin in {@code docs/ibmi-untagged-ccsid.tsv}: change both or neither. */
+    @Test
+    void supersetIsTheTableTheBackfillLoadersUse() {
+        assertEquals(Map.of(935, 1388, 836, 1388, 837, 1388, 937, 1371, 933, 1364,
+                930, 1390, 5026, 1390, 939, 1399, 5035, 1399), UntaggedCcsid.SUPERSET);
     }
 
     @Test
