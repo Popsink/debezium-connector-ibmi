@@ -18,13 +18,27 @@ import io.debezium.util.Collect;
  * <p>
  * The base handler only treats {@link IOException} as a lost connection, but the jt400 JDBC driver reports
  * a dropped connection as a {@link SQLNonTransientConnectionException}. Without it a connection failure
- * that outlives the streaming loop's retry budget stops the task instead of restarting the connector, so a
- * routine network or IBM i outage would need operator action to recover from.
+ * outside the streaming loop - starting the task, a snapshot - stops the task instead of restarting it, so
+ * a routine network or IBM i outage would need operator action to recover from.
+ * <p>
+ * A {@link NotRetriableException} is never retried, whatever its cause chain holds: the streaming loop
+ * throws it once it has already retried a failure for as long as that failure is worth it, or knows no
+ * retry can fix it. Restarting the task in place would run the same retries again on top of the loop's.
  */
 public class As400ErrorHandler extends ErrorHandler {
 
     public As400ErrorHandler(As400ConnectorConfig connectorConfig, ChangeEventQueue<?> queue, ErrorHandler replacedErrorHandler) {
         super(As400RpcConnector.class, connectorConfig, queue, replacedErrorHandler);
+    }
+
+    @Override
+    protected boolean isRetriable(Throwable throwable) {
+        for (Throwable t = throwable; t != null; t = t.getCause()) {
+            if (t instanceof NotRetriableException) {
+                return false;
+            }
+        }
+        return super.isRetriable(throwable);
     }
 
     @Override

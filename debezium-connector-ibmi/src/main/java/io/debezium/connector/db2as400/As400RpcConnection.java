@@ -289,7 +289,8 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
                 as400.connectService(AS400.COMMAND);
             }
             catch (final Exception e) {
-                log.error("Failed to reconnect", e);
+                // thrown to the caller, which reports it: logging every attempt here drowned the reports
+                log.debug("Failed to reconnect", e);
                 throw new IOException("Failed to reconnect", e);
             }
         }

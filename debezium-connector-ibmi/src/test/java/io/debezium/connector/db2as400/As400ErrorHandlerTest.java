@@ -49,14 +49,14 @@ class As400ErrorHandlerTest {
 
     @Test
     void jt400ConnectionFailureIsRetriable() {
-        assertThat(reportedFor(new DebeziumException("Failed to process offset X after 20 retries",
+        assertThat(reportedFor(new DebeziumException("Failed to start the snapshot",
                 new SQLNonTransientConnectionException("connection reset"))))
                 .isInstanceOf(RetriableException.class);
     }
 
     @Test
     void ioFailureIsRetriable() {
-        assertThat(reportedFor(new DebeziumException("Failed to process offset X after 20 retries",
+        assertThat(reportedFor(new DebeziumException("Failed to start the snapshot",
                 new IOException("Failed to reconnect"))))
                 .isInstanceOf(RetriableException.class);
     }
@@ -64,6 +64,18 @@ class As400ErrorHandlerTest {
     @Test
     void unavailableJournalPositionIsNotRetriable() {
         assertThat(reportedFor(new OffsetNoLongerAvailableException("journal position X was pruned")))
+                .isInstanceOf(ConnectException.class)
+                .isNotInstanceOf(RetriableException.class);
+    }
+
+    /**
+     * The streaming loop has already retried the lost connection for as long as it is retried: restarting
+     * the task in place would run the same retries again on top of them.
+     */
+    @Test
+    void aFailureTheStreamingLoopGaveUpOnIsNotRetriedAgain() {
+        assertThat(reportedFor(new NotRetriableException("Gave up at offset X: the connection to the IBM i is lost",
+                new IOException("Failed to reconnect"))))
                 .isInstanceOf(ConnectException.class)
                 .isNotInstanceOf(RetriableException.class);
     }
