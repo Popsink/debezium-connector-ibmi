@@ -32,6 +32,7 @@ import io.debezium.connector.SourceInfoStructMaker;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.ibmi.db2.journal.retrieve.PointerHandles;
 import io.debezium.ibmi.db2.journal.retrieve.RetrieveConfig;
+import io.debezium.ibmi.db2.journal.retrieve.UntaggedDecisions;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.relational.ColumnFilterMode;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
@@ -68,6 +69,8 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
     private final UnavailablePositionRecovery unavailablePositionRecovery;
     private final ErrorsTolerance errorsTolerance;
     private final Configuration config;
+    /** The task's one registry: the decoder decides, every offset context persists (Popsink/data-plane#5831). */
+    private final UntaggedDecisions untaggedDecisions = new UntaggedDecisions();
     private String incrementalTables = "";
 
     // used by the snapshot to limit the additional tables for a change in configuration
@@ -482,6 +485,10 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
 
     public long getBlockingSnapshotPauseTimeout() {
         return config.getLong(BLOCKING_SNAPSHOT_PAUSE_TIMEOUT);
+    }
+
+    public UntaggedDecisions untaggedDecisions() {
+        return untaggedDecisions;
     }
 
     public Integer getFromCcsid() {

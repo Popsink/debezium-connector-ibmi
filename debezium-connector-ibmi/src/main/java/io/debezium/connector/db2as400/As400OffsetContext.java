@@ -20,6 +20,7 @@ import io.debezium.config.Field;
 import io.debezium.connector.SnapshotRecord;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.ibmi.db2.journal.retrieve.JournalReceiver;
+import io.debezium.ibmi.db2.journal.retrieve.UntaggedDecisions;
 import io.debezium.pipeline.CommonOffsetContext;
 import io.debezium.pipeline.source.snapshot.incremental.IncrementalSnapshotContext;
 import io.debezium.pipeline.source.snapshot.incremental.SignalBasedIncrementalSnapshotContext;
@@ -38,6 +39,8 @@ public class As400OffsetContext extends CommonOffsetContext<SourceInfo> {
     public static final String RECEIVER_LIBRARY = "offset.receiver_library";
     public static final String PROCESSED = "offset.processed";
     public static final String RECEIVER = "offset.receiver";
+    /** See {@link UntaggedDecisions#serialized()}. */
+    public static final String UNTAGGED_CCSID = "offset.untagged_ccsid";
     private static final String SNAPSHOT_COMPLETED_KEY = "snapshot_completed";
 
     public static final Field EVENT_SEQUENCE_FIELD = Field.create(EVENT_SEQUENCE);
@@ -128,6 +131,10 @@ public class As400OffsetContext extends CommonOffsetContext<SourceInfo> {
                 As400OffsetContext.PROCESSED, Boolean.toString(position.processed()),
                 As400OffsetContext.RECEIVER_LIBRARY, position.getReceiver().library(),
                 As400OffsetContext.SNAPSHOT_COMPLETED_KEY, Boolean.toString(snapshotCompleted)));
+        final String untagged = connectorConfig.untaggedDecisions().serialized();
+        if (!untagged.isEmpty()) {
+            offset.put(UNTAGGED_CCSID, untagged);
+        }
         incrementalSnapshotContext.store(offset);
         return offset;
     }
@@ -189,6 +196,7 @@ public class As400OffsetContext extends CommonOffsetContext<SourceInfo> {
             final String receiver = (String) map.get(As400OffsetContext.RECEIVER);
             final boolean processed = Boolean.valueOf((String) map.get(As400OffsetContext.PROCESSED));
             final String receiverLibrary = (String) map.get(As400OffsetContext.RECEIVER_LIBRARY);
+            connectorConfig.untaggedDecisions().load((String) map.get(As400OffsetContext.UNTAGGED_CCSID));
             JournalProcessedPosition position = new JournalProcessedPosition();
             if ("null".equals(offsetStr)) {
                 log.warn("setting offsets to zero");

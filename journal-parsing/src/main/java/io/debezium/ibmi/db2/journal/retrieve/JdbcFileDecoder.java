@@ -11,12 +11,14 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -68,6 +70,7 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
     private final BytesPerChar octetLengthCache;
     private final DateTimeFormatCache dateTimeFormatCache;
     private final As400TextFactory textFactory;
+    private final UntaggedColumns untaggedColumns;
     /** Only known once the journal has been resolved, and null when lob fetching is turned off. */
     private JournalLobFetcher lobFetcher;
     /** See {@link #setRequireUniqueDdsKey}; the safe resolution unless an operator opts out. */
@@ -80,6 +83,13 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
 
     public JdbcFileDecoder(Connect<Connection, SQLException> con, String database, SchemaCacheIF schemaCache,
                            As400TextFactory textFactory, int fromCcsid, int toCcsid) {
+        this(con, database, schemaCache, textFactory, fromCcsid, toCcsid, new UntaggedDecisions());
+    }
+
+    /** @param untaggedDecisions the task's, so the offset persists the decisions made here */
+    public JdbcFileDecoder(Connect<Connection, SQLException> con, String database, SchemaCacheIF schemaCache,
+                           As400TextFactory textFactory, int fromCcsid, int toCcsid,
+                           UntaggedDecisions untaggedDecisions) {
         super();
         this.jdbcConnect = con;
         this.schemaCache = schemaCache;
@@ -89,6 +99,11 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
         ccsidCache = new CcsidCache(con, fromCcsid, toCcsid);
         octetLengthCache = new BytesPerChar(con);
         dateTimeFormatCache = new DateTimeFormatCache(con);
+        untaggedColumns = new UntaggedColumns(con, untaggedDecisions, textFactory);
+    }
+
+    public UntaggedColumns untaggedColumns() {
+        return untaggedColumns;
     }
 
     /**
@@ -495,14 +510,24 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
                     final int position = columnMetadata.getInt(17);
                     final boolean autoInc = "YES".equalsIgnoreCase(columnMetadata.getString(23));
 
-                    jdbcStructure
-                            .add(new Structure(name, type, jdcbType, length, precision, optional,
-                                    position, autoInc));
                     // the columns are read in record order, so their widths so far are the offset of the
                     // next one - which a lob column needs to know to work out its own width
                     final AS400DataType dataType = toDataType(schema, longTableName, name, type, length, precision,
                             recordOffset);
                     recordOffset += dataType.getByteLength();
+
+                    // an untagged column read as text is typed as text, so its Kafka schema is a string
+                    final OptionalInt textCcsid = isBitData(type)
+                            ? untaggedColumns.textCcsid(schema, longTableName, name)
+                            : OptionalInt.empty();
+                    if (textCcsid.isPresent()) {
+                        jdbcStructure.add(new Structure(name, type, isVarBitData(type) ? Types.VARCHAR : Types.CHAR,
+                                length, precision, optional, position, autoInc, textCcsid.getAsInt()));
+                    }
+                    else {
+                        jdbcStructure.add(new Structure(name, type, jdcbType, length, precision, optional,
+                                position, autoInc));
+                    }
 
                     as400structure.add(dataType);
                     octetLengthCache.add(schema, longTableName, name, length, octectLength);
@@ -634,10 +659,10 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
                 return as400Boolean;
             case "DECIMAL":
                 return new AS400PackedDecimal(length, precision);
-            case "CHAR () FOR BIT DATA": // password fields - treat as binary
-                return new AS400ByteArray(length);
-            case "VARCHAR () FOR BIT DATA": // password fields - treat as binary
-                return new AS400VarBin(length);
+            case "CHAR () FOR BIT DATA":
+                return bitData(schema, table, columnName, length);
+            case "VARCHAR () FOR BIT DATA":
+                return varBitData(schema, table, columnName, length);
             case "CHAR":
                 return getText(length, ccsidCache.getCcsid(schema, table, columnName));
             case "NCHAR":
@@ -698,14 +723,38 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
             default:
                 final Optional<Integer> varLength = bitDataLengthFromRegex(type, length, VAR_BIT_DATA);
                 if (varLength.isPresent()) {
-                    return new AS400VarBin(varLength.get());
+                    return varBitData(schema, table, columnName, varLength.get());
                 }
                 final Optional<Integer> fixedLenght = bitDataLengthFromRegex(type, length, BIT_DATA);
                 if (fixedLenght.isPresent()) {
-                    return new AS400ByteArray(fixedLenght.get());
+                    return bitData(schema, table, columnName, fixedLenght.get());
                 }
         }
         throw new IllegalArgumentException(String.format("Unsupported type %s for column %s", type, columnName));
+    }
+
+    /**
+     * An untagged (CCSID 65535) column: text when {@link UntaggedColumns} decided so, else bytes - a real
+     * binary value such as a password hash (Popsink/data-plane#5831).
+     */
+    private AS400DataType bitData(String schema, String table, String columnName, int length) {
+        final OptionalInt ccsid = untaggedColumns.textCcsid(schema, table, columnName);
+        return ccsid.isPresent() ? getText(length, ccsid.getAsInt()) : new AS400ByteArray(length);
+    }
+
+    private AS400DataType varBitData(String schema, String table, String columnName, int length) {
+        final OptionalInt ccsid = untaggedColumns.textCcsid(schema, table, columnName);
+        // a bit data column's length is in bytes, so one byte per character keeps the record width right
+        return ccsid.isPresent() ? getVarText(length, 1, ccsid.getAsInt()) : new AS400VarBin(length);
+    }
+
+    /** Whether jt400 reports the column as untagged ({@code FOR BIT DATA}) {@code CHAR} or {@code VARCHAR}. */
+    public static boolean isBitData(String type) {
+        return type != null && type.endsWith("FOR BIT DATA");
+    }
+
+    public static boolean isVarBitData(String type) {
+        return isBitData(type) && type.startsWith("VARCHAR");
     }
 
     private Optional<Integer> bitDataLengthFromRegex(String type, int length, Pattern regex) {

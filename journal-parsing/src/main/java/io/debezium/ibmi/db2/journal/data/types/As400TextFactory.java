@@ -113,8 +113,9 @@ public class As400TextFactory {
 
     /**
      * Fixed length text in a column's own CCSID, falling back to the system CCSID when the column
-     * has none. A column tagged 65535 holds untranslated bytes; reading those as the system CCSID is
-     * at least stable across hosts, where the locale guess is not.
+     * has none. A column tagged 65535 holds untranslated bytes, read as the system CCSID's extended
+     * superset ({@link UntaggedCcsid}): stable across hosts, where the locale guess is not, and what the
+     * backfill loaders read the same column as.
      */
     public AS400Text text(int length, int columnCcsid) {
         final int ccsid = resolve(columnCcsid);
@@ -137,6 +138,10 @@ public class As400TextFactory {
     }
 
     private int resolve(int columnCcsid) {
+        if (columnCcsid == NO_CCSID) {
+            // an unknown system CCSID has no superset and stays unknown
+            return UntaggedCcsid.superset(systemCcsid);
+        }
         final int normalised = normalise(columnCcsid);
         return (normalised == UNKNOWN_CCSID) ? systemCcsid : normalised;
     }

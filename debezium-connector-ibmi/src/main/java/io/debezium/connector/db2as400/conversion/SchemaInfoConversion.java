@@ -45,7 +45,7 @@ public class SchemaInfoConversion {
         if (table != null && table.columns() != null) {
             for (Column c : table.columns()) {
                 Structure structure = new Structure(c.name(), c.typeName(), c.jdbcType(), c.length(), c.scale().orElse(0), c.isOptional(), c.position(),
-                        c.isAutoIncremented());
+                        c.isAutoIncremented(), UntaggedText.ccsidOf(c).orElse(-1));
                 structures.add(structure);
             }
         }
@@ -88,6 +88,10 @@ public class SchemaInfoConversion {
                     ceditor.autoIncremented(col.isAutoinc());
                     ceditor.optional(col.isOptional());
                     ceditor.position(col.getPosition());
+                    if (col.getCcsid() > 0 && JdbcFileDecoder.isBitData(col.getType())) {
+                        // a snapshot reading this table later gets bytes for it, which the converter decodes
+                        UntaggedText.mark(ceditor, col.getType(), col.getCcsid());
+                    }
 
                     editor.addColumn(ceditor.create());
                 }

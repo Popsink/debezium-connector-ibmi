@@ -128,6 +128,11 @@ public interface SchemaCacheIF {
             return autoinc;
         }
 
+        /** @return the CCSID an untagged column is read in as text, -1 when not set */
+        public int getCcsid() {
+            return ccsid;
+        }
+
         @Override
         public String toString() {
             return "Structure [name=" + name + ", type=" + type + ", jdcbType=" + jdcbType + ", length=" + length
