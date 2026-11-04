@@ -131,7 +131,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
     public void execute(ChangeEventSourceContext context, As400Partition partition, As400OffsetContext offsetContext)
             throws InterruptedException {
         final Metronome metronome = Metronome.sleeper(pollInterval, clock);
-        final RetryWindow retryWindow = new RetryWindow(RetryWindow.budgets(connectorConfig), pollInterval, clock);
+        final RetryWindow retryWindow = new RetryWindow(connectorConfig, clock);
         final WatchDog watchDog = new WatchDog(Thread.currentThread(), connectorConfig.getMaxRetrievalTimeout(),
                 connectorConfig.getBlockingSnapshotPauseTimeout(), context::isPaused,
                 snapshotActivity::isSnapshotRunning, errorHandler::setProducerThrowable);
@@ -177,12 +177,11 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         // has gone, since the same failures are also how a badly resolved range reports
                         // itself, and recovering from one of those costs the whole retained journal (issue #79)
                         recoverIfThePositionIsReallyGone(offsetContext, e);
-                        retryAfter(retryWindow, RetryWindow.Kind.POSITION_UNREADABLE, offsetContext, e);
+                        retryAfter(retryWindow, watchDog, RetryWindow.Kind.POSITION_UNREADABLE, offsetContext, e);
                     }
                     catch (final ObjectLockedException e) {
-                        // the server answered: the connection is fine and the stream is not stalled (issue #107)
-                        watchDog.alive();
-                        retryAfter(retryWindow, RetryWindow.Kind.MEMBER_LOCKED, offsetContext, e);
+                        // nightly batch jobs hold such locks for hours, and they clear on their own (issue #107)
+                        retryAfter(retryWindow, watchDog, RetryWindow.Kind.MEMBER_LOCKED, offsetContext, e);
                     }
                     catch (final FatalException e) {
                         throw new DebeziumException("Unable to process offset " + offsetContext.getPosition(), e);
@@ -191,7 +190,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         // the WatchDog interrupts a call that has gone without progress for too long
                         if (context.isRunning()) {
                             closeAndReconnect();
-                            retryAfter(retryWindow, RetryWindow.Kind.CONNECTION_LOST, offsetContext, e);
+                            retryAfter(retryWindow, watchDog, RetryWindow.Kind.CONNECTION_LOST, offsetContext, e);
                         }
                     }
                     catch (IOException | SQLNonTransientConnectionException e) { // SQLNonTransientConnectionException
@@ -199,11 +198,11 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         // connection errors
                         failIfSignOnRejected(offsetContext, e);
                         closeAndReconnect();
-                        retryAfter(retryWindow, RetryWindow.Kind.CONNECTION_LOST, offsetContext, e);
+                        retryAfter(retryWindow, watchDog, RetryWindow.Kind.CONNECTION_LOST, offsetContext, e);
                     }
                     catch (final Exception e) {
                         failIfSignOnRejected(offsetContext, e);
-                        retryAfter(retryWindow, RetryWindow.Kind.UNKNOWN, offsetContext, e);
+                        retryAfter(retryWindow, watchDog, RetryWindow.Kind.UNKNOWN, offsetContext, e);
                     }
                 }
                 catch (final InterruptedException e) { // handle InterruptedException during the exception handling
@@ -331,10 +330,9 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
     }
 
     /**
-     * Waits out the backoff {@link RetryWindow} sets for this failure, or stops the task once the failure has
-     * outlived its budget. One policy for every failure the loop retries, bounded by time rather than by count,
-     * and stopping with a {@link NotRetriableException} so Debezium's in-place restarts do not run the same
-     * retries over again on top of it.
+     * Waits out the backoff {@link RetryWindow} sets for this failure, or stops the task with a
+     * {@link NotRetriableException} once the failure has outlived its budget. A call that came back failed
+     * is not a stalled stream, so the watchdog is told the thread is alive and does not cut the backoff short.
      * <p>
      * The wait is deliberately not taken from the streaming loop's {@link Metronome}. That one advances its
      * tick by exactly one period per {@code pause()} call rather than by the wall clock, and the healthy
@@ -343,25 +341,24 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
      * {@code pause()} returns immediately. Sharing it inverted the intent: the busier the connector, the
      * less backoff it got.
      */
-    private void retryAfter(RetryWindow retryWindow, RetryWindow.Kind kind, As400OffsetContext offsetContext, Exception e)
+    private void retryAfter(RetryWindow retryWindow, WatchDog watchDog, RetryWindow.Kind kind, As400OffsetContext offsetContext,
+                            Exception e)
             throws InterruptedException {
+        watchDog.alive();
         final Duration backoff = retryWindow.failed(kind, offsetContext.getPosition(), e);
         // a Metronome of its own, created here, so this first and only pause() really waits the whole backoff
         Metronome.sleeper(backoff, clock).pause();
     }
 
     /**
-     * A rejected sign-on - wrong or expired password, disabled or unknown profile, missing authority - is
-     * not transient, whatever it is wrapped in: reconnecting reports it as an {@link IOException}. Retrying it
-     * cannot help, and every attempt is one more failed sign-on counted towards the system's limit
-     * ({@code QMAXSIGN}), which can disable the profile.
+     * Fails at once on a rejected sign-on, before reconnecting would attempt one more: see
+     * {@link As400ErrorHandler#isRetriable}.
      */
     private static void failIfSignOnRejected(As400OffsetContext offsetContext, Exception e) {
-        for (Throwable t = e; t != null; t = t.getCause()) {
-            if (t instanceof AS400SecurityException) {
-                throw new NotRetriableException(String.format("The IBM i rejected the connector at offset %s, retrying cannot fix it: %s",
-                        offsetContext.getPosition(), t.getMessage()), e);
-            }
+        final Throwable rejected = As400ErrorHandler.causedBy(e, AS400SecurityException.class);
+        if (rejected != null) {
+            throw new NotRetriableException(String.format("The IBM i rejected the connector at offset %s, retrying cannot fix it: %s",
+                    offsetContext.getPosition(), rejected.getMessage()), e);
         }
     }
 

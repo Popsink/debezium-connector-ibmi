@@ -10,19 +10,17 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
 import java.time.Duration;
-import java.util.EnumMap;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.atomic.AtomicLong;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 
-import io.debezium.connector.db2as400.RetryWindow.Budget;
+import io.debezium.config.CommonConnectorConfig;
+import io.debezium.config.Configuration;
 import io.debezium.connector.db2as400.RetryWindow.Kind;
-import io.debezium.util.Clock;
+import io.debezium.util.MockClock;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
@@ -39,13 +37,7 @@ class RetryWindowTest {
     private static final Duration POLL_INTERVAL = Duration.ofMillis(5);
     private static final String POSITION = "RCV/82";
 
-    private final AtomicLong now = new AtomicLong();
-    private final Clock clock = new Clock() {
-        @Override
-        public long currentTimeInMillis() {
-            return now.get();
-        }
-    };
+    private final MockClock clock = new MockClock();
     private final ListAppender<ILoggingEvent> logs = new ListAppender<>();
     private Logger logger;
 
@@ -61,19 +53,15 @@ class RetryWindowTest {
         logger.detachAppender(logs);
     }
 
-    private static Map<Kind, Budget> budgets() {
-        final Map<Kind, Budget> budgets = new EnumMap<>(Kind.class);
-        budgets.put(Kind.MEMBER_LOCKED, new Budget(Duration.ofHours(1), Duration.ofHours(8)));
-        budgets.put(Kind.CONNECTION_LOST, new Budget(Duration.ofMinutes(15), Duration.ofHours(2)));
-        budgets.put(Kind.POSITION_UNREADABLE, new Budget(Duration.ofMinutes(5), Duration.ofMinutes(15)));
-        budgets.put(Kind.UNKNOWN, new Budget(Duration.ZERO, Duration.ofMinutes(5)));
-        return budgets;
-    }
-
-    private final RetryWindow window = new RetryWindow(budgets(), POLL_INTERVAL, clock);
+    /** The production budgets, with the default timeouts. */
+    private final RetryWindow window = new RetryWindow(new As400ConnectorConfig(Configuration.create()
+            .with(CommonConnectorConfig.TOPIC_PREFIX, "serverX")
+            .with(As400ConnectorConfig.DATABASE_NAME, "serverX")
+            .with(CommonConnectorConfig.POLL_INTERVAL_MS, POLL_INTERVAL.toMillis())
+            .build()), clock);
 
     private void at(Duration elapsed) {
-        now.set(elapsed.toMillis());
+        clock.advanceTo(elapsed.toMillis());
     }
 
     private List<Level> levels() {

@@ -563,10 +563,11 @@ public class RetrieveJournal {
                                     getFullAS400MessageText(id)));
                 }
                 case "CPF7007": { // member allocated by another job, e.g. a nightly reorganise or save
-                    // transient: the caller waits for the lock to clear, far longer than for an unknown failure (issue #107)
+                    // transient: the caller waits for the lock to clear, far longer than for an unknown failure (issue #107).
+                    // The first-level text names the member; the help text would cost a round trip on every retry
                     throw new ObjectLockedException(
                             String.format("Call failed position %s parameters %s member locked by another job: %s", retrievePosition, builder,
-                                    getFullAS400MessageText(id)));
+                                    id.getText()));
                 }
                 case "CPF7062": {
                     log.debug("Normal when filtering, call failed position {} parameters {} no data received: {}", retrievePosition, builder,

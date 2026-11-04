@@ -17,6 +17,8 @@ import org.apache.kafka.connect.errors.RetriableException;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import com.ibm.as400.access.AS400SecurityException;
+
 import io.debezium.DebeziumException;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
@@ -76,6 +78,15 @@ class As400ErrorHandlerTest {
     void aFailureTheStreamingLoopGaveUpOnIsNotRetriedAgain() {
         assertThat(reportedFor(new NotRetriableException("Gave up at offset X: the connection to the IBM i is lost",
                 new IOException("Failed to reconnect"))))
+                .isInstanceOf(ConnectException.class)
+                .isNotInstanceOf(RetriableException.class);
+    }
+
+    /** A rejected sign-on is reported as a lost connection, and retrying it only adds failed sign-ons. */
+    @Test
+    void aRejectedSignOnIsNotRetried() {
+        assertThat(reportedFor(new DebeziumException("Failed to start the snapshot",
+                new IOException("Failed to reconnect", mock(AS400SecurityException.class)))))
                 .isInstanceOf(ConnectException.class)
                 .isNotInstanceOf(RetriableException.class);
     }

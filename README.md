@@ -157,8 +157,8 @@ Three things are done to keep this from turning into a silent crash-loop:
   | `earliest` | Reset streaming to the earliest available journal receiver and continue. Intended for streaming-only / `no_data` connectors. Changes between the lost position and the earliest available receiver are **unrecoverable** and a loud warning is logged. Its cost scales with retention x journal rate: everything already delivered is re-read. On a busy journal this is effectively a denial of service against yourself - see below. |
   | `latest` | Reset streaming to the current journal head and continue, replaying nothing. Recommended for streaming-only / `no_data` connectors. Changes between the lost position and the head are **unrecoverable** and a loud warning is logged - exactly the same gap as `earliest`, without the replay. Requires `errors.tolerance=all` - see below. |
 
-  Mid-stream recovery is bounded: a position that cannot be read is retried for 15 minutes, then the
-  task stops rather than looping forever (see [Streaming retries](#streaming-retries)). A position that
+  Mid-stream recovery is bounded in time, then the task stops rather than looping forever (see
+  [Streaming retries](#streaming-retries)). A position that
   no longer exists is not retriable and stops the task; to have the engine restart on that too, set
   `errors.max.retries` together with `custom.retriable.exception=.*IBMI_OFFSET_NO_LONGER_AVAILABLE.*`.
 
@@ -245,9 +245,9 @@ The lock clears on its own, so it gets the longest budget: no restart, no reconn
 batch. The budget is there for a job that never releases its lock. Raise it if your batch windows run
 longer than 8 hours.
 
-**Rejected sign-ons** are not retried at all: reconnecting reports them as an `IOException`, but no retry
-can fix them, and each attempt is one more failed sign-on counted towards the system's limit
-(`QMAXSIGN`), which can disable the profile.
+**Rejected sign-ons** are not retried at all, by the streaming loop or by Debezium: reconnecting reports
+them as an `IOException`, but no retry can fix them, and each attempt is one more failed sign-on counted
+towards the system's limit (`QMAXSIGN`), which can disable the profile.
 
 ## Tables that cannot be captured
 
