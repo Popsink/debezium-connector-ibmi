@@ -228,6 +228,20 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                     + "practice. Files with a real SQL primary key are unaffected either way.",
             DEFAULT_DDS_KEY_REQUIRE_UNIQUE);
 
+    public static final int DEFAULT_CONNECTION_PROBE_TIMEOUT_MS = 15_000;
+
+    /**
+     * Bounds the liveness probe of the JDBC connection wrapper. It was a hard-coded 3 s, close to one round
+     * trip on a slow link, so a merely slow probe closed a working connection under the snapshot
+     * (Popsink/data-plane#5814).
+     */
+    public static final Field CONNECTION_PROBE_TIMEOUT_MS = Field.create("connection.probe.timeout.ms",
+            "JDBC connection liveness probe timeout (ms)",
+            "How long the liveness probe of the JDBC connection may take before it counts as failed. The "
+                    + "connection is only replaced when that probe fails and a cheap statement then fails too, "
+                    + "so a slow but working link keeps its connection. Raise it on a high-latency host.",
+            DEFAULT_CONNECTION_PROBE_TIMEOUT_MS);
+
     public static final Field TOPIC_NAMING_STRATEGY = Field.create("topic.naming.strategy")
             .withDisplayName("Topic naming strategy class")
             .withType(Type.CLASS)
@@ -573,7 +587,8 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
             MAX_SERVER_SIDE_ENTRIES, TOPIC_NAMING_STRATEGY, FROM_CCSID, TO_CCSID, SECURE,
             DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
             UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
-            ERRORS_TOLERANCE, LOB_FETCH, POINTER_HANDLE_THRESHOLD, JOURNAL_PREFETCH, DDS_KEY_REQUIRE_UNIQUE);
+            ERRORS_TOLERANCE, LOB_FETCH, POINTER_HANDLE_THRESHOLD, JOURNAL_PREFETCH, DDS_KEY_REQUIRE_UNIQUE,
+            CONNECTION_PROBE_TIMEOUT_MS);
 
     public static ConfigDef configDef() {
         final ConfigDef c = RelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
@@ -584,7 +599,8 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                         DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
                         UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
                         LOB_FETCH,
-                        POINTER_HANDLE_THRESHOLD, JOURNAL_PREFETCH, DDS_KEY_REQUIRE_UNIQUE)
+                        POINTER_HANDLE_THRESHOLD, JOURNAL_PREFETCH, DDS_KEY_REQUIRE_UNIQUE,
+                        CONNECTION_PROBE_TIMEOUT_MS)
                 .connector(
                         SCHEMA_NAME_ADJUSTMENT_MODE)
                 .events(
@@ -831,6 +847,7 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
         JdbcConfiguration dbConfig = super.getJdbcConfig();
         JdbcConfiguration.Builder dbFromConfig = JdbcConfiguration.create();
         dbFromConfig.with("secure", Boolean.toString(isSecure()));
+        dbFromConfig.with(CONNECTION_PROBE_TIMEOUT_MS.name(), Integer.toString(config.getInteger(CONNECTION_PROBE_TIMEOUT_MS)));
         int fromCcsid = getFromCcsid();
         if (fromCcsid != -1) {
             dbFromConfig.with("from.ccsid", Integer.toString(fromCcsid));
