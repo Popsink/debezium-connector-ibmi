@@ -7,10 +7,18 @@ package io.debezium.ibmi.db2.journal.retrieve;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.List;
@@ -18,6 +26,7 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 
 import io.debezium.ibmi.db2.journal.retrieve.DdsKeys.DdsKey;
+import io.debezium.ibmi.db2.journal.retrieve.DdsKeys.Uniqueness;
 
 /**
  * A DDS keyed access path only identifies a record when the file was created with {@code UNIQUE};
@@ -129,5 +138,106 @@ class DdsKeysTest {
         assertFalse(DdsKeys.read(keyedFile("KEYED FCFO", "K")).unique());
         assertFalse(DdsKeys.read(keyedFile(" ", "K")).unique());
         assertFalse(DdsKeys.read(keyedFile(null, "K")).unique());
+    }
+
+    // --- data-plane#5932: a release without QSYS2.SYSFILES (before IBM i 7.4 TR7 / 7.5 TR1) ---
+
+    private static final SQLException SQL0204 = new SQLException("[SQL0204] SYSFILES in QSYS2 type *FILE not found.", "42704", -204);
+    private static final SQLException SQL0551 = new SQLException("[SQL0551] Not authorized to object QADBXREF in QSYS type *FILE.", "42501", -551);
+
+    private final Connection con = mock(Connection.class);
+
+    /** A statement whose query answers {@code rs}, or fails with {@code failure} when it is not null. */
+    private void answer(String query, SQLException failure, ResultSet rs) throws SQLException {
+        if (failure != null) {
+            when(con.prepareStatement(query)).thenThrow(failure);
+            return;
+        }
+        final PreparedStatement ps = mock(PreparedStatement.class);
+        when(ps.executeQuery()).thenReturn(rs);
+        when(con.prepareStatement(query)).thenReturn(ps);
+    }
+
+    @Test
+    void aSystemWithSysfilesNeverTouchesTheOtherCatalogs() throws Exception {
+        answer(DdsKeys.KEY_COLUMNS, null, keyedFile(UNIQUE, "ORDER_NO"));
+
+        final DdsKey key = new DdsKeys.Reader().read(con, "LIB", "ORDERS");
+
+        assertTrue(key.unique());
+        verify(con, never()).prepareStatement(DdsKeys.KEY_COLUMNS_QADBXREF);
+        verify(con, never()).prepareStatement(DdsKeys.KEY_COLUMNS_ONLY);
+    }
+
+    /** The crash loop: SQL0204 on SYSFILES failed every start. QADBXREF.DBXUNQ tells the same thing. */
+    @Test
+    void aMissingSysfilesFallsBackToTheCrossReferenceFile() throws Exception {
+        answer(DdsKeys.KEY_COLUMNS, SQL0204, null);
+        answer(DdsKeys.KEY_COLUMNS_QADBXREF, null, keyedFile("U", "ORDER_NO"));
+
+        final DdsKey key = new DdsKeys.Reader().read(con, "LIB", "ORDERS");
+
+        assertEquals(List.of("ORDER_NO"), key.columns());
+        assertTrue(key.unique());
+    }
+
+    @Test
+    void aDuplicateAllowingFileReadFromTheCrossReferenceFileIsNotUnique() throws Exception {
+        answer(DdsKeys.KEY_COLUMNS, SQL0204, null);
+        answer(DdsKeys.KEY_COLUMNS_QADBXREF, null, keyedFile("D", "ACCOUNT"));
+
+        assertSame(Uniqueness.DUPLICATES_ALLOWED, new DdsKeys.Reader().read(con, "LIB", "GL").uniqueness());
+    }
+
+    /** The view's absence is a property of the system: one failing round trip per connection, not per table. */
+    @Test
+    void theMissingViewIsOnlyTriedOncePerReader() throws Exception {
+        answer(DdsKeys.KEY_COLUMNS, SQL0204, null);
+        final PreparedStatement ps = mock(PreparedStatement.class);
+        when(ps.executeQuery()).thenAnswer(i -> keyedFile("U", "K"));
+        when(con.prepareStatement(DdsKeys.KEY_COLUMNS_QADBXREF)).thenReturn(ps);
+        final DdsKeys.Reader reader = new DdsKeys.Reader();
+
+        reader.read(con, "LIB", "A");
+        reader.read(con, "LIB", "B");
+        reader.read(con, "LIB", "C");
+
+        verify(con, times(1)).prepareStatement(DdsKeys.KEY_COLUMNS);
+        verify(con, times(3)).prepareStatement(DdsKeys.KEY_COLUMNS_QADBXREF);
+    }
+
+    /** No SYSFILES and no authority on QADBXREF: the key columns alone, uniqueness unknown, never a failed start. */
+    @Test
+    void aRefusedCrossReferenceFileLeavesTheUniquenessUnknown() throws Exception {
+        answer(DdsKeys.KEY_COLUMNS, SQL0204, null);
+        answer(DdsKeys.KEY_COLUMNS_QADBXREF, SQL0551, null);
+        final ResultSet rs = mock(ResultSet.class);
+        when(rs.next()).thenReturn(true, true, false);
+        when(rs.getString(1)).thenReturn("ACCOUNT ", "POSTED_ON ");
+        answer(DdsKeys.KEY_COLUMNS_ONLY, null, rs);
+
+        final DdsKey key = new DdsKeys.Reader().read(con, "LIB", "GL");
+
+        assertSame(Uniqueness.UNKNOWN, key.uniqueness());
+        assertEquals(List.of("ACCOUNT", "POSTED_ON"), key.columns());
+        assertEquals(List.of(), key.asRecordKey(true, "LIB", "GL"));
+        assertEquals(List.of("ACCOUNT", "POSTED_ON"), key.asRecordKey(false, "LIB", "GL"));
+    }
+
+    /** Only a missing or refused catalog degrades; anything else (a lock, a dropped link) still fails loudly. */
+    @Test
+    void anyOtherFailureStillPropagates() throws Exception {
+        final SQLException locked = new SQLException("[SQL0913] Row or object in use.", "57033", -913);
+        when(con.prepareStatement(anyString())).thenThrow(locked);
+
+        assertSame(locked, assertThrows(SQLException.class, () -> new DdsKeys.Reader().read(con, "LIB", "GL")));
+        verify(con, never()).prepareStatement(DdsKeys.KEY_COLUMNS_QADBXREF);
+    }
+
+    @Test
+    void aRefusedSysfilesIsNotMistakenForAMissingOne() throws Exception {
+        answer(DdsKeys.KEY_COLUMNS, SQL0551, null);
+
+        assertThrows(SQLException.class, () -> new DdsKeys.Reader().read(con, "LIB", "GL"));
     }
 }
