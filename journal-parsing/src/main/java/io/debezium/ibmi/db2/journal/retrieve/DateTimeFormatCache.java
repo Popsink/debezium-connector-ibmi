@@ -33,17 +33,23 @@ import com.ibm.as400.access.AS400Time;
  */
 public class DateTimeFormatCache {
     // SYSCOLUMNS2 (not SYSCOLUMNS) exposes the DDS-derived date/time format and separator columns; they were added in
-    // IBM i 7.4 TR5 / 7.3 TR11. On older releases the prepare fails, lookup() swallows it and the decoder falls back to
-    // the default *ISO behaviour. SYSCOLUMNS2 is a superset of SYSCOLUMNS and IBM recommends it for performance.
+    // IBM i 7.4 TR5 / 7.3 TR11. On older releases the prepare fails (SQL0204 / SQL0206), lookup() logs it once, stops
+    // asking and the decoder falls back to the default *ISO behaviour (data-plane#5932: one ERROR per table before).
+    // SYSCOLUMNS2 is a superset of SYSCOLUMNS and IBM recommends it for performance.
     private static final String GET_FORMATS = "select table_name, system_table_name, column_name, system_column_name, "
             + "date_format, date_separator, time_format, time_separator "
             + "FROM qsys2.SYSCOLUMNS2 where table_schema=? and (system_table_name = ? or table_name = ?)";
 
     static final Logger log = LoggerFactory.getLogger(DateTimeFormatCache.class);
+    /** jt400's {@link SQLException#getErrorCode()} for SQL0204 (no such object) and SQL0206 (no such column). */
+    private static final int OBJECT_NOT_FOUND = -204;
+    private static final int COLUMN_NOT_FOUND = -206;
 
     private final Map<String, Optional<FormatAndSeparator>> dateMap = new HashMap<>();
     private final Map<String, Optional<FormatAndSeparator>> timeMap = new HashMap<>();
     private final Connect<Connection, SQLException> jdbcConnect;
+    /** Set once the release is known to lack the catalog read; every later lookup is then unknown without a query. */
+    private volatile boolean catalogMissing;
 
     public DateTimeFormatCache(final Connect<Connection, SQLException> jdbcConnect) {
         this.jdbcConnect = jdbcConnect;
@@ -80,11 +86,23 @@ public class DateTimeFormatCache {
             return map.get(canonicalName);
         }
 
-        try {
-            fetchAllFormatsForTable(schema, table);
-        }
-        catch (final Exception e) {
-            log.error("failed to fetch date/time formats for {}.{}", schema, table, e);
+        if (!catalogMissing) {
+            try {
+                fetchAllFormatsForTable(schema, table);
+            }
+            catch (final SQLException e) {
+                if (e.getErrorCode() == OBJECT_NOT_FOUND || e.getErrorCode() == COLUMN_NOT_FOUND) {
+                    catalogMissing = true;
+                    log.warn("This IBM i release has no QSYS2.SYSCOLUMNS2 date/time format columns ({}); DATE and TIME "
+                            + "columns are decoded as *ISO for every table.", e.getMessage());
+                }
+                else {
+                    log.error("failed to fetch date/time formats for {}.{}", schema, table, e);
+                }
+            }
+            catch (final Exception e) {
+                log.error("failed to fetch date/time formats for {}.{}", schema, table, e);
+            }
         }
         // cache the negative result so an unknown column doesn't re-query on every record
         return map.computeIfAbsent(canonicalName, k -> Optional.empty());

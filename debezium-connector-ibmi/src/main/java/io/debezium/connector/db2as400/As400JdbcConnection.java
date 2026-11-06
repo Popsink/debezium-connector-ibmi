@@ -56,6 +56,7 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
     private final int toCcsid;
     /** See {@link As400ConnectorConfig#DDS_KEY_REQUIRE_UNIQUE}. */
     private final boolean requireUniqueDdsKey;
+    private final DdsKeys.Reader ddsKeyReader = new DdsKeys.Reader();
     private boolean registered = false;
     /** Set by the schema, which owns the decoder; null until then, when no column is read as text. */
     private UntaggedColumns untaggedColumns;
@@ -341,12 +342,7 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
      * key - see {@link DdsKeys}. A file created in SQL has none and reads empty.
      */
     protected DdsKey readDdsKey(TableId id) throws SQLException {
-        return prepareQueryAndMap(DdsKeys.KEY_COLUMNS,
-                call -> {
-                    call.setString(1, id.schema());
-                    call.setString(2, id.table());
-                },
-                DdsKeys::read);
+        return ddsKeyReader.read(connection(), id.schema(), id.table());
     }
 
     protected List<String> mapSystemColumnNamesToLongNames(TableId id, List<String> systemColumnNames) throws SQLException {
