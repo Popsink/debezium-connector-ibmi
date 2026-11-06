@@ -15,20 +15,28 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLTimeoutException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.List;
 import java.util.OptionalInt;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.junit.jupiter.api.Test;
 
 import com.ibm.as400.access.AS400Text;
 
 import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
+import io.debezium.ibmi.db2.journal.data.types.UntaggedCcsid;
 
 /** Given a table's untagged columns and a sample of their bytes, when decided, then text or binary. */
 class UntaggedColumnsTest {
@@ -83,19 +91,69 @@ class UntaggedColumnsTest {
 
         assertEquals(OptionalInt.of(1388), columns.textCcsid("LIB", "T", "NAME"));
         assertTrue(columns.textCcsid("LIB", "T", "PWD").isEmpty());
-        assertEquals("LIB.T.NAME=1388;LIB.T.PWD=hex", decisions.serialized());
+        assertEquals("LIB.T.NAME=1388;LIB.T.PWD=binary", decisions.serialized());
         // one capped query for both columns
         verify(connection, times(1)).prepareStatement(
                 "SELECT \"NAME\", \"PWD\" FROM \"LIB\".\"T\" FETCH FIRST 1000 ROWS ONLY OPTIMIZE FOR 1000 ROWS");
         verify(sample).setQueryTimeout(UntaggedColumns.SAMPLE_TIMEOUT_SECONDS);
     }
 
-    /** A single unreadable value is enough: a column of mostly text with binary in it is not text. */
+    /** Under {@link UntaggedCcsid#VALUES_PER_FAILURE} values, a single unreadable one keeps the column binary. */
     @Test
-    void oneUnreadableValueKeepsTheColumnBinary() throws SQLException {
+    void inASmallSampleOneUnreadableValueKeepsTheColumnBinary() throws SQLException {
         table(List.of("C"), List.of(new byte[][]{ ebcdic("ABC") }, new byte[][]{ HASH }, new byte[][]{ ebcdic("DEF") }));
 
         assertTrue(columns(37).textCcsid("LIB", "T", "C").isEmpty());
+    }
+
+    /**
+     * The sample Popsink/data-plane#5989 met on a 1388 host, pinned from data-plane's
+     * {@code docs/ibmi-untagged-sample.tsv}: a thousand clean CJK values and two damaged on the host, a stored
+     * SUB and an unmapped DBCS code. The column is text, and the damaged values decode as the file says.
+     */
+    @Test
+    void aFewValuesDamagedOnTheHostLeaveTheColumnText() throws Exception {
+        final List<byte[][]> rows = new ArrayList<>();
+        try (InputStream in = getClass().getResourceAsStream("/ibmi-untagged-sample.tsv")) {
+            for (final String line : new String(in.readAllBytes(), StandardCharsets.UTF_8).split("\n")) {
+                if (!line.isBlank() && !line.startsWith("#")) {
+                    final String[] cells = line.split("\t");
+                    final byte[] value = HexFormat.of().parseHex(cells[0]);
+                    assertEquals(unescape(cells[1]), new AS400Text(value.length, 1388).toObject(value));
+                    rows.addAll(Collections.nCopies(Integer.parseInt(cells[2]), new byte[][]{ value }));
+                }
+            }
+        }
+        table(List.of("NAME"), rows);
+
+        assertEquals(OptionalInt.of(1388), columns(935).textCcsid("LIB", "T", "NAME"));
+    }
+
+    /** Binary data fails on most values: it stays binary however large the sample. */
+    @Test
+    void binaryDataStaysBinaryWithAFewValuesThatReadAsText() throws SQLException {
+        final List<byte[][]> rows = new ArrayList<>(Collections.nCopies(900, new byte[][]{ HASH }));
+        rows.addAll(Collections.nCopies(100, new byte[][]{ ebcdic("ABC") }));
+        table(List.of("C"), rows);
+
+        assertTrue(columns(37).textCcsid("LIB", "T", "C").isEmpty());
+    }
+
+    /** Blanks say nothing: they never dilute a column's failures, as in the loaders. */
+    @Test
+    void blanksDoNotDiluteTheFailures() throws SQLException {
+        final List<byte[][]> rows = new ArrayList<>(Collections.nCopies(100, new byte[][]{ BLANKS }));
+        rows.add(new byte[][]{ HASH });
+        rows.add(new byte[][]{ ebcdic("ABC") });
+        table(List.of("C"), rows);
+
+        assertTrue(columns(37).textCcsid("LIB", "T", "C").isEmpty());
+    }
+
+    /** The file's JSON string, which only ever escapes as backslash-u and four hex digits. */
+    private static String unescape(String json) {
+        return Pattern.compile("\\\\u([0-9a-f]{4})").matcher(json.substring(1, json.length() - 1))
+                .replaceAll(m -> Matcher.quoteReplacement(String.valueOf((char) Integer.parseInt(m.group(1), 16))));
     }
 
     @Test
@@ -113,7 +171,7 @@ class UntaggedColumnsTest {
 
         assertTrue(columns.textCcsid("LIB", "T", "A").isEmpty());
         assertTrue(columns.textCcsid("LIB", "T", "B").isEmpty());
-        assertEquals("LIB.T.A=hex;LIB.T.B=hex", decisions.serialized());
+        assertEquals("LIB.T.A=binary;LIB.T.B=binary", decisions.serialized());
     }
 
     /** An unknown system CCSID names no code page: binary, never the pod's locale guess, as the loaders do. */
@@ -123,14 +181,14 @@ class UntaggedColumnsTest {
         final UntaggedColumns columns = columns(As400TextFactory.NO_CCSID);
 
         assertTrue(columns.textCcsid("LIB", "T", "C").isEmpty());
-        assertEquals("LIB.T.C=hex", decisions.serialized(), "decided, so a later known CCSID does not flip it");
+        assertEquals("LIB.T.C=binary", decisions.serialized(), "decided, so a later known CCSID does not flip it");
         verify(connection, never()).prepareStatement(org.mockito.ArgumentMatchers.startsWith("SELECT "));
     }
 
     /** What the offset carries is not re-sampled, so a restart never flips a column's type. */
     @Test
     void aPersistedDecisionIsNotResampled() throws SQLException {
-        decisions.load("LIB.T.C=hex;LIB.T.D=1388");
+        decisions.load("LIB.T.C=binary;LIB.T.D=1388");
         final UntaggedColumns columns = columns(935);
 
         assertTrue(columns.textCcsid("LIB", "T", "C").isEmpty());
