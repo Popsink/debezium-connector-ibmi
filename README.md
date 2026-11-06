@@ -28,6 +28,7 @@ Patches that upstream accepts are dropped from the fork at the next rebase. Upst
 | `latest` journal position recovery strategy (#84) | Candidate for upstream (#93) |
 | SLF4J placeholder mismatches (#56) | Candidate for upstream (#93) |
 | A DDS keyed access path only keys records when the file requires unique keys, `dds.key.require.unique` (#96) | Candidate for upstream (#93) |
+| Time-bounded streaming retries per kind of failure, CPF7007 member locks waited out, rejected sign-ons not retried (#107) | Popsink-only for now; tuned for an orchestrator that restarts a failed engine |
 
 Already accepted upstream and no longer carried here: persist and load the incremental snapshot status (debezium/dbz#1861) and the reliable connection close that clears the prepared-statement cache (debezium/dbz#2204).
 
@@ -156,12 +157,10 @@ Three things are done to keep this from turning into a silent crash-loop:
   | `earliest` | Reset streaming to the earliest available journal receiver and continue. Intended for streaming-only / `no_data` connectors. Changes between the lost position and the earliest available receiver are **unrecoverable** and a loud warning is logged. Its cost scales with retention x journal rate: everything already delivered is re-read. On a busy journal this is effectively a denial of service against yourself - see below. |
   | `latest` | Reset streaming to the current journal head and continue, replaying nothing. Recommended for streaming-only / `no_data` connectors. Changes between the lost position and the head are **unrecoverable** and a loud warning is logged - exactly the same gap as `earliest`, without the replay. Requires `errors.tolerance=all` - see below. |
 
-  Mid-stream recovery is bounded: 20 consecutive failed polls fail the task rather than looping forever.
-  A lost connection (`IOException`, or the jt400 driver's `SQLNonTransientConnectionException`) is
-  classified as retriable, so hitting the bound restarts the connector — unlimited by default, see
-  `errors.max.retries` — rather than stopping the task. A position that no longer exists is not retriable
-  and stops the task; to have the engine restart on that too, set `errors.max.retries` together with
-  `custom.retriable.exception=.*IBMI_OFFSET_NO_LONGER_AVAILABLE.*`.
+  Mid-stream recovery is bounded in time, then the task stops rather than looping forever (see
+  [Streaming retries](#streaming-retries)). A position that
+  no longer exists is not retriable and stops the task; to have the engine restart on that too, set
+  `errors.max.retries` together with `custom.retriable.exception=.*IBMI_OFFSET_NO_LONGER_AVAILABLE.*`.
 
   Setting `snapshot.mode=when_needed` also triggers Debezium core's own re-snapshot-on-data-error path,
   which is equivalent to `journal.unavailable.position.recovery=snapshot`.
@@ -212,6 +211,43 @@ this:
 
 > Not to be confused with a stale JDBC connection detected mid-snapshot, which is a connection-liveness
 > issue rather than offset/position recovery.
+
+## Streaming retries
+
+Every failure the streaming loop retries goes through one policy, bounded by **time** rather than by a
+count of attempts. A retry window opens at the first failed poll and closes at the next successful one;
+each failure is measured from the start of the window against the budget of its own kind:
+
+| Failure | While retrying | ERROR after | Gives up after |
+| --- | --- | --- | --- |
+| A journaled member locked by another job (**CPF7007**) | waits, keeps the connection | 1 hour | `journal.lock.timeout.ms` (default 8 hours) |
+| The IBM i unreachable (`IOException`, `SQLNonTransientConnectionException`, a call the watchdog interrupted) | reconnects | 15 minutes | `connection.retry.timeout.ms` (default 2 hours) |
+| A journal position the server refuses while it is still in the receiver chain | resolves the range again | 5 minutes | 15 minutes |
+| Anything else | retries | at once | 5 minutes |
+| The sign-on rejected (wrong or expired password, disabled profile, missing authority) | — | at once | at once |
+
+The backoff between attempts grows from `poll.interval.ms` to 8 times it. A failure is logged with its
+stack trace when the window opens (or when the kind of failure changes), then summarised every 5
+minutes, at WARN until the wait passes its ERROR threshold and at ERROR after it; the recovery is logged
+at INFO. Because each budget is finite and measured from the start of the window, a stream that keeps
+failing stops by the largest budget even when the kind of failure keeps changing: a permanent failure
+that looks transient is never retried forever.
+
+When a budget is spent the task stops with an error naming the failure and the setting that bounds it.
+That error is **never retried by Debezium**, even when a lost connection is in its cause chain, so
+`errors.max.retries` does not run the same retries a second time on top of the loop's; the orchestrator
+decides what happens next (Popsink restarts the process). `errors.max.retries` still applies to the
+failures the loop does not retry: task start, snapshots, and a stuck blocking-snapshot handshake.
+
+**Member locks.** A job holding a lock on a journaled member — typically a nightly reorganise, clear or
+save — makes the journal call fail with CPF7007 for every table of the source, not just the locked one.
+The lock clears on its own, so it gets the longest budget: no restart, no reconnect, no re-delivered
+batch. The budget is there for a job that never releases its lock. Raise it if your batch windows run
+longer than 8 hours.
+
+**Rejected sign-ons** are not retried at all, by the streaming loop or by Debezium: reconnecting reports
+them as an `IOException`, but no retry can fix them, and each attempt is one more failed sign-on counted
+towards the system's limit (`QMAXSIGN`), which can disable the profile.
 
 ## Tables that cannot be captured
 

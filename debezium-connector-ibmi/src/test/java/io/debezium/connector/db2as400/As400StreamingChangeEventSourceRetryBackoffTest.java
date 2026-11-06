@@ -6,7 +6,6 @@
 package io.debezium.connector.db2as400;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -20,7 +19,6 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import org.junit.jupiter.api.Test;
 
-import io.debezium.DebeziumException;
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.ibmi.db2.journal.retrieve.JournalReceiver;
 import io.debezium.ibmi.db2.journal.retrieve.RetrievalState;
@@ -45,11 +43,13 @@ class As400StreamingChangeEventSourceRetryBackoffTest {
     private static final int WATCHDOG_TIMEOUT_MS = 60_000;
     /** Small enough to keep the tests quick, large enough that the assertions aren't scheduler noise. */
     private static final Duration POLL_INTERVAL = Duration.ofMillis(5);
+    /** Failed polls after the healthy one. */
+    private static final int FAILURES = 11;
     /**
-     * What {@link #POLL_INTERVAL} the 19 pauses of an exhausted retry budget add up to:
-     * 1 + 2 + 4 (attempts 1-3) + 8 x 16 (attempts 4-19, capped).
+     * What {@link #POLL_INTERVAL} the pauses after {@link #FAILURES} failed polls add up to:
+     * 1 + 2 + 4 (attempts 1-3) + 8 x 8 (attempts 4-11, capped).
      */
-    private static final long TOTAL_BACKOFF_IN_POLL_INTERVALS = 135;
+    private static final long TOTAL_BACKOFF_IN_POLL_INTERVALS = 71;
 
     private final As400ConnectorConfig config = mock(As400ConnectorConfig.class);
     private final As400RpcConnection dataConnection = mock(As400RpcConnection.class);
@@ -95,6 +95,7 @@ class As400StreamingChangeEventSourceRetryBackoffTest {
     private As400StreamingChangeEventSource source() {
         when(config.getPollInterval()).thenReturn(POLL_INTERVAL);
         when(config.getMaxRetrievalTimeout()).thenReturn(WATCHDOG_TIMEOUT_MS);
+        when(config.getConnectionRetryTimeout()).thenReturn(As400ConnectorConfig.DEFAULT_CONNECTION_RETRY_TIMEOUT);
         when(config.getSnapshotMode()).thenReturn(As400ConnectorConfig.SnapshotMode.WHEN_NEEDED);
         when(jdbcConnection.getRealDatabaseName()).thenReturn("DB");
         when(offsetContext.getPosition()).thenReturn(new JournalProcessedPosition(
@@ -106,25 +107,10 @@ class As400StreamingChangeEventSourceRetryBackoffTest {
                 mock(ErrorHandler.class), Clock.SYSTEM, mock(As400DatabaseSchema.class), new SnapshotActivity());
     }
 
-    @Test
-    void backoffGrowsWithEachRetryThenLevelsOffAtTheCap() {
-        final As400StreamingChangeEventSource source = source();
-
-        assertThat(source.retryBackoff(0)).isEqualTo(POLL_INTERVAL);
-        assertThat(source.retryBackoff(1)).isEqualTo(POLL_INTERVAL.multipliedBy(2));
-        assertThat(source.retryBackoff(2)).isEqualTo(POLL_INTERVAL.multipliedBy(4));
-        assertThat(source.retryBackoff(3)).isEqualTo(POLL_INTERVAL.multipliedBy(8));
-        // capped from here on, including at the very edge of the retry budget
-        assertThat(source.retryBackoff(4)).isEqualTo(POLL_INTERVAL.multipliedBy(8));
-        assertThat(source.retryBackoff(19)).isEqualTo(POLL_INTERVAL.multipliedBy(8));
-        // and no overflow for a shift that would wrap a long
-        assertThat(source.retryBackoff(Integer.MAX_VALUE)).isEqualTo(POLL_INTERVAL.multipliedBy(8));
-    }
-
     /**
      * The regression: a connector that streamed with data for a while, then hit a failure burst, must still
      * spread its retries. Before the fix the first successful iteration alone was enough to put the shared
-     * metronome's tick far enough behind that all 20 attempts were consumed with no waiting at all.
+     * metronome's tick far enough behind that every retry was made with no waiting at all.
      */
     @Test
     void retriesStillWaitAfterTheLoopHasBeenStreamingWithData() throws Exception {
@@ -144,13 +130,12 @@ class As400StreamingChangeEventSourceRetryBackoffTest {
                     throw new IOException("journal RPC call failed");
                 });
 
-        assertThatThrownBy(() -> source.execute(new BoundedContext(1000), new As400Partition("server"), offsetContext))
-                .isInstanceOf(DebeziumException.class)
-                .hasMessageContaining("after 20 retries");
+        // one healthy poll, then the failures, all well inside the connection's retry window
+        source.execute(new BoundedContext(1 + FAILURES), new As400Partition("server"), offsetContext);
 
         final Duration spentRetrying = Duration.ofNanos(System.nanoTime() - firstFailureAt.get());
-        // the 19 pauses of an exhausted budget, halved to leave room for a coarse scheduler. Before the fix
-        // this burst took about 33ms, i.e. an order of magnitude under the threshold, whatever the margin
+        // the pauses of the failed polls, halved to leave room for a coarse scheduler. Before the fix a burst
+        // like this took a few milliseconds, i.e. an order of magnitude under the threshold, whatever the margin
         assertThat(spentRetrying).isGreaterThan(POLL_INTERVAL.multipliedBy(TOTAL_BACKOFF_IN_POLL_INTERVALS / 2));
     }
 

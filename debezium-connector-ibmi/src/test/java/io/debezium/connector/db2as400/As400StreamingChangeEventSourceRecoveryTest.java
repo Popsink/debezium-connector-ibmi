@@ -5,6 +5,7 @@
  */
 package io.debezium.connector.db2as400;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.atLeastOnce;
@@ -14,12 +15,16 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.io.IOException;
 import java.math.BigInteger;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.junit.jupiter.api.Test;
+
+import com.ibm.as400.access.AS400SecurityException;
 
 import io.debezium.DebeziumException;
 import io.debezium.connector.db2as400.As400ConnectorConfig.UnavailablePositionRecovery;
@@ -30,6 +35,7 @@ import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalFilterExcep
 import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalRangeException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.JournalReceiverNotFoundException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
+import io.debezium.ibmi.db2.journal.retrieve.exception.ObjectLockedException;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.source.spi.ChangeEventSource.ChangeEventSourceContext;
@@ -89,11 +95,17 @@ class As400StreamingChangeEventSourceRecoveryTest {
     }
 
     private As400StreamingChangeEventSource source(UnavailablePositionRecovery mode) {
+        return source(mode, Clock.SYSTEM);
+    }
+
+    private As400StreamingChangeEventSource source(UnavailablePositionRecovery mode, Clock clock) {
         // the receiver the position names is gone from the chain, i.e. this really is a lost position and not
         // a range the connector resolved badly (issue #79); positionStillOnTheServer() is the other case
         when(dataConnection.isPositionStillAvailable(any())).thenReturn(false);
         when(config.getPollInterval()).thenReturn(Duration.ofMillis(1));
         when(config.getMaxRetrievalTimeout()).thenReturn(WATCHDOG_TIMEOUT_MS);
+        when(config.getJournalLockTimeout()).thenReturn(As400ConnectorConfig.DEFAULT_JOURNAL_LOCK_TIMEOUT);
+        when(config.getConnectionRetryTimeout()).thenReturn(As400ConnectorConfig.DEFAULT_CONNECTION_RETRY_TIMEOUT);
         when(config.getUnavailablePositionRecovery()).thenReturn(mode);
         when(config.getSnapshotMode()).thenReturn(As400ConnectorConfig.SnapshotMode.WHEN_NEEDED);
         when(jdbcConnection.getRealDatabaseName()).thenReturn("DB");
@@ -103,7 +115,17 @@ class As400StreamingChangeEventSourceRecoveryTest {
         @SuppressWarnings("unchecked")
         final EventDispatcher<As400Partition, TableId> dispatcher = mock(EventDispatcher.class);
         return new As400StreamingChangeEventSource(config, dataConnection, jdbcConnection, dispatcher,
-                mock(ErrorHandler.class), Clock.SYSTEM, mock(As400DatabaseSchema.class), new SnapshotActivity());
+                mock(ErrorHandler.class), clock, mock(As400DatabaseSchema.class), new SnapshotActivity());
+    }
+
+    /** A minute passes every time the time is read, so budgets of hours go by in a few hundred polls. */
+    private static Clock fastClock(AtomicLong now) {
+        return new Clock() {
+            @Override
+            public long currentTimeInMillis() {
+                return now.addAndGet(60_000);
+            }
+        };
     }
 
     private void execute(As400StreamingChangeEventSource source, int iterations) throws InterruptedException {
@@ -235,16 +257,82 @@ class As400StreamingChangeEventSourceRecoveryTest {
     }
 
     @Test
-    void repeatedRecoveryIsBoundedByTheRetryLimit() throws Exception {
-        final As400StreamingChangeEventSource source = source(UnavailablePositionRecovery.EARLIEST);
+    void repeatedRecoveryIsBoundedInTime() throws Exception {
+        final As400StreamingChangeEventSource source = source(UnavailablePositionRecovery.EARLIEST, fastClock(new AtomicLong()));
         when(dataConnection.getJournalEntries(any(), any(), any(), any()))
                 .thenThrow(new LostJournalException("CPF7053 break in receivers"));
 
-        // the loop would otherwise recover forever, the retry bound has to stop it
-        assertThatThrownBy(() -> execute(source, 1000))
-                .isInstanceOf(DebeziumException.class)
-                .hasMessageContaining("after 20 retries");
+        // the loop would otherwise recover forever, the retry window has to stop it
+        assertThatThrownBy(() -> execute(source, 100_000))
+                .isInstanceOf(NotRetriableException.class)
+                .hasMessageContaining("the journal position cannot be read");
 
         verify(offsetContext, atLeastOnce()).setPosition(new JournalProcessedPosition());
+    }
+
+    /**
+     * A member locked by a nightly batch job (CPF7007) clears on its own: waiting for it must not reconnect
+     * nor move the position, and must outlast the minutes an unknown failure is retried for (issue #107).
+     */
+    @Test
+    void aMemberLockedLongerThanAnUnknownFailureIsRetriedIsWaitedOut() throws Exception {
+        final AtomicLong now = new AtomicLong();
+        final As400StreamingChangeEventSource source = source(UnavailablePositionRecovery.EARLIEST, fastClock(now));
+        final ObjectLockedException locked = new ObjectLockedException(
+                "CPF7007 member locked by another job: Cannot allocate member TABLE1 file TABLE1 in LIB.");
+        final AtomicInteger calls = new AtomicInteger();
+        when(dataConnection.getJournalEntries(any(), any(), any(), any())).thenAnswer(invocation -> {
+            // locked for two hours of the fast clock, then released
+            if (now.get() < Duration.ofHours(2).toMillis()) {
+                calls.incrementAndGet();
+                throw locked;
+            }
+            return RetrievalState.Success;
+        });
+
+        execute(source, 1_000);
+
+        assertThat(calls.get()).as("retried well past an unknown failure's 5 minutes").isGreaterThan(20);
+        verify(dataConnection, never()).close();
+        verify(offsetContext, never()).setPosition(any());
+    }
+
+    /**
+     * A job that never releases its lock must not stall the source forever with only log lines: past
+     * {@code journal.lock.timeout.ms} the task stops, with an error naming the lock and the setting.
+     */
+    @Test
+    void aMemberLockedPastTheTimeoutStopsTheTaskNamingTheLock() throws Exception {
+        final AtomicLong now = new AtomicLong();
+        final As400StreamingChangeEventSource source = source(UnavailablePositionRecovery.EARLIEST, fastClock(now));
+        when(dataConnection.getJournalEntries(any(), any(), any(), any())).thenThrow(new ObjectLockedException(
+                "Call failed: Cannot allocate member TABLE1 file TABLE1 in LIB."));
+
+        assertThatThrownBy(() -> execute(source, 100_000))
+                .isInstanceOf(NotRetriableException.class)
+                .hasMessageContaining(As400ConnectorConfig.JOURNAL_LOCK_TIMEOUT.name())
+                .hasMessageContaining("Cannot allocate member TABLE1 file TABLE1 in LIB.")
+                .hasCauseInstanceOf(ObjectLockedException.class);
+
+        assertThat(now.get()).as("not before the timeout").isGreaterThanOrEqualTo(As400ConnectorConfig.DEFAULT_JOURNAL_LOCK_TIMEOUT);
+        verify(dataConnection, never()).close();
+    }
+
+    /**
+     * Reconnecting reports a rejected sign-on as an {@link IOException}, and retrying it as a lost connection
+     * only adds failed sign-ons towards the limit that disables the profile: it stops the task at once.
+     */
+    @Test
+    void aRejectedSignOnStopsTheTaskAtOnce() throws Exception {
+        final As400StreamingChangeEventSource source = source(UnavailablePositionRecovery.EARLIEST);
+        final AS400SecurityException rejected = mock(AS400SecurityException.class);
+        when(rejected.getMessage()).thenReturn("User profile is disabled.");
+        when(dataConnection.getJournalEntries(any(), any(), any(), any())).thenThrow(new IOException("Failed to reconnect", rejected));
+
+        assertThatThrownBy(() -> execute(source, 100))
+                .isInstanceOf(NotRetriableException.class)
+                .hasMessageContaining("User profile is disabled.");
+
+        verify(dataConnection, times(1)).getJournalEntries(any(), any(), any(), any());
     }
 }
