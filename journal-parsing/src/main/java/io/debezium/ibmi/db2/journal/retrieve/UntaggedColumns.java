@@ -32,9 +32,10 @@ import io.debezium.ibmi.db2.journal.data.types.UntaggedCcsid;
  *
  * <p>
  * A decision comes from {@link UntaggedDecisions} when there is one. Otherwise every undecided untagged
- * column of the table is sampled in one capped query: a column whose first non-blank values all read as
- * text ({@link UntaggedCcsid#readsAsText}) is text, any other is binary. A sample that fails decides
- * binary - what the column streamed as before - rather than guess.
+ * column of the table is sampled in one capped query: a column whose non-blank values read as text
+ * ({@link UntaggedCcsid#readsAsText}) but for at most one in {@link UntaggedCcsid#VALUES_PER_FAILURE} is
+ * text, any other is binary (Popsink/data-plane#5989). A sample that fails decides binary - what the
+ * column streamed as before - rather than guess.
  * </p>
  */
 public class UntaggedColumns {
@@ -131,11 +132,7 @@ public class UntaggedColumns {
         final StringJoiner text = new StringJoiner(", ");
         for (final Map.Entry<String, Integer> entry : decided.entrySet()) {
             decisions.putIfAbsent(UntaggedDecisions.key(schema, table, entry.getKey()), entry.getValue());
-            if (entry.getValue() == UntaggedDecisions.HEX) {
-                log.warn("untagged (ccsid 65535) column {} of {}.{} does not read as text in ccsid {}, it stays "
-                        + "binary", entry.getKey(), schema, table, ccsid);
-            }
-            else {
+            if (entry.getValue() != UntaggedDecisions.HEX) {
                 text.add(entry.getKey());
             }
         }
@@ -166,20 +163,24 @@ public class UntaggedColumns {
                 + " FETCH FIRST " + SAMPLE_ROWS + " ROWS ONLY OPTIMIZE FOR " + SAMPLE_ROWS + " ROWS");
         columns.forEach(c -> select.add(quote(c)));
 
-        final boolean[] binary = new boolean[columns.size()];
+        final int[] nonBlank = new int[columns.size()];
+        final int[] failing = new int[columns.size()];
         final Map<Integer, AS400Text> decoders = new HashMap<>();
         try (PreparedStatement ps = jdbcConnect.connection().prepareStatement(select.toString())) {
             ps.setQueryTimeout(SAMPLE_TIMEOUT_SECONDS);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     for (int i = 0; i < columns.size(); i++) {
-                        final byte[] value = binary[i] ? null : rs.getBytes(i + 1);
-                        // a blank value decodes to spaces, which read as text: only null needs skipping
-                        if (value == null || value.length == 0) {
+                        final byte[] value = rs.getBytes(i + 1);
+                        // blanks are skipped, as the loaders do: counted clean, they would dilute the failures
+                        if (value == null || UntaggedCcsid.isBlank(value)) {
                             continue;
                         }
+                        nonBlank[i]++;
                         final AS400Text decoder = decoders.computeIfAbsent(value.length, l -> new AS400Text(l, ccsid));
-                        binary[i] = !UntaggedCcsid.readsAsText((String) decoder.toObject(value));
+                        if (!UntaggedCcsid.readsAsText((String) decoder.toObject(value))) {
+                            failing[i]++;
+                        }
                     }
                 }
             }
@@ -187,7 +188,13 @@ public class UntaggedColumns {
 
         final Map<String, Integer> decided = new LinkedHashMap<>();
         for (int i = 0; i < columns.size(); i++) {
-            decided.put(columns.get(i), binary[i] ? UntaggedDecisions.HEX : ccsid);
+            final boolean text = UntaggedCcsid.isTextColumn(nonBlank[i], failing[i]);
+            decided.put(columns.get(i), text ? ccsid : UntaggedDecisions.HEX);
+            if (failing[i] > 0) {
+                log.warn("{} of {} sampled values of untagged (ccsid 65535) column {} of {}.{} do not read as text in "
+                        + "ccsid {}: {}", failing[i], nonBlank[i], columns.get(i), schema, table, ccsid,
+                        text ? "it is text, those values stream with substitution characters" : "it stays binary");
+            }
         }
         return decided;
     }

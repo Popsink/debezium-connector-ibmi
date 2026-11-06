@@ -21,7 +21,7 @@ class UntaggedDecisionsTest {
         decisions.putIfAbsent(UntaggedDecisions.key("LIB", "TABLE", "PWD"), UntaggedDecisions.HEX);
         decisions.putIfAbsent(UntaggedDecisions.key("LIB", "TABLE", "NAME"), 1388);
 
-        assertEquals("LIB.TABLE.NAME=1388;LIB.TABLE.PWD=hex", decisions.serialized());
+        assertEquals("LIB.TABLE.NAME=1388;LIB.TABLE.PWD=binary", decisions.serialized());
 
         final UntaggedDecisions restored = new UntaggedDecisions();
         restored.load(decisions.serialized());
@@ -34,7 +34,7 @@ class UntaggedDecisionsTest {
     @Test
     void aDecisionIsSticky() {
         final UntaggedDecisions decisions = new UntaggedDecisions();
-        decisions.load("LIB.T.C=hex");
+        decisions.load("LIB.T.C=binary");
         decisions.putIfAbsent("LIB.T.C", 1388);
         decisions.load("LIB.T.C=37");
 
@@ -53,6 +53,19 @@ class UntaggedDecisionsTest {
 
         decisions.putIfAbsent("LIB.T.D", 37);
         assertEquals("LIB.T.C=1388;LIB.T.D=37", decisions.serialized());
+    }
+
+    /**
+     * A binary decision written before Popsink/data-plane#5989 is forgotten, so the column is sampled again
+     * under the tolerant rule; a text decision of the same offset is kept.
+     */
+    @Test
+    void aBinaryDecisionFromBeforeTheTolerantRuleIsDropped() {
+        final UntaggedDecisions decisions = new UntaggedDecisions();
+        decisions.load("LIB.T.C=hex;LIB.T.D=1388;LIB.T.E=binary");
+
+        assertTrue(decisions.get("LIB.T.C").isEmpty());
+        assertEquals("LIB.T.D=1388;LIB.T.E=binary", decisions.serialized());
     }
 
     @Test

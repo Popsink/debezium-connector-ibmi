@@ -52,7 +52,7 @@ class JdbcFileDecoderUntaggedTest {
         when(metadata.getColumns(any(), eq("LIB"), eq("T"), any())).thenReturn(columns);
 
         final UntaggedDecisions decisions = new UntaggedDecisions();
-        decisions.load("LIB.T.NAME=1388;LIB.T.PWD=hex");
+        decisions.load("LIB.T.NAME=1388;LIB.T.PWD=binary");
         final JdbcFileDecoder decoder = new JdbcFileDecoder(() -> connection, "DB", new SchemaCacheHash(),
                 As400TextFactory.forCcsid(935), -1, -1, decisions);
 
