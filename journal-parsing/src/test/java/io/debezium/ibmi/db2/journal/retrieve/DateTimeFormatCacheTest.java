@@ -9,11 +9,14 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 
 import org.junit.jupiter.api.Test;
 
@@ -155,5 +158,20 @@ public class DateTimeFormatCacheTest {
         assertTrue(cache.getDate("SCHEMA", "ORDERS", "ORDER_DATE").isEmpty());
         assertTrue(cache.getDate("SCHEMA", "ORDERS", "ORDER_DATE").isEmpty());
         assertEquals(1, calls[0], "second lookup of the same column must hit the negative cache");
+    }
+
+    /** data-plane#5932: a release without the SYSCOLUMNS2 format columns logged one ERROR per table; now one query, one WARN. */
+    @Test
+    public void aReleaseWithoutTheFormatColumnsIsAskedOnce() throws Exception {
+        final Connection con = mock(Connection.class);
+        when(con.prepareStatement(anyString()))
+                .thenThrow(new SQLException("[SQL0206] Column or global variable TIME_SEPARATOR not found.", "42703", -206));
+        final DateTimeFormatCache cache = new DateTimeFormatCache(() -> con);
+
+        assertTrue(cache.getDate("LIB", "A", "D").isEmpty());
+        assertTrue(cache.getTime("LIB", "B", "T").isEmpty());
+        assertTrue(cache.getDate("LIB", "C", "D").isEmpty());
+
+        verify(con, times(1)).prepareStatement(anyString());
     }
 }

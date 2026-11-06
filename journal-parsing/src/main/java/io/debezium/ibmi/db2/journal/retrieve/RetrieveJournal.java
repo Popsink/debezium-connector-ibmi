@@ -41,6 +41,7 @@ import io.debezium.ibmi.db2.journal.retrieve.exception.FatalException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalFilterException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalRangeException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
+import io.debezium.ibmi.db2.journal.retrieve.exception.ObjectLockedException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.RetrieveJournalException;
 import io.debezium.ibmi.db2.journal.retrieve.rjne0200.EntryHeader;
 import io.debezium.ibmi.db2.journal.retrieve.rjne0200.EntryHeaderDecoder;
@@ -526,9 +527,10 @@ public class RetrieveJournal {
         }
     }
 
-    private Block reThrowIfFatal(JournalProcessedPosition retrievePosition, final ServiceProgramCall spc,
-                                 JournalProcessedPosition latestJournalPosition, PositionRange range, String job)
-            throws LostJournalException, InvalidJournalRangeException, FatalException {
+    // package-private for tests
+    Block reThrowIfFatal(JournalProcessedPosition retrievePosition, final ServiceProgramCall spc,
+                         JournalProcessedPosition latestJournalPosition, PositionRange range, String job)
+            throws LostJournalException, InvalidJournalRangeException, FatalException, ObjectLockedException {
         for (final AS400Message id : spc.getMessageList()) {
             final String idt = id.getID();
             if (idt == null) {
@@ -560,6 +562,13 @@ public class RetrieveJournal {
                             String.format("Call failed position %s parameters %s object not found or not journaled: %s", retrievePosition, builder,
                                     getFullAS400MessageText(id)));
                 }
+                case "CPF7007": { // member allocated by another job, e.g. a nightly reorganise or save
+                    // transient: the caller waits for the lock to clear, far longer than for an unknown failure (issue #107).
+                    // The first-level text names the member; the help text would cost a round trip on every retry
+                    throw new ObjectLockedException(
+                            String.format("Call failed position %s parameters %s member locked by another job: %s", retrievePosition, builder,
+                                    id.getText()));
+                }
                 case "CPF7062": {
                     log.debug("Normal when filtering, call failed position {} parameters {} no data received: {}", retrievePosition, builder,
                             id.getText());
@@ -568,8 +577,8 @@ public class RetrieveJournal {
                             latestJournalPosition, range, job);
                 }
                 default:
-                    log.error("Call failed position {} parameters {} with error code {} message {}", retrievePosition, idt,
-                            builder, getFullAS400MessageText(id));
+                    log.error("Call failed position {} parameters {} with error code {} message {}", retrievePosition, builder,
+                            idt, getFullAS400MessageText(id));
             }
         }
         throw new RetrieveJournalException(String.format("Call failed position %s", retrievePosition));

@@ -20,6 +20,8 @@ import java.util.stream.Stream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.ibm.as400.access.AS400SecurityException;
+
 import io.debezium.DebeziumException;
 import io.debezium.connector.db2as400.As400ConnectorConfig.UnavailablePositionRecovery;
 import io.debezium.connector.db2as400.As400RpcConnection.BlockingReceiverConsumer;
@@ -30,6 +32,7 @@ import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.ibmi.db2.journal.retrieve.exception.FatalException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.InvalidJournalRangeException;
 import io.debezium.ibmi.db2.journal.retrieve.exception.LostJournalException;
+import io.debezium.ibmi.db2.journal.retrieve.exception.ObjectLockedException;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
@@ -47,9 +50,6 @@ import io.debezium.util.Metronome;
 public class As400StreamingChangeEventSource implements StreamingChangeEventSource<As400Partition, As400OffsetContext> {
 
     private static final int TRANSACTION_MAP_WARN_SIZE = 50_000;
-    private static final int MAX_RETRIES = 20;
-    /** Retry backoff grows from {@code poll.interval.ms} up to this multiple of it, then stays there. */
-    private static final long MAX_RETRY_BACKOFF_MULTIPLIER = 8;
     /** How often the paused streaming thread re-checks and re-acknowledges the blocking-snapshot pause. */
     private static final long PAUSE_POLL_INTERVAL_MS = 250;
     /** How often a still-paused streaming thread reports that it is waiting, so a pause is never silent. */
@@ -131,7 +131,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
     public void execute(ChangeEventSourceContext context, As400Partition partition, As400OffsetContext offsetContext)
             throws InterruptedException {
         final Metronome metronome = Metronome.sleeper(pollInterval, clock);
-        int retries = 0;
+        final RetryWindow retryWindow = new RetryWindow(connectorConfig, clock);
         final WatchDog watchDog = new WatchDog(Thread.currentThread(), connectorConfig.getMaxRetrievalTimeout(),
                 connectorConfig.getBlockingSnapshotPauseTimeout(), context::isPaused,
                 snapshotActivity::isSnapshotRunning, errorHandler::setProducerThrowable);
@@ -168,7 +168,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         // Debezium throttles this to heartbeat.interval.ms internally and
                         // no-ops when heartbeats are disabled, so the per-iteration call is cheap.
                         dispatcher.dispatchHeartbeatEventAlsoToIncrementalSnapshot(partition, offsetContext);
-                        retries = 0;
+                        retryWindow.succeeded(offsetContext.getPosition());
                     }
                     catch (final LostJournalException | InvalidJournalRangeException e) {
                         // the journal or the receivers we were reading may be gone, e.g. deleted while we were
@@ -177,30 +177,32 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                         // has gone, since the same failures are also how a badly resolved range reports
                         // itself, and recovering from one of those costs the whole retained journal (issue #79)
                         recoverIfThePositionIsReallyGone(offsetContext, e);
-                        retries = pauseBeforeRetry(retries, offsetContext, e);
+                        retryAfter(retryWindow, watchDog, RetryWindow.Kind.POSITION_UNREADABLE, offsetContext, e);
+                    }
+                    catch (final ObjectLockedException e) {
+                        // nightly batch jobs hold such locks for hours, and they clear on their own (issue #107)
+                        retryAfter(retryWindow, watchDog, RetryWindow.Kind.MEMBER_LOCKED, offsetContext, e);
                     }
                     catch (final FatalException e) {
                         throw new DebeziumException("Unable to process offset " + offsetContext.getPosition(), e);
                     }
                     catch (final InterruptedException e) {
+                        // the WatchDog interrupts a call that has gone without progress for too long
                         if (context.isRunning()) {
-                            log.error("Interrupted processing offset {} retry {}", offsetContext.getPosition(), retries);
                             closeAndReconnect();
-                            retries = pauseBeforeRetry(retries, offsetContext, e);
+                            retryAfter(retryWindow, watchDog, RetryWindow.Kind.CONNECTION_LOST, offsetContext, e);
                         }
                     }
                     catch (IOException | SQLNonTransientConnectionException e) { // SQLNonTransientConnectionException
                         // thrown by jt400 jdbc driver when
                         // connection errors
-                        log.error("Connection failed offset {} retry {}", offsetContext.getPosition(), retries, e);
+                        failIfSignOnRejected(offsetContext, e);
                         closeAndReconnect();
-
-                        retries = pauseBeforeRetry(retries, offsetContext, e);
+                        retryAfter(retryWindow, watchDog, RetryWindow.Kind.CONNECTION_LOST, offsetContext, e);
                     }
                     catch (final Exception e) {
-                        log.error("Failed to process offset {} retry {}", offsetContext.getPosition(), retries, e);
-
-                        retries = pauseBeforeRetry(retries, offsetContext, e);
+                        failIfSignOnRejected(offsetContext, e);
+                        retryAfter(retryWindow, watchDog, RetryWindow.Kind.UNKNOWN, offsetContext, e);
                     }
                 }
                 catch (final InterruptedException e) { // handle InterruptedException during the exception handling
@@ -328,46 +330,36 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
     }
 
     /**
-     * Waits out an exponentially growing backoff before the next attempt, giving up once the same failure
-     * has been retried {@link #MAX_RETRIES} times so a permanently broken stream fails the connector
-     * instead of retrying forever. A lost connection is retriable, so failing here restarts the connector,
-     * see {@link As400ErrorHandler}.
+     * Waits out the backoff {@link RetryWindow} sets for this failure, or stops the task with a
+     * {@link NotRetriableException} once the failure has outlived its budget. A call that came back failed
+     * is not a stalled stream, so the watchdog is told the thread is alive and does not cut the backoff short.
      * <p>
      * The wait is deliberately not taken from the streaming loop's {@link Metronome}. That one advances its
      * tick by exactly one period per {@code pause()} call rather than by the wall clock, and the healthy
      * path never calls it - {@code Success} and {@code MoreDataAvailable} both fall straight through - so by
      * the time a failure burst starts its tick is behind by roughly the whole time spent streaming and every
      * {@code pause()} returns immediately. Sharing it inverted the intent: the busier the connector, the
-     * less backoff it got, and 20 attempts could be spent in under 3 seconds.
-     *
-     * @return the number of retries attempted so far
+     * less backoff it got.
      */
-    private int pauseBeforeRetry(int retries, As400OffsetContext offsetContext, Exception e)
+    private void retryAfter(RetryWindow retryWindow, WatchDog watchDog, RetryWindow.Kind kind, As400OffsetContext offsetContext,
+                            Exception e)
             throws InterruptedException {
-        final int attempted = retries + 1;
-        if (attempted >= MAX_RETRIES) {
-            throw new DebeziumException(
-                    String.format("Failed to process offset %s after %d retries", offsetContext.getPosition(), attempted), e);
-        }
-        final Duration backoff = retryBackoff(retries);
-        log.info("Retrying offset {} in {}ms, attempt {}/{}", offsetContext.getPosition(), backoff.toMillis(), attempted,
-                MAX_RETRIES);
+        watchDog.alive();
+        final Duration backoff = retryWindow.failed(kind, offsetContext.getPosition(), e);
         // a Metronome of its own, created here, so this first and only pause() really waits the whole backoff
         Metronome.sleeper(backoff, clock).pause();
-        return attempted;
     }
 
     /**
-     * {@code pollInterval * 2^retries}, capped at {@link #MAX_RETRY_BACKOFF_MULTIPLIER} times the poll
-     * interval so the wait stays proportional to how often the connector was asked to poll. The whole
-     * {@link #MAX_RETRIES} budget spans 135 poll intervals: about 68s at the 500ms default, about 4.5
-     * minutes at {@code poll.interval.ms=2000} - rather than the 2.7 seconds it took while the streaming
-     * metronome was shared.
+     * Fails at once on a rejected sign-on, before reconnecting would attempt one more: see
+     * {@link As400ErrorHandler#isRetriable}.
      */
-    Duration retryBackoff(int retries) {
-        // 1L << 30 already dwarfs the cap; clamping the shift keeps it out of overflow territory
-        final long multiplier = Math.min(1L << Math.min(retries, 30), MAX_RETRY_BACKOFF_MULTIPLIER);
-        return pollInterval.multipliedBy(multiplier);
+    private static void failIfSignOnRejected(As400OffsetContext offsetContext, Exception e) {
+        final Throwable rejected = As400ErrorHandler.causedBy(e, AS400SecurityException.class);
+        if (rejected != null) {
+            throw new NotRetriableException(String.format("The IBM i rejected the connector at offset %s, retrying cannot fix it: %s",
+                    offsetContext.getPosition(), rejected.getMessage()), e);
+        }
     }
 
     public void closeAndReconnect() {
@@ -376,14 +368,15 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
             dataConnection.connection();
         }
         catch (final Exception e) {
-            log.error("Failure reconnecting command", e);
+            // the next poll fails the same way, and the retry window reports it
+            log.debug("Failure reconnecting command", e);
         }
         try {
             jdbcConnection.close();
             jdbcConnection.connect();
         }
         catch (final Exception e) {
-            log.error("Failure reconnecting sql", e);
+            log.debug("Failure reconnecting sql", e);
         }
     }
 

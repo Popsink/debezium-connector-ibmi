@@ -75,6 +75,7 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
     private JournalLobFetcher lobFetcher;
     /** See {@link #setRequireUniqueDdsKey}; the safe resolution unless an operator opts out. */
     private boolean requireUniqueDdsKey = true;
+    private final DdsKeys.Reader ddsKeyReader = new DdsKeys.Reader();
     /** Both hold the tables already logged about, so a per-entry problem is reported once, not per row. */
     private final Set<String> lobsUnfetchedLogged = ConcurrentHashMap.newKeySet();
     private final Set<String> recordLengthLogged = ConcurrentHashMap.newKeySet();
@@ -561,15 +562,7 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
      */
     // package private so the uniqueness decision can be driven from a test without a live IBM i
     List<String> ddsPrimaryKeys(String table, String schema) throws SQLException {
-        final Connection con = jdbcConnect.connection();
-
-        try (PreparedStatement ps = con.prepareStatement(DdsKeys.KEY_COLUMNS)) {
-            ps.setString(1, schema);
-            ps.setString(2, table);
-            try (ResultSet rs = ps.executeQuery()) {
-                return DdsKeys.read(rs).asRecordKey(requireUniqueDdsKey, schema, table);
-            }
-        }
+        return ddsKeyReader.read(jdbcConnect.connection(), schema, table).asRecordKey(requireUniqueDdsKey, schema, table);
     }
 
     private List<String> primaryKeysFromMeta(String table, String schema, String databaseCatalog,

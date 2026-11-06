@@ -165,6 +165,30 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                     + "before the task is failed with a retriable error (and restarted) to avoid a silent wedge.",
             DEFAULT_BLOCKING_SNAPSHOT_PAUSE_TIMEOUT);
 
+    public static final long DEFAULT_JOURNAL_LOCK_TIMEOUT = 8 * 60 * 60 * 1000L;
+    /**
+     * How long (ms) the streaming thread waits in place for a journaled member locked by another job
+     * (CPF7007) before failing the task (issue #107). Nightly batch jobs hold such locks for minutes to
+     * hours and they clear on their own, so the wait costs no restart; the bound is there for a job that
+     * never releases its lock, which would otherwise stall the whole source with nothing but log lines.
+     */
+    public static final Field JOURNAL_LOCK_TIMEOUT = Field.create("journal.lock.timeout.ms",
+            "journal member lock timeout",
+            "Max time in ms to wait for a journaled member locked by another job (CPF7007) to be released "
+                    + "before failing the task. Locks shorter than this are waited out without restarting.",
+            DEFAULT_JOURNAL_LOCK_TIMEOUT);
+
+    public static final long DEFAULT_CONNECTION_RETRY_TIMEOUT = 2 * 60 * 60 * 1000L;
+    /**
+     * How long (ms) the streaming thread keeps reconnecting to an unreachable IBM i before failing the task.
+     * Maintenance - an IPL, a full-system save in restricted state - can take the system away for hours,
+     * and the source health probe already reports the lost connection while it lasts.
+     */
+    public static final Field CONNECTION_RETRY_TIMEOUT = Field.create("connection.retry.timeout.ms",
+            "connection retry timeout",
+            "Max time in ms to keep reconnecting to an unreachable IBM i while streaming before failing the task.",
+            DEFAULT_CONNECTION_RETRY_TIMEOUT);
+
     public static final long DEFAULT_CACHE_ADDITIONAL_DELAY = 5000;
 
     public static final Field JOURNAL_CACHE_ADDITIONAL_DELAY = Field.create("journal.additional.delay", "additional delay when journal caching is enabled",
@@ -222,8 +246,9 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                     + "number of records sharing one key value, and keying records on it makes every keyed "
                     + "destination - a compacted topic, a merged table - keep only the last record of each key "
                     + "value and silently drop the rest. By default the access path is therefore only used when "
-                    + "QSYS2.SYSFILES.ACCESS_PATH_TYPE reports KEYED UNIQUE, and a file that allows "
-                    + "duplicates streams without a record key. Set to false to key records on a duplicate-"
+                    + "the catalog (QSYS2.SYSFILES, or QSYS.QADBXREF before IBM i 7.4 TR7) reports it UNIQUE, and a "
+                    + "file that allows duplicates - or whose uniqueness neither catalog can tell - streams without "
+                    + "a record key. Set to false to key records on a duplicate-"
                     + "allowing access path anyway, which is only safe when the key is known to be unique in "
                     + "practice. Files with a real SQL primary key are unaffected either way.",
             DEFAULT_DDS_KEY_REQUIRE_UNIQUE);
@@ -501,6 +526,14 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
         return config.getLong(BLOCKING_SNAPSHOT_PAUSE_TIMEOUT);
     }
 
+    public long getConnectionRetryTimeout() {
+        return config.getLong(CONNECTION_RETRY_TIMEOUT);
+    }
+
+    public long getJournalLockTimeout() {
+        return config.getLong(JOURNAL_LOCK_TIMEOUT);
+    }
+
     public UntaggedDecisions untaggedDecisions() {
         return untaggedDecisions;
     }
@@ -586,7 +619,8 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
             RelationalDatabaseConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE, SOCKET_TIMEOUT,
             MAX_SERVER_SIDE_ENTRIES, TOPIC_NAMING_STRATEGY, FROM_CCSID, TO_CCSID, SECURE,
             DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
-            UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
+            UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT, JOURNAL_LOCK_TIMEOUT,
+            CONNECTION_RETRY_TIMEOUT,
             ERRORS_TOLERANCE, LOB_FETCH, POINTER_HANDLE_THRESHOLD, JOURNAL_PREFETCH, DDS_KEY_REQUIRE_UNIQUE,
             CONNECTION_PROBE_TIMEOUT_MS);
 
@@ -597,7 +631,8 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
                         HOSTNAME, USER, PASSWORD, SCHEMA, BUFFER_SIZE,
                         SOCKET_TIMEOUT, FROM_CCSID, TO_CCSID, SECURE,
                         DIAGNOSTICS_FOLDER, TRIM_NON_XML_CHARSEQUENCE_FIELD_MODE, JOURNAL_CACHE_ADDITIONAL_DELAY, TRANSACTION_MGMT_ENABLED,
-                        UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT,
+                        UNAVAILABLE_POSITION_RECOVERY, SNAPSHOT_QUERY_TIME_LIMIT, MAX_RETRIEVAL_TIMEOUT, BLOCKING_SNAPSHOT_PAUSE_TIMEOUT, JOURNAL_LOCK_TIMEOUT,
+                        CONNECTION_RETRY_TIMEOUT,
                         LOB_FETCH,
                         POINTER_HANDLE_THRESHOLD, JOURNAL_PREFETCH, DDS_KEY_REQUIRE_UNIQUE,
                         CONNECTION_PROBE_TIMEOUT_MS)
