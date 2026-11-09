@@ -5,8 +5,11 @@
  */
 package io.debezium.connector.db2as400;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.sql.SQLNonTransientConnectionException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
@@ -139,6 +142,63 @@ public class As400SnapshotChangeEventSource
             log.warn("Could not set snapshot query governor time limit (continuing without it): {}", e.getMessage());
             rollbackQuietly(connection);
         }
+    }
+
+    /**
+     * Debezium keeps this {@link Connection} from step 1 and only calls {@code rollback()} on it, in the
+     * {@code finally} of the snapshot. {@code rollbackTransaction} is private in core, so the returned object
+     * is where the fix lives: every call goes to the wrapper's <em>current</em> connection, which
+     * {@link As400JdbcConnection#connection()} may have replaced mid-snapshot, and the rollback ignores a
+     * connection that is gone - a schema snapshot that already persisted its history then completes instead
+     * of being retried from step 1 (Popsink/data-plane#5814).
+     */
+    @Override
+    public Connection createSnapshotConnection() throws SQLException {
+        super.createSnapshotConnection();
+        return currentConnectionView(jdbcConnection);
+    }
+
+    static Connection currentConnectionView(JdbcConnection wrapper) {
+        return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[]{ Connection.class },
+                (proxy, method, args) -> {
+                    if ("rollback".equals(method.getName()) && method.getParameterCount() == 0) {
+                        rollbackCurrent(wrapper);
+                        return null;
+                    }
+                    try {
+                        return method.invoke(wrapper.connection(), args);
+                    }
+                    catch (InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
+    }
+
+    /**
+     * Rolls back what the wrapper's current connection holds. A gone connection is logged and ignored: the
+     * snapshot only reads, and the host ends the transaction with the job. Any other failure still fails.
+     */
+    static void rollbackCurrent(JdbcConnection wrapper) throws SQLException {
+        try {
+            final Connection current = wrapper.connection();
+            if (current.isClosed() || current.getAutoCommit()) {
+                // A connection the wrapper re-opened starts in auto-commit: nothing is pending on it.
+                return;
+            }
+            current.rollback();
+        }
+        catch (SQLException e) {
+            if (!isConnectionGone(e)) {
+                throw e;
+            }
+            log.warn("Snapshot connection gone at the final rollback, ignored (a snapshot holds nothing to roll back): {}", e.getMessage());
+        }
+    }
+
+    /** SQLSTATE class 08 is "connection exception"; jt400 reports a closed connection as 08003. */
+    static boolean isConnectionGone(SQLException e) {
+        return e instanceof SQLNonTransientConnectionException
+                || (e.getSQLState() != null && e.getSQLState().startsWith("08"));
     }
 
     private static void rollbackQuietly(JdbcConnection connection) {

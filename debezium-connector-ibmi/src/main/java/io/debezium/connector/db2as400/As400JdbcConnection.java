@@ -11,6 +11,7 @@ import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -23,6 +24,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
@@ -64,6 +66,18 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
     /** Skip the {@link Connection#isValid} liveness round-trip if we validated within this window. */
     private static final long VALIDATION_INTERVAL_MS = 2_000;
     private long lastValidatedEpochMs = 0;
+    /** See {@link As400ConnectorConfig#CONNECTION_PROBE_TIMEOUT_MS}. */
+    private final int validationTimeoutMs;
+    /** Confirms a failed {@link Connection#isValid} before the connection is replaced. */
+    static final String CONFIRM_DEAD_SQL = "values 1";
+
+    /** What one liveness probe concluded; only {@link #DEAD} replaces the connection. */
+    enum Probe {
+        ALIVE,
+        /** {@code isValid} failed, yet a statement then succeeded: slow, not dead. */
+        SLOW,
+        DEAD
+    }
 
     private static final String GET_DATABASE_NAME = "values ( CURRENT_SERVER )";
     private static final String GET_SYSTEM_TABLE_NAME = "select trim(system_table_name) from qsys2.systables where system_table_schema=? AND table_name=?";
@@ -131,6 +145,7 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
         this.fromCcsid = config.getInteger(As400ConnectorConfig.FROM_CCSID);
         this.toCcsid = config.getInteger(As400ConnectorConfig.TO_CCSID);
         this.requireUniqueDdsKey = config.getBoolean(As400ConnectorConfig.DDS_KEY_REQUIRE_UNIQUE);
+        this.validationTimeoutMs = config.getInteger(As400ConnectorConfig.CONNECTION_PROBE_TIMEOUT_MS);
         this.config = config;
         realDatabaseName = retrieveRealDatabaseName();
         log.debug("connection: {}", connectionString());
@@ -542,21 +557,75 @@ public class As400JdbcConnection extends JdbcConnection implements Connect<Conne
         if (now - lastValidatedEpochMs < VALIDATION_INTERVAL_MS) {
             return conn;
         }
-        if (!conn.isValid(3)) {
-            log.info("connection dead closing");
-            try {
-                super.close();
+        final long started = System.nanoTime();
+        final Probe probe = probe(conn, validationTimeoutMs);
+        final long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+        switch (probe) {
+            case DEAD -> {
+                log.info("connection dead closing: the probe failed after {} ms (timeout {} ms) and a statement failed too",
+                        elapsedMs, validationTimeoutMs);
+                try {
+                    super.close();
+                }
+                catch (final Exception e) {
+                    // we can ignore this we just need a new connection
+                }
+                conn = super.connection(true);
             }
-            catch (final Exception e) {
-                // we can ignore this we just need a new connection
-            }
-            conn = super.connection(true);
-        }
-        else {
-            log.debug("validated connection OK");
+            case SLOW -> log.warn("connection probe failed after {} ms (timeout {} ms) but a statement succeeded: slow link, keeping the connection",
+                    elapsedMs, validationTimeoutMs);
+            case ALIVE -> log.debug("validated connection OK in {} ms", elapsedMs);
         }
         lastValidatedEpochMs = System.currentTimeMillis();
         return conn;
+    }
+
+    /**
+     * Never declares a connection dead on one failed {@code isValid}: on a slow link a probe can time out on
+     * a working connection, and replacing it closes the object a running snapshot still holds
+     * (Popsink/data-plane#5814). A cheap statement, bounded by the same timeout, has to fail as well.
+     */
+    static Probe probe(Connection conn, int timeoutMs) {
+        final int timeoutSeconds = (int) Math.max(1, TimeUnit.MILLISECONDS.toSeconds(timeoutMs + 999L));
+        try {
+            if (conn.isValid(timeoutSeconds)) {
+                return Probe.ALIVE;
+            }
+        }
+        catch (SQLException e) {
+            log.debug("isValid threw, confirming with a statement", e);
+        }
+        Integer previousNetworkTimeout = null;
+        try {
+            try {
+                previousNetworkTimeout = conn.getNetworkTimeout();
+                // A half-dead socket can otherwise block the statement past any query timeout.
+                conn.setNetworkTimeout(Runnable::run, timeoutMs);
+            }
+            catch (SQLException e) {
+                previousNetworkTimeout = null;
+                log.debug("network timeout not settable, confirming with the query timeout only", e);
+            }
+            try (Statement statement = conn.createStatement()) {
+                statement.setQueryTimeout(timeoutSeconds);
+                statement.execute(CONFIRM_DEAD_SQL);
+            }
+            return Probe.SLOW;
+        }
+        catch (SQLException e) {
+            log.debug("confirming statement failed", e);
+            return Probe.DEAD;
+        }
+        finally {
+            if (previousNetworkTimeout != null) {
+                try {
+                    conn.setNetworkTimeout(Runnable::run, previousNetworkTimeout);
+                }
+                catch (SQLException e) {
+                    log.debug("could not restore the network timeout", e);
+                }
+            }
+        }
     }
 
     @Override
