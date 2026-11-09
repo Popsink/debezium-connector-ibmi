@@ -89,7 +89,7 @@ public class JdbcFileDecoderTest {
     @Test
     public void untaggedColumnDecidedBinaryStaysBinary() {
         final UntaggedDecisions decisions = new UntaggedDecisions();
-        decisions.load("S.T.PWD=hex;S.T.VPWD=hex");
+        decisions.load("S.T.PWD=binary;S.T.VPWD=binary");
         final JdbcFileDecoder decoder = new JdbcFileDecoder(null, null, new SchemaCacheHash(), TEXT_FACTORY, -1, -1,
                 decisions);
 

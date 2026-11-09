@@ -28,7 +28,13 @@ public class UntaggedDecisions {
 
     /** The value of a column kept binary; a CCSID is never 0. */
     public static final int HEX = 0;
-    private static final String HEX_TEXT = "hex";
+    private static final String BINARY_TEXT = "binary";
+    /**
+     * How a binary decision was written before Popsink/data-plane#5989, under a rule one damaged value
+     * failed: dropped on load, so the column is sampled once more. A text decision is kept as it was, so
+     * no column flips from string back to bytes.
+     */
+    private static final String STALE_BINARY_TEXT = "hex";
 
     private final Map<String, Integer> decisions = new ConcurrentHashMap<>();
     /** Rebuilt only when a decision is added: the offset reads it once per record. */
@@ -56,6 +62,7 @@ public class UntaggedDecisions {
         if (persisted == null || persisted.isBlank()) {
             return;
         }
+        int stale = 0;
         for (final String entry : persisted.split(";")) {
             final int at = entry.lastIndexOf('=');
             if (at <= 0) {
@@ -63,17 +70,26 @@ public class UntaggedDecisions {
                 continue;
             }
             final String value = entry.substring(at + 1);
+            if (STALE_BINARY_TEXT.equals(value)) {
+                stale++;
+                continue;
+            }
             try {
-                putIfAbsent(entry.substring(0, at), HEX_TEXT.equals(value) ? HEX : Integer.parseInt(value));
+                putIfAbsent(entry.substring(0, at), BINARY_TEXT.equals(value) ? HEX : Integer.parseInt(value));
             }
             catch (final NumberFormatException e) {
                 log.warn("ignoring malformed untagged column decision '{}' in the offset", entry);
             }
         }
+        if (stale > 0) {
+            log.warn("dropped {} untagged column binary decisions taken before a few damaged values were "
+                    + "tolerated: those columns are sampled again, and one now read as text streams as a string",
+                    stale);
+        }
         log.info("loaded {} untagged column decisions from the offset", decisions.size());
     }
 
-    /** {@code LIB.TABLE.COL=1388;LIB.TABLE.COL2=hex}, sorted; empty when nothing is decided. */
+    /** {@code LIB.TABLE.COL=1388;LIB.TABLE.COL2=binary}, sorted; empty when nothing is decided. */
     public String serialized() {
         return serialized;
     }
@@ -85,7 +101,7 @@ public class UntaggedDecisions {
                 out.append(';');
             }
             out.append(entry.getKey()).append('=')
-                    .append(entry.getValue() == HEX ? HEX_TEXT : entry.getValue().toString());
+                    .append(entry.getValue() == HEX ? BINARY_TEXT : entry.getValue().toString());
         }
         serialized = out.toString();
     }

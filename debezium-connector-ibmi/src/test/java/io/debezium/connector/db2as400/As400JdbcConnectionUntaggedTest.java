@@ -32,7 +32,7 @@ class As400JdbcConnectionUntaggedTest {
     @Test
     void untaggedColumnsAreTypedByTheirDecision() {
         final UntaggedDecisions decisions = new UntaggedDecisions();
-        decisions.load("LIB.T.NAME=1388;LIB.T.PWD=hex");
+        decisions.load("LIB.T.NAME=1388;LIB.T.PWD=binary");
         final UntaggedColumns untagged = new UntaggedColumns(null, decisions, As400TextFactory.forCcsid(935));
 
         final Column name = snapshotColumn("NAME", "CHAR () FOR BIT DATA", untagged);

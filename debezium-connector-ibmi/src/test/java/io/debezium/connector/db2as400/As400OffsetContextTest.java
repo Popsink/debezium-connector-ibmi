@@ -118,7 +118,7 @@ public class As400OffsetContextTest {
         config.untaggedDecisions().putIfAbsent("LIB.T.NAME", 1388);
         config.untaggedDecisions().putIfAbsent("LIB.T.PWD", UntaggedDecisions.HEX);
         final Map<String, ?> offset = original.getOffset();
-        assertThat(offset.get(As400OffsetContext.UNTAGGED_CCSID)).isEqualTo("LIB.T.NAME=1388;LIB.T.PWD=hex");
+        assertThat(offset.get(As400OffsetContext.UNTAGGED_CCSID)).isEqualTo("LIB.T.NAME=1388;LIB.T.PWD=binary");
 
         final As400ConnectorConfig restarted = newConfig();
         new As400OffsetContext.Loader(restarted).load(offset);
