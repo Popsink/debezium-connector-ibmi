@@ -495,7 +495,7 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
             final int growthSamples = catchUpTrend.record(behind, bufferFull);
             streamingMetrics.setJournalBehindGrowthSamples(growthSamples);
             final String rates = recordRates(journalRates, streamingMetrics, System.currentTimeMillis(), currentReceiver.getOffset(),
-                    position.getOffset(), behind);
+                    position.isOffsetSet() ? position.getOffset() : null, behind, bufferFull);
             final FirstHeader header = retrieveJournal.getFirstHeader();
             log.info("Current position diagnostics last call {}, header {}, behind {}, parked on receiver {} at offset {}, "
                     + "current receiver {}, last block rpc {}ms waited {}ms consumed {}ms, small call {}ms, {}, "
@@ -515,11 +515,13 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
     /**
      * Feeds one diagnostics sample to {@code rates}, publishes what it measured as gauges, and describes it for
      * the diagnostics line (issue #87). The gauges keep their last measured values through a sample that
-     * measures nothing (the first one, or one across an offset reset).
+     * measures nothing (the first one, one across an offset reset, or one taken with no position yet).
+     *
+     * @param position the connector's position, null while it has none (a blank {@code earliest} reset)
      */
     static String recordRates(JournalRates rates, As400StreamingChangeEventSourceMetrics metrics, long nowMs, BigInteger head,
-                              BigInteger position, BigInteger behind) {
-        final Optional<JournalRates.Rates> measured = rates.record(nowMs, head, position);
+                              BigInteger position, BigInteger behind, boolean bufferFull) {
+        final Optional<JournalRates.Rates> measured = rates.record(nowMs, head, position, bufferFull);
         measured.ifPresent(r -> {
             metrics.setJournalProductionRate(Math.round(r.production()));
             metrics.setJournalReadRate(Math.round(r.read()));

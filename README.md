@@ -176,11 +176,14 @@ Three things are done to keep this from turning into a silent crash-loop:
 Before any strategy is applied, a `WARN` states what the recovery costs, measured against the receiver
 chain at that moment: the entries no retained receiver holds any more (lost under every strategy), what
 `earliest` re-reads, what `latest` skips, the retention window and roll cadence, and the time `earliest`
-needs to return to the head at the rates the diagnostics last measured. Re-reading is duplicates, a hole
-is data loss, and telling the two apart used to mean parsing the receiver list a failure dumped. The
-`DATA GAP` warning only calls entries unrecoverable when the chain shows some are missing: a pruned
-receiver whose successor starts with the very next entry loses nothing, and a chain that cannot be read,
-or whose sequence numbers do not come after the lost position, is reported as not measured.
+needs to return to the head at the rates the diagnostics last measured - projected only when the connector
+was then reading full buffers, since a connector keeping up reads what the journal produces and says
+nothing of how fast it can re-read. Re-reading is duplicates, a hole is data loss, and telling the two
+apart used to mean parsing the receiver list a failure dumped. The `DATA GAP` warning only calls entries
+unrecoverable when the chain shows some are missing: a pruned receiver whose successor starts with the
+very next entry loses nothing, a lost position whose sequence number still falls inside the chain is
+reported as apparently retained, and a chain that cannot be read, or whose head is below the lost
+position (a journal recreated or its sequence reset), is reported as not measured.
 
 Data already lost from pruned receivers cannot be recovered via CDC; recovery is about getting the
 connector healthy again, not replaying the gap. Ad-hoc snapshots (both incremental and blocking) are

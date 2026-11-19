@@ -17,7 +17,9 @@ import java.util.Optional;
  *
  * <p>Both offsets are journal sequence numbers. A sample in which either went backwards - an offset reset by
  * a recovery, a journal whose sequence was reset - measures nothing, so it yields no rate and the next sample
- * starts again from it.</p>
+ * starts again from it. A sample with no position at all - the blank position an {@code earliest} reset leaves
+ * until the first entry is read - is not a starting point either: measured from it, the next interval would
+ * credit the connector with reading the whole journal up to where it resumed.</p>
  */
 public class JournalRates {
 
@@ -26,8 +28,11 @@ public class JournalRates {
      *
      * @param production the journal head's advance
      * @param read       the connector position's advance
+     * @param saturated  whether the connector read a full buffer at both ends of the interval: it was behind
+     *                   throughout, so {@code read} is how fast it can read. Otherwise it read what there was to
+     *                   read, which says how fast the journal grew, not how fast the connector could catch up.
      */
-    public record Rates(double production, double read) {
+    public record Rates(double production, double read, boolean saturated) {
         /** Positive while the lag shrinks, negative while it grows. */
         public double closing() {
             return read - production;
@@ -52,26 +57,35 @@ public class JournalRates {
     private long lastMs;
     private BigInteger lastHead;
     private BigInteger lastPosition;
+    private boolean lastBufferFull;
     private Rates last;
 
     /**
+     * @param position   the connector's position; null while it has none, which drops the previous sample
+     * @param bufferFull whether the call this sample follows returned a full buffer
      * @return the rates since the previous sample; empty for the first one, or when the interval measured
      *         nothing
      */
-    public Optional<Rates> record(long nowMs, BigInteger head, BigInteger position) {
+    public Optional<Rates> record(long nowMs, BigInteger head, BigInteger position, boolean bufferFull) {
+        if (head == null || position == null) {
+            lastHead = null;
+            lastPosition = null;
+            return Optional.empty();
+        }
         Optional<Rates> rates = Optional.empty();
         if (lastHead != null && nowMs > lastMs) {
             final BigInteger produced = head.subtract(lastHead);
             final BigInteger read = position.subtract(lastPosition);
             if (produced.signum() >= 0 && read.signum() >= 0) {
                 final double seconds = (nowMs - lastMs) / 1000.0;
-                last = new Rates(produced.doubleValue() / seconds, read.doubleValue() / seconds);
+                last = new Rates(produced.doubleValue() / seconds, read.doubleValue() / seconds, lastBufferFull && bufferFull);
                 rates = Optional.of(last);
             }
         }
         lastMs = nowMs;
         lastHead = head;
         lastPosition = position;
+        lastBufferFull = bufferFull;
         return rates;
     }
 

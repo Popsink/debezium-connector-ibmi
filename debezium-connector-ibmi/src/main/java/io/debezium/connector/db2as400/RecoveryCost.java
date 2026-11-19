@@ -17,9 +17,10 @@ import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
  * {@code latest} skips, the retention window, and the time the re-read takes at the rates last observed.
  *
  * <p>A recovery warning used to assert a data loss unconditionally. Whether there is one is arithmetic over the
- * chain: the entries between the lost position and the first one still retained. When the sequence numbers do
- * not place the lost position before the chain - a journal recreated or its sequence reset - that arithmetic
- * means nothing, and the warning says it could not be measured instead of claiming either answer.</p>
+ * chain: the entries between the lost position and the first one still retained. When the lost position's
+ * sequence number falls inside the chain, its entries appear to be retained and the warning says so; when it is
+ * past the chain's head - a journal recreated or its sequence reset - that arithmetic means nothing, and the
+ * warning says it could not be measured instead of claiming either answer.</p>
  *
  * @param lost  the position that could not be read
  * @param chain the receiver chain as it is now
@@ -44,29 +45,50 @@ public record RecoveryCost(JournalProcessedPosition lost, ReceiverChain chain, O
         return missing.signum() < 0 ? Optional.empty() : Optional.of(missing);
     }
 
-    /** Entries between the lost position and the head that are still retained, which {@code latest} skips. */
+    /**
+     * Entries {@code latest} skips: the whole retained chain when the lost position comes before it, counted
+     * receiver by receiver like {@link ReceiverChain#retainedEntries()} so a sequence reset inside the chain does
+     * not distort it; what follows the lost position when its sequence number still falls inside the chain.
+     * Empty when the lost position is past the chain's head - a journal recreated or its sequence reset - as
+     * then nothing places it in the chain.
+     */
     public Optional<BigInteger> retainedEntriesSkippedByLatest() {
         if (!lost.isOffsetSet() || chain.receivers() == 0) {
             return Optional.empty();
         }
-        final BigInteger from = chain.oldestStart().max(nextNeeded());
-        final BigInteger skipped = chain.head().subtract(from).add(BigInteger.ONE);
-        return Optional.of(skipped.max(BigInteger.ZERO));
+        final BigInteger next = nextNeeded();
+        if (next.compareTo(chain.oldestStart()) <= 0) {
+            return Optional.of(chain.retainedEntries());
+        }
+        if (next.compareTo(chain.head().add(BigInteger.ONE)) <= 0) {
+            return Optional.of(chain.head().subtract(next).add(BigInteger.ONE));
+        }
+        return Optional.empty();
     }
 
     /**
      * What a reset to the earliest receiver leaves the connector with, and how long it takes to come back at the
-     * rates last observed. A connector at the head reads only what the journal produces, so a read rate no
-     * higher than production projects nothing rather than "never".
+     * rates last observed. Only a connector that was reading full buffers - behind, reading as fast as it can -
+     * shows how fast it reads; one that was keeping up read what the journal produced, and a projection from
+     * that would be noise (a few entries per second of closing rate turn a re-read into years).
      */
     String earliestCatchUp() {
         final BigInteger reread = chain.retainedEntries();
-        return rates.map(r -> r.timeToClose(reread)
-                .map(d -> String.format(Locale.ROOT, "%s at the last observed rates (read %.0f/s, production %.0f/s)",
-                        ReceiverChain.formatDuration(d), r.read(), r.production()))
-                .orElse(String.format(Locale.ROOT, "not projected: the last observed read rate (%.0f/s) did not exceed "
-                        + "production (%.0f/s), which is all a connector at the head can read", r.read(), r.production())))
-                .orElse("not projected: no read rate observed yet");
+        if (reread.signum() <= 0) {
+            return "none needed: nothing is retained to re-read";
+        }
+        return rates.map(r -> {
+            if (!r.saturated()) {
+                return String.format(Locale.ROOT, "not projected: when last measured the connector was keeping up (read %.0f/s, "
+                        + "production %.0f/s), so its read rate shows what the journal produced, not how fast it can re-read",
+                        r.read(), r.production());
+            }
+            return r.timeToClose(reread)
+                    .map(d -> String.format(Locale.ROOT, "%s at the last observed rates (read %.0f/s, production %.0f/s)",
+                            ReceiverChain.formatDuration(d), r.read(), r.production()))
+                    .orElse(String.format(Locale.ROOT, "never at the last observed rates: reading full buffers, the connector "
+                            + "read %.0f/s against %.0f/s produced", r.read(), r.production()));
+        }).orElse("not projected: no read rate observed yet");
     }
 
     /**
@@ -81,14 +103,28 @@ public record RecoveryCost(JournalProcessedPosition lost, ReceiverChain chain, O
 
     /**
      * Whether the entries between the lost position and the earliest retained receiver are gone, stated only as
-     * far as the chain shows it.
+     * far as the chain shows it. A lost position whose sequence number still falls inside the chain - a position
+     * reported lost while its entries are retained (#79) - is said to be so, not left as unmeasured.
      */
     public String gapStatement() {
-        return missingEntries().map(missing -> missing.signum() == 0
-                ? "no entry is missing between the lost position and the earliest available receiver, which starts right after it"
-                : missing + " entries between the lost position and the earliest available receiver are unrecoverable")
-                .orElse("whether entries are missing between the lost position and the earliest available receiver could not be "
-                        + "measured: the chain's sequence numbers do not come after the lost position");
+        final Optional<BigInteger> missing = missingEntries();
+        if (missing.isPresent()) {
+            return missing.get().signum() == 0
+                    ? "no entry is missing between the lost position and the earliest available receiver, which starts right after it"
+                    : missing.get() + " entries between the lost position and the earliest available receiver are unrecoverable";
+        }
+        if (!lost.isOffsetSet() || chain.receivers() == 0) {
+            return "whether entries are missing between the lost position and the earliest available receiver could not be "
+                    + "measured: " + (lost.isOffsetSet() ? "no receiver is retained" : "the lost position has no sequence number");
+        }
+        final BigInteger next = nextNeeded();
+        if (next.compareTo(chain.head().add(BigInteger.ONE)) <= 0) {
+            return "no entry appears missing: the lost position's sequence number " + lost.getOffset() + " still falls inside "
+                    + "the retained chain (" + chain.oldestStart() + " to " + chain.head() + "), unless the journal's sequence was reset";
+        }
+        return "whether entries are missing between the lost position and the earliest available receiver could not be "
+                + "measured: the lost position's sequence number " + lost.getOffset() + " is past the chain's head " + chain.head()
+                + ", so the journal was recreated or its sequence reset";
     }
 
     /** {@link #gapStatement()}, or why there is no measurement at all. */

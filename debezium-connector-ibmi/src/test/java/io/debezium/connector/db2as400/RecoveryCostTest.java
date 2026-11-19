@@ -8,13 +8,16 @@ package io.debezium.connector.db2as400;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.math.BigInteger;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 
 import org.junit.jupiter.api.Test;
 
 import io.debezium.ibmi.db2.journal.retrieve.JournalProcessedPosition;
 import io.debezium.ibmi.db2.journal.retrieve.JournalReceiver;
+import io.debezium.ibmi.db2.journal.retrieve.rnrn0200.JournalStatus;
 
 /**
  * The recovery warning states what it measured (issue #87): the distance re-read or skipped, the retention
@@ -65,15 +68,29 @@ class RecoveryCostTest {
     }
 
     /**
-     * A journal recreated, or its sequence reset, numbers the chain past the lost position: the arithmetic means
+     * A journal recreated, or its sequence reset, numbers the chain below the lost position: the arithmetic means
      * nothing then, and the warning says it could not measure rather than claiming either answer.
      */
     @Test
-    void aLostPositionTheChainDoesNotComeAfterIsNotMeasured() {
-        final RecoveryCost cost = cost(processed(2_000, "OLDRCV"), Optional.empty());
+    void aLostPositionPastTheChainsHeadIsNotMeasured() {
+        final RecoveryCost cost = cost(processed(50_000, "OLDRCV"), Optional.empty());
 
         assertThat(cost.missingEntries()).isEmpty();
-        assertThat(cost.gapStatement()).doesNotContain("unrecoverable").contains("could not be measured");
+        assertThat(cost.gapStatement()).doesNotContain("unrecoverable").contains("could not be measured", "past the chain's head 3700");
+        assertThat(cost.retainedEntriesSkippedByLatest()).as("nothing places it in the chain").isEmpty();
+    }
+
+    /**
+     * A position reported lost while its sequence number is still inside the chain - #79's false positive, the
+     * incident behind issue #87 - is said to look retained, not left as an open question.
+     */
+    @Test
+    void aLostPositionStillInsideTheChainIsSaidToBeRetained() {
+        final RecoveryCost cost = cost(processed(2_000, "RCV002"), Optional.empty());
+
+        assertThat(cost.missingEntries()).isEmpty();
+        assertThat(cost.gapStatement()).doesNotContain("unrecoverable", "could not be measured")
+                .contains("no entry appears missing", "2000 still falls inside the retained chain (101 to 3700)");
     }
 
     @Test
@@ -84,7 +101,7 @@ class RecoveryCostTest {
 
     @Test
     void theWarningCarriesTheDistancesTheRetentionAndTheProjectedCatchUp() {
-        final RecoveryCost cost = cost(processed(60, "RCV000"), Optional.of(new JournalRates.Rates(100, 300)));
+        final RecoveryCost cost = cost(processed(60, "RCV000"), Optional.of(new JournalRates.Rates(100, 300, true)));
 
         assertThat(cost.retainedEntriesSkippedByLatest()).contains(BigInteger.valueOf(3_600));
         // 3 600 entries to re-read, closing at 200/s
@@ -103,12 +120,47 @@ class RecoveryCostTest {
                 .contains(BigInteger.valueOf(700));
     }
 
+    /**
+     * 'latest' skips the whole retained chain when the lost position comes before it, counted receiver by receiver:
+     * sequence arithmetic over a chain whose sequence was reset part-way would come out negative.
+     */
+    @Test
+    void latestSkipsTheWholeChainAcrossASequenceReset() {
+        final ReceiverChain reset = ReceiverChain.of(List.of(
+                ReceiverChainTest.receiver("RCV001", ReceiverChainTest.NOW.minus(Duration.ofMinutes(60)), 5_001, 6_000,
+                        JournalStatus.OnlineSavedDetached),
+                ReceiverChainTest.receiver("RCV002", ReceiverChainTest.NOW.minus(Duration.ofMinutes(30)), 1, 500, JournalStatus.Attached)),
+                ReceiverChainTest.NOW);
+
+        final RecoveryCost cost = new RecoveryCost(processed(4_000, "RCV000"), reset, Optional.empty());
+
+        assertThat(cost.retainedEntriesSkippedByLatest()).contains(BigInteger.valueOf(1_500));
+        assertThat(cost.missingEntries()).contains(BigInteger.valueOf(1_000));
+    }
+
     @Test
     void aConnectorThatWasAtTheHeadProjectsNoCatchUp() {
         // at the head the read rate is the production rate, which says nothing about how fast it could read
-        assertThat(cost(processed(60, "RCV000"), Optional.of(new JournalRates.Rates(100, 100))).earliestCatchUp())
-                .startsWith("not projected: the last observed read rate (100/s) did not exceed production (100/s)");
+        assertThat(cost(processed(60, "RCV000"), Optional.of(new JournalRates.Rates(100, 100, false))).earliestCatchUp())
+                .startsWith("not projected: when last measured the connector was keeping up (read 100/s, production 100/s)");
         assertThat(cost(processed(60, "RCV000"), Optional.empty()).earliestCatchUp())
                 .isEqualTo("not projected: no read rate observed yet");
+    }
+
+    /**
+     * A connector at the head that drained a small backlog in the interval shows a few entries per second of
+     * closing rate; projecting a 3 600-entry re-read from 3/s would say 20 minutes, from noise.
+     */
+    @Test
+    void aSmallClosingRateAtTheHeadProjectsNothing() {
+        assertThat(cost(processed(60, "RCV000"), Optional.of(new JournalRates.Rates(100, 103, false))).earliestCatchUp())
+                .startsWith("not projected");
+    }
+
+    /** Reading full buffers and still not closing: the connector cannot catch up, and that is stated. */
+    @Test
+    void aSaturatedReaderThatDoesNotCloseNeverCatchesUp() {
+        assertThat(cost(processed(60, "RCV000"), Optional.of(new JournalRates.Rates(300, 200, true))).earliestCatchUp())
+                .startsWith("never at the last observed rates: reading full buffers, the connector read 200/s against 300/s produced");
     }
 }

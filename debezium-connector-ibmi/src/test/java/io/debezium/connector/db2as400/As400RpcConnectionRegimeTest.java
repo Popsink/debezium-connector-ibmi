@@ -47,15 +47,27 @@ class As400RpcConnectionRegimeTest {
         final As400StreamingChangeEventSourceMetrics metrics = mock(As400StreamingChangeEventSourceMetrics.class);
 
         assertThat(As400RpcConnection.recordRates(rates, metrics, 0, BigInteger.valueOf(3_000), BigInteger.valueOf(500),
-                BigInteger.valueOf(2_500))).isEqualTo("rates n/a until the next sample");
+                BigInteger.valueOf(2_500), true)).isEqualTo("rates n/a until the next sample");
         verify(metrics, never()).setJournalProductionRate(anyLong());
 
         final String line = As400RpcConnection.recordRates(rates, metrics, 10_000, BigInteger.valueOf(4_000),
-                BigInteger.valueOf(3_500), BigInteger.valueOf(500));
+                BigInteger.valueOf(3_500), BigInteger.valueOf(500), true);
 
         assertThat(line).startsWith("journal production 100/s, read 300/s, closing 200/s");
         verify(metrics).setJournalProductionRate(100);
         verify(metrics).setJournalReadRate(300);
         verify(metrics).setJournalClosingRate(200);
+    }
+
+    /** A blank position (an 'earliest' reset not yet read from) publishes nothing and is no baseline. */
+    @Test
+    void aSampleWithNoPositionPublishesNoRate() {
+        final JournalRates rates = new JournalRates();
+        final As400StreamingChangeEventSourceMetrics metrics = mock(As400StreamingChangeEventSourceMetrics.class);
+
+        As400RpcConnection.recordRates(rates, metrics, 0, BigInteger.valueOf(3_000), null, BigInteger.valueOf(3_000), true);
+        assertThat(As400RpcConnection.recordRates(rates, metrics, 10_000, BigInteger.valueOf(4_000), BigInteger.valueOf(2_000),
+                BigInteger.valueOf(2_000), true)).isEqualTo("rates n/a until the next sample");
+        verify(metrics, never()).setJournalReadRate(anyLong());
     }
 }
