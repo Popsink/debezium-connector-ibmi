@@ -400,6 +400,8 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                 }
 
                 final TableId tableId = new TableId(database, eheader.getLibrary(), longName);
+                // the converters may alter a value of this row long after this entry, once its commit arrives
+                final RowAttribution row = RowAttribution.ofJournalEntry(tableId, eheader);
 
                 final boolean includeTable = connectorConfig.getTableFilters().dataCollectionFilter()
                         .isIncluded(tableId);
@@ -482,7 +484,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                                 txc.event(tableId);
                             }
                             dispatcher.dispatchDataChangeEvent(partition, tableId, new As400ChangeRecordEmitter(partition,
-                                    offsetContext, Operation.UPDATE, dataBefore, dataNext, clock, connectorConfig));
+                                    offsetContext, Operation.UPDATE, dataBefore, dataNext, clock, connectorConfig, row));
                         }
                         else {
                             log.debug("update in transaction {}, buffering it", txId);
@@ -495,7 +497,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                             List<As400ChangeRecord> bufferList = bufferRecordMap.get(txId);
                             if (bufferList != null) {
                                 bufferList.add(new As400ChangeRecord(partition, tableId,
-                                        new As400ChangeRecordEmitter(partition, snapshot, Operation.UPDATE, dataBefore, dataNext, clock, connectorConfig)));
+                                        new As400ChangeRecordEmitter(partition, snapshot, Operation.UPDATE, dataBefore, dataNext, clock, connectorConfig, row)));
                                 log.debug("Buffer list for transaction {}: {}", txId, bufferList);
                             }
                         }
@@ -518,7 +520,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                                 txc.event(tableId);
                             }
                             dispatcher.dispatchDataChangeEvent(partition, tableId, new As400ChangeRecordEmitter(partition,
-                                    offsetContext, Operation.CREATE, null, dataNext, clock, connectorConfig));
+                                    offsetContext, Operation.CREATE, null, dataNext, clock, connectorConfig, row));
                         }
                         else {
                             log.debug("insert in transaction {}, buffering it", txId);
@@ -531,7 +533,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                             List<As400ChangeRecord> bufferList = bufferRecordMap.get(txId);
                             if (bufferList != null) {
                                 bufferList.add(new As400ChangeRecord(partition, tableId, new As400ChangeRecordEmitter(partition,
-                                        snapshot, Operation.CREATE, null, dataNext, clock, connectorConfig)));
+                                        snapshot, Operation.CREATE, null, dataNext, clock, connectorConfig, row)));
                                 log.debug("Buffer list for transaction {}: {}", txId, bufferRecordMap.get(txId));
                             }
                         }
@@ -555,7 +557,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                                 txc.event(tableId);
                             }
                             dispatcher.dispatchDataChangeEvent(partition, tableId, new As400ChangeRecordEmitter(partition,
-                                    offsetContext, Operation.DELETE, dataBefore, null, clock, connectorConfig));
+                                    offsetContext, Operation.DELETE, dataBefore, null, clock, connectorConfig, row));
                         }
                         else {
                             log.debug("delete in transaction {}, buffering it", txId);
@@ -568,7 +570,7 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                             List<As400ChangeRecord> bufferList = bufferRecordMap.get(txId);
                             if (bufferList != null) {
                                 bufferList.add(new As400ChangeRecord(partition, tableId,
-                                        new As400ChangeRecordEmitter(partition, snapshot, Operation.DELETE, dataBefore, null, clock, connectorConfig)));
+                                        new As400ChangeRecordEmitter(partition, snapshot, Operation.DELETE, dataBefore, null, clock, connectorConfig, row)));
                                 log.debug("Buffer list for transaction {}: {}", txId, bufferRecordMap.get(txId));
                             }
                         }

@@ -34,10 +34,14 @@ import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.notification.NotificationService;
 import io.debezium.pipeline.source.SnapshottingTask;
 import io.debezium.pipeline.source.spi.SnapshotProgressListener;
+import io.debezium.pipeline.spi.ChangeRecordEmitter;
+import io.debezium.pipeline.spi.OffsetContext;
 import io.debezium.pipeline.spi.SnapshotResult;
 import io.debezium.relational.RelationalSnapshotChangeEventSource;
+import io.debezium.relational.SnapshotChangeRecordEmitter;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
+import io.debezium.schema.DataCollectionSchema;
 import io.debezium.schema.SchemaChangeEvent;
 import io.debezium.schema.SchemaChangeEvent.SchemaChangeEventType;
 import io.debezium.snapshot.SnapshotterService;
@@ -482,5 +486,30 @@ public class As400SnapshotChangeEventSource
     protected As400OffsetContext copyOffset(
                                             RelationalSnapshotContext<As400Partition, As400OffsetContext> snapshotContext) {
         return new Loader(connectorConfig).load(snapshotContext.offset.getOffset());
+    }
+
+    @Override
+    protected ChangeRecordEmitter<As400Partition> getChangeRecordEmitter(As400Partition partition, As400OffsetContext offset,
+                                                                         TableId tableId, Object[] row, Instant timestamp) {
+        offset.event(tableId, timestamp);
+        return new AttributedSnapshotRecordEmitter(partition, offset, row, getClock(), connectorConfig, tableId);
+    }
+
+    /** A snapshot row whose values, if a converter alters one, are reported against their table (#58). */
+    static final class AttributedSnapshotRecordEmitter extends SnapshotChangeRecordEmitter<As400Partition> {
+        private final RowAttribution attribution;
+
+        AttributedSnapshotRecordEmitter(As400Partition partition, OffsetContext offset, Object[] row, Clock clock,
+                                        As400ConnectorConfig connectorConfig, TableId tableId) {
+            super(partition, offset, row, clock, connectorConfig);
+            this.attribution = RowAttribution.ofSnapshot(tableId);
+        }
+
+        @Override
+        public void emitChangeRecords(DataCollectionSchema schema, Receiver<As400Partition> receiver) throws InterruptedException {
+            try (RowAttribution.Binding binding = attribution.bind()) {
+                super.emitChangeRecords(schema, receiver);
+            }
+        }
     }
 }

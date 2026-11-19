@@ -134,7 +134,7 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
         final As400ConnectorConfig newConfig = taskContext.getConfig();
 
         final As400StreamingChangeEventSourceMetrics streamingMetrics = new As400StreamingChangeEventSourceMetrics(
-                taskContext, queue, metadataProvider, schema::tableIds);
+                taskContext, queue, metadataProvider, schema::tableIds, schema.getSanitisedValues());
 
         // journal reading needs raw schema.table names, not the regex form tableIncludeList() returns
         String configuredIncludes = newConfig.getRawTableIncludeList();
