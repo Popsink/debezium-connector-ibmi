@@ -233,6 +233,10 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
             if (offset == null || rpcConnection.checkLogPosition(offset) != As400RpcConnection.PositionAvailability.PRUNED) {
                 continue;
             }
+            // measured before any strategy is applied, see As400StreamingChangeEventSource (issue #87)
+            final Optional<RecoveryCost> cost = rpcConnection.recoveryCost(offset.getPosition());
+            LOGGER.warn("stored journal position {} is no longer available (pruned receiver); recovering with '{}': {}",
+                    offset.getPosition(), mode.getValue(), RecoveryCost.describe(cost));
             switch (mode) {
                 case FAIL:
                     throw new OffsetNoLongerAvailableException(
@@ -250,16 +254,16 @@ public class As400ConnectorTask extends BaseSourceTask<As400Partition, As400Offs
                     break;
                 case EARLIEST:
                     LOGGER.warn("DATA GAP: stored journal position {} is no longer available (pruned receiver); resetting streaming to "
-                            + "the earliest available journal receiver. Changes between the lost position and the earliest available "
-                            + "receiver are unrecoverable.", offset.getPosition());
+                            + "the earliest available journal receiver: {}.", offset.getPosition(), RecoveryCost.gapStatement(cost));
                     offset.setPosition(new JournalProcessedPosition());
                     break;
                 case LATEST:
                     final JournalProcessedPosition head = currentJournalHead(rpcConnection, offset);
                     LOGGER.warn("DATA GAP: stored journal position {} is no longer available (pruned receiver); resetting streaming to "
-                            + "the current journal head {}. Changes between the lost position and the head are unrecoverable - as they "
-                            + "are under 'earliest', which replays the whole retained journal to recover none of them.",
-                            offset.getPosition(), head);
+                            + "the current journal head {}: the {} retained entries before it are skipped, and {}.",
+                            offset.getPosition(), head,
+                            cost.flatMap(RecoveryCost::retainedEntriesSkippedByLatest).map(Object::toString).orElse("(unmeasured)"),
+                            RecoveryCost.gapStatement(cost));
                     offset.setPosition(head);
                     break;
             }
