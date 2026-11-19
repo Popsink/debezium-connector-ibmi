@@ -26,15 +26,41 @@ public final class RowAttribution {
     private static final ThreadLocal<Binding> CURRENT = new ThreadLocal<>();
 
     private final TableId table;
-    private final String position;
+    /** The journal entry the row was read from, formatted only if a value of the row is reported. */
+    private final EntryHeader entry;
+    private String position;
 
-    private RowAttribution(TableId table, String position) {
+    private RowAttribution(TableId table, EntryHeader entry, String position) {
         this.table = table;
+        this.entry = entry;
         this.position = position;
     }
 
-    /** A row read from the journal: its offset, RRN, member, entry and commit cycle. */
+    /**
+     * A row read from the journal: its offset, RRN, member, entry and commit cycle. Built for every entry the
+     * streaming source processes, so the position is only formatted when a value of the row is reported; the
+     * header is immutable, so it still describes this entry when a buffered record is emitted at commit.
+     */
     public static RowAttribution ofJournalEntry(TableId table, EntryHeader eheader) {
+        return new RowAttribution(table, eheader, null);
+    }
+
+    /** A row read by a snapshot query, which has no journal position. */
+    public static RowAttribution ofSnapshot(TableId table) {
+        return new RowAttribution(table, null, "read by snapshot");
+    }
+
+    /** A row read by a signal-based incremental snapshot, which has no journal position either. */
+    public static RowAttribution ofIncrementalSnapshot(TableId table) {
+        return new RowAttribution(table, null, "read by incremental snapshot");
+    }
+
+    /** A row whose position is not known: at least the table is. */
+    public static RowAttribution ofTable(TableId table) {
+        return new RowAttribution(table, null, null);
+    }
+
+    private static String describe(EntryHeader eheader) {
         final StringBuilder position = new StringBuilder()
                 .append("offset ").append(eheader.getSequenceNumber())
                 .append(", RRN ").append(eheader.getRelativeRecordNumber());
@@ -45,17 +71,7 @@ public final class RowAttribution {
         position.append(", journal code ").append(eheader.getJournalCode())
                 .append(", entry type ").append(eheader.getJournalEntryType())
                 .append(", commit cycle ").append(eheader.getCommitCycle());
-        return new RowAttribution(table, position.toString());
-    }
-
-    /** A row read by a snapshot query, which has no journal position. */
-    public static RowAttribution ofSnapshot(TableId table) {
-        return new RowAttribution(table, "read by snapshot");
-    }
-
-    /** A row whose position is not known: at least the table is. */
-    public static RowAttribution ofTable(TableId table) {
-        return new RowAttribution(table, null);
+        return position.toString();
     }
 
     public TableId table() {
@@ -64,13 +80,18 @@ public final class RowAttribution {
 
     /** Where in the source the row was read, or {@code null} when that is not known. */
     public String position() {
+        if (position == null && entry != null) {
+            // the converting thread is the only reader; a race would only format the same string twice
+            position = describe(entry);
+        }
         return position;
     }
 
     @Override
     public String toString() {
         final String name = (table == null) ? "unknown table" : "table " + table;
-        return (position == null) ? name : name + ", " + position;
+        final String where = position();
+        return (where == null) ? name : name + ", " + where;
     }
 
     /** Makes this the row being converted on this thread until the binding is closed. */

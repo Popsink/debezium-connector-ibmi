@@ -7,6 +7,7 @@ package io.debezium.connector.db2as400;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import java.math.BigInteger;
@@ -85,6 +86,10 @@ class As400ValueConvertersSanitiseTest {
     }
 
     private static RowAttribution journalRow(long offset, long rrn) {
+        return RowAttribution.ofJournalEntry(TABLE, journalEntry(offset, rrn));
+    }
+
+    private static EntryHeader journalEntry(long offset, long rrn) {
         final EntryHeader eheader = mock(EntryHeader.class);
         when(eheader.getSequenceNumber()).thenReturn(BigInteger.valueOf(offset));
         when(eheader.getRelativeRecordNumber()).thenReturn(BigInteger.valueOf(rrn));
@@ -92,7 +97,7 @@ class As400ValueConvertersSanitiseTest {
         when(eheader.getJournalCode()).thenReturn('R');
         when(eheader.getJournalEntryType()).thenReturn(JournalEntryType.ADD_ROW2);
         when(eheader.getCommitCycle()).thenReturn(BigInteger.valueOf(42));
-        return RowAttribution.ofJournalEntry(TABLE, eheader);
+        return eheader;
     }
 
     private List<ILoggingEvent> at(Level level) {
@@ -220,5 +225,31 @@ class As400ValueConvertersSanitiseTest {
             assertThat(RowAttribution.current().row().position()).startsWith("offset 1,");
         }
         assertThat(RowAttribution.current()).isNull();
+    }
+
+    @Test
+    void aJournalRowIsOnlyDescribedWhenOneOfItsValuesIsLogged() {
+        // every journal entry the streaming source processes gets an attribution: it must cost nothing
+        // until a value of that row is actually reported
+        final EntryHeader first = journalEntry(1, 1);
+        final EntryHeader quiet = journalEntry(2, 2);
+        final RowAttribution firstRow = RowAttribution.ofJournalEntry(TABLE, first);
+        final RowAttribution quietRow = RowAttribution.ofJournalEntry(TABLE, quiet);
+        verifyNoInteractions(first, quiet);
+
+        logger.setLevel(Level.INFO);
+        final As400ValueConverters converters = converters();
+        try (RowAttribution.Binding row = firstRow.bind()) {
+            convert(converters, NOTES, DIRTY);
+        }
+        // counted and held for the next summary, but neither announced nor logged at DEBUG
+        try (RowAttribution.Binding row = quietRow.bind()) {
+            convert(converters, NOTES, DIRTY);
+        }
+
+        assertThat(at(Level.WARN)).singleElement().extracting(ILoggingEvent::getFormattedMessage)
+                .asString().contains("offset 1, RRN 1");
+        assertThat(converters.sanitisedValues().total()).isEqualTo(2);
+        verifyNoInteractions(quiet);
     }
 }

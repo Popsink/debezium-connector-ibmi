@@ -67,7 +67,8 @@ public class SanitisedValues {
         total.incrementAndGet();
         byColumn.computeIfAbsent(key, k -> new LongAdder()).increment();
 
-        final String where = (row == null) ? "row unknown" : row.toString();
+        // the row itself, not its description: SLF4J formats it only for a line that is actually logged
+        final Object where = (row == null) ? "row unknown" : row;
         log.debug("replaced {} control character(s) with '?' in column {} ({})", replaced, column, where);
         if (announced.add(key)) {
             log.warn("replaced {} control character(s) with '?' in column {} ({}). The row and the column are "
@@ -91,7 +92,7 @@ public class SanitisedValues {
             if (window.isEmpty()) {
                 windowStartMs = now;
             }
-            window.computeIfAbsent(key, k -> new Window()).add(row == null ? null : row.position());
+            window.computeIfAbsent(key, k -> new Window()).add(row);
             final long elapsedMs = now - windowStartMs;
             if (elapsedMs < SUMMARY_INTERVAL.toMillis()) {
                 return null;
@@ -130,22 +131,24 @@ public class SanitisedValues {
 
     private static final class Window {
         private long count;
-        private String first;
-        private String last;
+        private RowAttribution first;
+        private RowAttribution last;
 
-        void add(String position) {
+        void add(RowAttribution row) {
             if (count++ == 0) {
-                first = position;
+                first = row;
             }
-            last = position;
+            last = row;
         }
 
         @Override
         public String toString() {
-            if (first == null) {
+            final String firstAt = (first == null) ? null : first.position();
+            if (firstAt == null) {
                 return count + " value(s)";
             }
-            return count + " value(s), first at " + first + (count > 1 && last != null ? ", last at " + last : "");
+            final String lastAt = (last == null) ? null : last.position();
+            return count + " value(s), first at " + firstAt + (count > 1 && lastAt != null ? ", last at " + lastAt : "");
         }
     }
 }

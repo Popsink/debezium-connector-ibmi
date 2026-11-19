@@ -24,9 +24,18 @@ import io.debezium.data.Envelope;
 import io.debezium.data.Envelope.Operation;
 import io.debezium.ibmi.db2.journal.retrieve.JournalEntryType;
 import io.debezium.ibmi.db2.journal.retrieve.rjne0200.EntryHeader;
+import io.debezium.jdbc.MainConnectionProvidingConnectionFactory;
+import io.debezium.pipeline.ErrorHandler;
+import io.debezium.pipeline.EventDispatcher;
+import io.debezium.pipeline.notification.NotificationService;
+import io.debezium.pipeline.source.snapshot.incremental.IncrementalSnapshotChangeEventSource;
+import io.debezium.pipeline.source.spi.DataChangeEventListener;
+import io.debezium.pipeline.source.spi.SnapshotProgressListener;
 import io.debezium.pipeline.spi.OffsetContext;
 import io.debezium.relational.TableId;
 import io.debezium.relational.TableSchema;
+import io.debezium.snapshot.SnapshotterService;
+import io.debezium.spi.schema.DataCollectionId;
 import io.debezium.util.Clock;
 
 /**
@@ -109,13 +118,52 @@ class As400ChangeRecordEmitterAttributionTest {
         final As400ConnectorConfig config = config();
         final List<RowAttribution> bound = new ArrayList<>();
         final As400SnapshotChangeEventSource.AttributedSnapshotRecordEmitter emitter = new As400SnapshotChangeEventSource.AttributedSnapshotRecordEmitter(
-                new As400Partition("serverX"), offset(), new Object[]{ "x" }, Clock.SYSTEM, config, TABLE);
+                new As400Partition("serverX"), offset(), new Object[]{ "x" }, Clock.SYSTEM, config, RowAttribution.ofSnapshot(TABLE));
 
         emitter.emitChangeRecords(recordingSchema(bound), (partition, schema, operation, key, value, o, headers) -> {
         });
 
         assertThat(bound).isNotEmpty()
                 .allSatisfy(r -> assertThat(r.toString()).isEqualTo("table " + TABLE + ", read by snapshot"));
+        assertThat(RowAttribution.current()).isNull();
+    }
+
+    @Test
+    void anIncrementalSnapshotRowIsReportedAgainstItsTable() throws InterruptedException {
+        final As400ConnectorConfig config = new As400ConnectorConfig(Configuration.create()
+                .with(CommonConnectorConfig.TOPIC_PREFIX, "serverX")
+                .with(As400ConnectorConfig.DATABASE_NAME, "DTEST")
+                .with(CommonConnectorConfig.SIGNAL_DATA_COLLECTION, "DTEST.LIB.SIGNALS")
+                .build());
+        @SuppressWarnings("unchecked")
+        final MainConnectionProvidingConnectionFactory<As400JdbcConnection> connections = mock(MainConnectionProvidingConnectionFactory.class);
+        when(connections.mainConnection()).thenReturn(mock(As400JdbcConnection.class));
+        @SuppressWarnings("unchecked")
+        final EventDispatcher<As400Partition, TableId> dispatcher = mock(EventDispatcher.class);
+        final As400ChangeEventSourceFactory factory = new As400ChangeEventSourceFactory(config, config, mock(As400RpcConnection.class),
+                connections, mock(ErrorHandler.class), dispatcher, Clock.SYSTEM, mock(As400DatabaseSchema.class),
+                mock(SnapshotterService.class));
+
+        @SuppressWarnings("unchecked")
+        final SnapshotProgressListener<As400Partition> progress = mock(SnapshotProgressListener.class);
+        @SuppressWarnings("unchecked")
+        final DataChangeEventListener<As400Partition> changes = mock(DataChangeEventListener.class);
+        @SuppressWarnings("unchecked")
+        final NotificationService<As400Partition, As400OffsetContext> notifications = mock(NotificationService.class);
+        final IncrementalSnapshotChangeEventSource<As400Partition, ? extends DataCollectionId> source = factory
+                .getIncrementalSnapshotChangeEventSource(mock(As400OffsetContext.class), progress, changes, notifications)
+                .orElseThrow();
+
+        // Debezium's own incremental snapshot emitter binds no row: the connector must supply its own
+        assertThat(source).isInstanceOf(As400IncrementalSnapshotChangeEventSource.class);
+        final List<RowAttribution> bound = new ArrayList<>();
+        ((As400IncrementalSnapshotChangeEventSource) source)
+                .getChangeRecordEmitter(new As400Partition("serverX"), TABLE, offset(), new Object[]{ "x" })
+                .emitChangeRecords(recordingSchema(bound), (partition, schema, operation, key, value, o, headers) -> {
+                });
+
+        assertThat(bound).isNotEmpty()
+                .allSatisfy(r -> assertThat(r.toString()).isEqualTo("table " + TABLE + ", read by incremental snapshot"));
         assertThat(RowAttribution.current()).isNull();
     }
 }

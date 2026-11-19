@@ -37,6 +37,7 @@ import io.debezium.pipeline.source.spi.SnapshotProgressListener;
 import io.debezium.pipeline.spi.ChangeRecordEmitter;
 import io.debezium.pipeline.spi.OffsetContext;
 import io.debezium.pipeline.spi.SnapshotResult;
+import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.RelationalSnapshotChangeEventSource;
 import io.debezium.relational.SnapshotChangeRecordEmitter;
 import io.debezium.relational.Table;
@@ -492,17 +493,22 @@ public class As400SnapshotChangeEventSource
     protected ChangeRecordEmitter<As400Partition> getChangeRecordEmitter(As400Partition partition, As400OffsetContext offset,
                                                                          TableId tableId, Object[] row, Instant timestamp) {
         offset.event(tableId, timestamp);
-        return new AttributedSnapshotRecordEmitter(partition, offset, row, getClock(), connectorConfig, tableId);
+        return new AttributedSnapshotRecordEmitter(partition, offset, row, getClock(), connectorConfig,
+                RowAttribution.ofSnapshot(tableId));
     }
 
-    /** A snapshot row whose values, if a converter alters one, are reported against their table (#58). */
+    /**
+     * A snapshot row whose values, if a converter alters one, are reported against their table (#58). Used by
+     * the initial and blocking snapshots here, and by the incremental one in
+     * {@link As400IncrementalSnapshotChangeEventSource}.
+     */
     static final class AttributedSnapshotRecordEmitter extends SnapshotChangeRecordEmitter<As400Partition> {
         private final RowAttribution attribution;
 
         AttributedSnapshotRecordEmitter(As400Partition partition, OffsetContext offset, Object[] row, Clock clock,
-                                        As400ConnectorConfig connectorConfig, TableId tableId) {
+                                        RelationalDatabaseConnectorConfig connectorConfig, RowAttribution attribution) {
             super(partition, offset, row, clock, connectorConfig);
-            this.attribution = RowAttribution.ofSnapshot(tableId);
+            this.attribution = attribution;
         }
 
         @Override

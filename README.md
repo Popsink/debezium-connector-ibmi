@@ -320,6 +320,22 @@ log alone: slice `2 * byteLength` hex characters per column in table-format orde
 field, random bytes are corruption, a valid-looking pattern that is shifted means the table format changed
 after the entry was journaled. The RRN is what the customer needs to locate the row.
 
+### Control characters in text columns
+
+A control, format, private-use, surrogate or unassigned character in a text value is replaced with `?` and the
+value delivered: the row and the column are not lost, but a consumer cannot tell a substituted `?` from a
+genuine one. The first value altered in a column is logged once at **WARN** (`replaced N control character(s)
+with '?' in column …`), naming the table and, for a journal row, the offset, RRN, member, journal code, entry
+type and commit cycle; a snapshot row names only its table. After that the log carries at most one summary a
+minute per task (`… in N more value(s) over the last 60s [LIB.TABLE.COLUMN: …]`), and every altered value
+at **DEBUG** under `io.debezium.connector.db2as400.As400ValueConverters`. The summary goes out with the next
+altered value, so values altered in the last minute before the rewrites stop show only in the counter and at
+DEBUG.
+
+The streaming metrics MBean counts them since the task started: `SanitisedValues` (total, snapshot included)
+and `SanitisedValuesByColumn` (`LIBRARY.TABLE.COLUMN` → count). A recurring rewrite on a fixed set of columns
+usually means their CCSID is wrong (see "CCSID") or that they hold binary data.
+
 ## Memory
 
 Recommended minimum memory 1GB
