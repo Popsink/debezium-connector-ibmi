@@ -8,6 +8,7 @@ package io.debezium.connector.db2as400;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.sql.SQLNonTransientConnectionException;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -58,6 +59,7 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
     private static SocketProperties socketProperties = new SocketProperties();
     private final LogLimmiting periodic = new LogLimmiting(5 * 60 * 1000l);
     private final CatchUpTrend catchUpTrend = new CatchUpTrend();
+    private final JournalRates journalRates = new JournalRates();
     /** walking and dispatching the previous block, the part a prefetch hides */
     private long lastConsumedMs;
     private final JournalInfoRetrieval journalInfoRetrieval;
@@ -91,6 +93,8 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
                         config.cacheAdditionalDelay(), As400ConnectorConfig.JOURNAL_CACHE_ADDITIONAL_DELAY.name(),
                         config.getPollInterval().toMillis());
             }
+            log.info("{}", describeRegime(journalInfo, cacheWait, config.cacheAdditionalDelay(),
+                    journalInfoRetrieval.headDelayMs(journalInfo), readReceiverChain()));
 
             boolean transactionMgt = config.isTransactionMgmtEnabled();
 
@@ -108,6 +112,53 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
         }
         catch (final IOException e) {
             log.error("Failed to fetch library", e);
+        }
+    }
+
+    /**
+     * The journal regime line (issue #87): whether this deployment reads at the live head or behind it, and what
+     * the retained chain holds - the inputs to "is it exposed to #79" and "what would a recovery cost", which
+     * used to be readable only from the receiver list dumped by a failure.
+     *
+     * <p>A caching journal is read up to the head a probe proves readable, which lags live by up to the cache
+     * wait; if the probe is refused it falls back to the timer, {@code effectiveHeadDelay} behind live. A
+     * journal that does not cache is read on the timer, {@code journal.additional.delay} behind live.</p>
+     */
+    static String describeRegime(JournalInfo journal, long cacheWaitMs, long additionalDelayMs, long effectiveHeadDelayMs,
+                                 String chain) {
+        return String.format("Journal %s/%s: caching=%s, head=%s, cacheWait=%dms, additionalDelay=%dms, effectiveHeadDelay=%dms, %s",
+                journal.journalLibrary(), journal.journalName(), journal.isCaching(),
+                journal.isCaching() ? "proven by probe (timer if the probe is refused)" : "timer", cacheWaitMs, additionalDelayMs,
+                effectiveHeadDelayMs, chain);
+    }
+
+    /** The chain for the regime line, or why it could not be read: it only feeds a log line and must not fail startup. */
+    private String readReceiverChain() {
+        try {
+            return ReceiverChain.of(journalInfoRetrieval.getReceivers(connection(), journalInfo), Instant.now()).describe();
+        }
+        catch (final Exception e) {
+            log.debug("could not read the receiver chain for the journal regime line", e);
+            return "receivers=unavailable (" + e + ")";
+        }
+    }
+
+    /**
+     * What recovering from {@code lost} costs against the receiver chain as it is now, with the rates the
+     * periodic diagnostics last measured (issue #87). Empty when the chain cannot be read: it only informs the
+     * recovery warning and must never stand in the way of the recovery itself.
+     */
+    public Optional<RecoveryCost> recoveryCost(JournalProcessedPosition lost) {
+        if (journalInfo == null || lost == null) {
+            return Optional.empty();
+        }
+        try {
+            final ReceiverChain chain = ReceiverChain.of(journalInfoRetrieval.getReceivers(connection(), journalInfo), Instant.now());
+            return Optional.of(new RecoveryCost(lost, chain, journalRates.lastRates()));
+        }
+        catch (final Exception e) {
+            log.warn("could not read the receiver chain to measure the cost of recovering position {}", lost, e);
+            return Optional.empty();
         }
     }
 
@@ -443,13 +494,15 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
             final boolean bufferFull = state == RetrievalState.MoreDataAvailable;
             final int growthSamples = catchUpTrend.record(behind, bufferFull);
             streamingMetrics.setJournalBehindGrowthSamples(growthSamples);
+            final String rates = recordRates(journalRates, streamingMetrics, System.currentTimeMillis(), currentReceiver.getOffset(),
+                    position.isOffsetSet() ? position.getOffset() : null, behind, bufferFull);
             final FirstHeader header = retrieveJournal.getFirstHeader();
             log.info("Current position diagnostics last call {}, header {}, behind {}, parked on receiver {} at offset {}, "
                     + "current receiver {}, last block rpc {}ms waited {}ms consumed {}ms, small call {}ms, {}, "
-                    + "lag growth samples {}", state, header, behind, position.getReceiver(), position.getOffset(),
+                    + "lag growth samples {}, {}", state, header, behind, position.getReceiver(), position.getOffset(),
                     currentReceiver, retrieveJournal.lastRpcMs(), retrieveJournal.lastWaitMs(), lastConsumedMs,
                     smallCallMs, describeLink(header == null ? 0 : header.totalBytes(), retrieveJournal.lastRpcMs(), smallCallMs),
-                    growthSamples);
+                    growthSamples, rates);
             if (growthSamples >= CatchUpTrend.WARN_AFTER) {
                 log.warn("CANNOT CATCH UP: lag grew for {} consecutive samples (now {} behind) with a full {} byte buffer "
                         + "every call; the journal grows faster than this connection reads it and the position will fall out "
@@ -457,6 +510,24 @@ public class As400RpcConnection implements AutoCloseable, Connect<AS400, IOExcep
                         + "max.journal.timeout, or retain receivers for longer.", growthSamples, behind, config.getJournalBufferSize());
             }
         }
+    }
+
+    /**
+     * Feeds one diagnostics sample to {@code rates}, publishes what it measured as gauges, and describes it for
+     * the diagnostics line (issue #87). The gauges keep their last measured values through a sample that
+     * measures nothing (the first one, one across an offset reset, or one taken with no position yet).
+     *
+     * @param position the connector's position, null while it has none (a blank {@code earliest} reset)
+     */
+    static String recordRates(JournalRates rates, As400StreamingChangeEventSourceMetrics metrics, long nowMs, BigInteger head,
+                              BigInteger position, BigInteger behind, boolean bufferFull) {
+        final Optional<JournalRates.Rates> measured = rates.record(nowMs, head, position, bufferFull);
+        measured.ifPresent(r -> {
+            metrics.setJournalProductionRate(Math.round(r.production()));
+            metrics.setJournalReadRate(Math.round(r.read()));
+            metrics.setJournalClosingRate(Math.round(r.closing()));
+        });
+        return measured.map(r -> r.describe(behind)).orElse("rates n/a until the next sample");
     }
 
     /**

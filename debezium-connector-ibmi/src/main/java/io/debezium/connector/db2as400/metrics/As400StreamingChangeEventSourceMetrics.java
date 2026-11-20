@@ -21,6 +21,9 @@ public class As400StreamingChangeEventSourceMetrics extends DefaultStreamingChan
     private final AtomicLong journalOffset = new AtomicLong();
     private final AtomicLong lastProcessedMs = new AtomicLong();
     private final AtomicInteger journalBehindGrowthSamples = new AtomicInteger();
+    private final AtomicLong journalProductionRate = new AtomicLong();
+    private final AtomicLong journalReadRate = new AtomicLong();
+    private final AtomicLong journalClosingRate = new AtomicLong();
 
     public <T extends CdcSourceTaskContext> As400StreamingChangeEventSourceMetrics(T taskContext, ChangeEventQueueMetrics changeEventQueueMetrics,
                                                                                    EventMetadataProvider metadataProvider,
@@ -62,5 +65,32 @@ public class As400StreamingChangeEventSourceMetrics extends DefaultStreamingChan
 
     public void setJournalBehindGrowthSamples(int samples) {
         this.journalBehindGrowthSamples.lazySet(samples);
+    }
+
+    @Override
+    public long getJournalProductionRate() {
+        return journalProductionRate.get();
+    }
+
+    public void setJournalProductionRate(long entriesPerSecond) {
+        this.journalProductionRate.lazySet(entriesPerSecond);
+    }
+
+    @Override
+    public long getJournalReadRate() {
+        return journalReadRate.get();
+    }
+
+    public void setJournalReadRate(long entriesPerSecond) {
+        this.journalReadRate.lazySet(entriesPerSecond);
+    }
+
+    @Override
+    public long getJournalClosingRate() {
+        return journalClosingRate.get();
+    }
+
+    public void setJournalClosingRate(long entriesPerSecond) {
+        this.journalClosingRate.lazySet(entriesPerSecond);
     }
 }

@@ -29,6 +29,7 @@ Patches that upstream accepts are dropped from the fork at the next rebase. Upst
 | SLF4J placeholder mismatches (#56) | Candidate for upstream (#93) |
 | A DDS keyed access path only keys records when the file requires unique keys, `dds.key.require.unique` (#96) | Candidate for upstream (#93) |
 | Time-bounded streaming retries per kind of failure, CPF7007 member locks waited out, rejected sign-ons not retried (#107) | Popsink-only for now; tuned for an orchestrator that restarts a failed engine |
+| Journal regime line at task start, journal rates in the diagnostics and as gauges, measured recovery cost in the recovery warnings (#87) | Candidate for upstream (#93) |
 
 Already accepted upstream and no longer carried here: persist and load the incremental snapshot status (debezium/dbz#1861) and the reliable connection close that clears the prepared-statement cache (debezium/dbz#2204).
 
@@ -172,6 +173,18 @@ Three things are done to keep this from turning into a silent crash-loop:
   Where a dropped record is not acceptable, `snapshot` is the safe recovery: it fills the gap instead
   of skipping it.
 
+Before any strategy is applied, a `WARN` states what the recovery costs, measured against the receiver
+chain at that moment: the entries no retained receiver holds any more (lost under every strategy), what
+`earliest` re-reads, what `latest` skips, the retention window and roll cadence, and the time `earliest`
+needs to return to the head at the rates the diagnostics last measured - projected only when the connector
+was then reading full buffers, since a connector keeping up reads what the journal produces and says
+nothing of how fast it can re-read. Re-reading is duplicates, a hole is data loss, and telling the two
+apart used to mean parsing the receiver list a failure dumped. The `DATA GAP` warning only calls entries
+unrecoverable when the chain shows some are missing: a pruned receiver whose successor starts with the
+very next entry loses nothing, a lost position whose sequence number still falls inside the chain is
+reported as apparently retained, and a chain that cannot be read, or whose head is below the lost
+position (a journal recreated or its sequence reset), is reported as not measured.
+
 Data already lost from pruned receivers cannot be recovered via CDC; recovery is about getting the
 connector healthy again, not replaying the gap. Ad-hoc snapshots (both incremental and blocking) are
 also supported via the signalling channel.
@@ -304,6 +317,24 @@ trip) and derives the `link rate` and the bytes `in flight per round trip`: a lo
 in flight over a long round trip is a TCP window, not a slow network. An IBM i ships with 64 KiB
 buffers (`CHGTCPA TCPSNDBUF`/`TCPRCVBUF`), about 320 KB/s at 200 ms whatever `buffer.size` is; raise
 them on the host.
+
+From its second sample the same line derives the rates between two samples: journal `production`,
+connector `read`, their difference `closing` (negative while the lag grows), and the `catch-up` time at
+that rate. They are also exposed as `JournalProductionRate`, `JournalReadRate` and `JournalClosingRate`
+(entries per second). A sample across an offset reset or a sequence reset measures nothing; the gauges
+keep their last measured values.
+
+At task start one `INFO` line states the journal regime and what the retained chain holds:
+
+```
+Journal LIB/QSQJRN: caching=true, head=proven by probe (timer if the probe is refused), cacheWait=25000ms,
+  additionalDelay=0ms, effectiveHeadDelay=25000ms, receivers=424, retention=64.7h, retainedEntries=3525020805,
+  averageProduction=15129/s, medianRoll=7.3min, oldest=RCVLIB/RCV0001, attached=RCVLIB/RCV0424
+```
+
+`effectiveHeadDelay` is how far behind live the head may be held (`journal.additional.delay`, plus the
+system's journal cache wait on a caching journal). A journal that does not cache is read on the timer;
+fast-rolling receivers on a caching journal are what exposed connectors to the reset of issue #79.
 
 When the lag (`behind`, `JournalBehind`) has grown for three consecutive samples with a full buffer
 every call, the connector logs `CANNOT CATCH UP` at WARN and exposes the count as
