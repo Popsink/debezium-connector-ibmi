@@ -6,12 +6,14 @@
 package io.debezium.connector.db2as400.metrics;
 
 import java.math.BigInteger;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import io.debezium.connector.base.ChangeEventQueueMetrics;
 import io.debezium.connector.common.CdcSourceTaskContext;
 import io.debezium.connector.db2as400.As400Partition;
+import io.debezium.connector.db2as400.SanitisedValues;
 import io.debezium.pipeline.metrics.CapturedTablesSupplier;
 import io.debezium.pipeline.metrics.DefaultStreamingChangeEventSourceMetrics;
 import io.debezium.pipeline.source.spi.EventMetadataProvider;
@@ -21,11 +23,14 @@ public class As400StreamingChangeEventSourceMetrics extends DefaultStreamingChan
     private final AtomicLong journalOffset = new AtomicLong();
     private final AtomicLong lastProcessedMs = new AtomicLong();
     private final AtomicInteger journalBehindGrowthSamples = new AtomicInteger();
+    private final SanitisedValues sanitisedValues;
 
     public <T extends CdcSourceTaskContext> As400StreamingChangeEventSourceMetrics(T taskContext, ChangeEventQueueMetrics changeEventQueueMetrics,
                                                                                    EventMetadataProvider metadataProvider,
-                                                                                   CapturedTablesSupplier capturedTablesSupplier) {
+                                                                                   CapturedTablesSupplier capturedTablesSupplier,
+                                                                                   SanitisedValues sanitisedValues) {
         super(taskContext, changeEventQueueMetrics, metadataProvider, capturedTablesSupplier);
+        this.sanitisedValues = sanitisedValues;
     }
 
     @Override
@@ -62,5 +67,15 @@ public class As400StreamingChangeEventSourceMetrics extends DefaultStreamingChan
 
     public void setJournalBehindGrowthSamples(int samples) {
         this.journalBehindGrowthSamples.lazySet(samples);
+    }
+
+    @Override
+    public long getSanitisedValues() {
+        return sanitisedValues.total();
+    }
+
+    @Override
+    public Map<String, Long> getSanitisedValuesByColumn() {
+        return sanitisedValues.byColumn();
     }
 }

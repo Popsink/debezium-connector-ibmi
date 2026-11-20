@@ -12,7 +12,6 @@ import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.notification.NotificationService;
 import io.debezium.pipeline.source.snapshot.incremental.IncrementalSnapshotChangeEventSource;
-import io.debezium.pipeline.source.snapshot.incremental.SignalBasedIncrementalSnapshotChangeEventSource;
 import io.debezium.pipeline.source.spi.ChangeEventSourceFactory;
 import io.debezium.pipeline.source.spi.DataChangeEventListener;
 import io.debezium.pipeline.source.spi.SnapshotChangeEventSource;
@@ -67,7 +66,7 @@ public class As400ChangeEventSourceFactory implements ChangeEventSourceFactory<A
         if (configuration.getSignalingDataCollectionIds().isEmpty()) {
             return Optional.empty();
         }
-        final SignalBasedIncrementalSnapshotChangeEventSource<As400Partition, TableId> incrementalSnapshotChangeEventSource = new SignalBasedIncrementalSnapshotChangeEventSource<>(
+        final As400IncrementalSnapshotChangeEventSource incrementalSnapshotChangeEventSource = new As400IncrementalSnapshotChangeEventSource(
                 configuration,
                 jdbcConnectionFactory.mainConnection(),
                 dispatcher,
