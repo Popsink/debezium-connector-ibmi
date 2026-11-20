@@ -246,6 +246,7 @@ public class As400SnapshotChangeEventSource
         if (connectorConfig.skipUncapturableTables()) {
             dropMemberlessFiles(tables);
         }
+        logUnresolvedIncludeListEntries(tables);
         return tables;
     }
 
@@ -285,11 +286,15 @@ public class As400SnapshotChangeEventSource
      * "Adding table" lines and the rest showed up in neither direction, so the only way to tell "never
      * captured because it does not exist" from "captured fine" was to diff the configured list against the
      * log by hand. Nothing about which tables are captured changes here.
+     * <p>
+     * The entries are matched against the tables discovered on the source, not against the snapshot's captured
+     * tables: a blocking (ad-hoc) snapshot narrows those to the requested tables, and every other entry was then
+     * named as non-existent, including a table exported seconds earlier (#73).
      */
-    private void logUnresolvedIncludeListEntries(Set<TableId> capturedTables) {
+    private void logUnresolvedIncludeListEntries(Set<TableId> discoveredTables) {
         final Map<String, Predicate<TableId>> matchers = connectorConfig.getTableIncludeListMatchers();
         final List<String> unresolved = matchers.entrySet().stream()
-                .filter(entry -> capturedTables.stream().noneMatch(entry.getValue()))
+                .filter(entry -> discoveredTables.stream().noneMatch(entry.getValue()))
                 .map(Map.Entry::getKey)
                 .toList();
         if (!unresolved.isEmpty()) {
@@ -356,8 +361,6 @@ public class As400SnapshotChangeEventSource
             throws Exception {
         final Set<String> schemas = snapshotContext.capturedTables.stream().map(TableId::schema)
                 .collect(Collectors.toSet());
-
-        logUnresolvedIncludeListEntries(snapshotContext.capturedTables);
 
         // reading info only for the schemas we're interested in as per the set of
         // captured tables;
