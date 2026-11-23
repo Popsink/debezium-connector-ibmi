@@ -279,6 +279,12 @@ stop a healthy table from being captured.
 Snapshots already skipped both (table discovery asks for `TABLE` only), so this is about the streaming
 side.
 
+**A physical file with no member** (typically an empty source file such as `QCMDSRC` swept in by a
+library-wide include list) is listed by the catalog like any table, but every SQL access to it fails
+with `SQL0204 *FIRST in *N type *MEM not found`. With `none` the snapshot fails on it, and the error
+names the table and `errors.tolerance=all`; with `all` it is dropped from the snapshot at ERROR level
+(files without a row in `QSYS2.SYSPARTITIONSTAT`) and the other tables are snapshotted as usual.
+
 > `errors.tolerance` is the same property name and the same `none`/`all` values as Kafka Connect's own,
 > which governs converter/transform/producer errors; the setting is shared and the intent is the same.
 

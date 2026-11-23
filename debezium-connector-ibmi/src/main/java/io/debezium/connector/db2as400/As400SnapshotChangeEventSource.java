@@ -435,7 +435,11 @@ public class As400SnapshotChangeEventSource
         }
         catch (SQLException e) {
             final String hint = switch (e.getErrorCode()) {
-                case -204 -> " (SQL0204: the physical file may have no member, or the table was dropped after discovery)";
+                case -204 -> connectorConfig.skipUncapturableTables()
+                        ? " (SQL0204: the physical file may have no member, or the table was dropped after discovery)"
+                        : " (SQL0204: the physical file may have no member - set " + As400ConnectorConfig.ERRORS_TOLERANCE.name()
+                                + "=all to skip memberless files, or remove it from table.include.list - "
+                                + "or the table was dropped after discovery)";
                 case -551, -552 -> " (SQL0551/SQL0552: the connecting user profile is not authorized to the table)";
                 case -913 -> " (SQL0913: the object is locked - a save or reorganize may be running)";
                 default -> "";
