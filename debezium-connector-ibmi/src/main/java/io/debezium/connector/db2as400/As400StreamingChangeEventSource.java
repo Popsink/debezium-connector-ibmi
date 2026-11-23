@@ -13,6 +13,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -310,6 +311,11 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
      */
     private void applyUnavailablePositionRecovery(As400OffsetContext offsetContext, Exception cause) {
         final String lost = "journal position " + offsetContext.getPosition() + " is no longer available on the server while streaming";
+        // measured before any strategy is applied: whether this is a hole or only duplicates is arithmetic over
+        // the chain, and getting it wrong by hand is what the operator escalates (issue #87)
+        final Optional<RecoveryCost> cost = dataConnection.recoveryCost(offsetContext.getPosition());
+        log.warn("{}; recovering with '{}': {}", lost, connectorConfig.getUnavailablePositionRecovery().getValue(),
+                RecoveryCost.describe(cost));
         switch (connectorConfig.getUnavailablePositionRecovery()) {
             case FAIL:
                 throw new OffsetNoLongerAvailableException(lost + ". Reset the offset and trigger a snapshot, or set '"
@@ -318,8 +324,8 @@ public class As400StreamingChangeEventSource implements StreamingChangeEventSour
                 throw new OffsetNoLongerAvailableException(lost + "; failing the task so snapshot.mode '"
                         + connectorConfig.getSnapshotMode().getValue() + "' can take a fresh snapshot to fill the gap when it restarts.", cause);
             case EARLIEST:
-                log.warn("DATA GAP: {}; resetting streaming to the earliest available journal receiver. Changes between the "
-                        + "lost position and the earliest available receiver are unrecoverable.", lost, cause);
+                log.warn("DATA GAP: {}; resetting streaming to the earliest available journal receiver: {}.", lost,
+                        RecoveryCost.gapStatement(cost), cause);
                 offsetContext.setPosition(new JournalProcessedPosition());
                 // discard ongoing transactions
                 beforeMap.clear();

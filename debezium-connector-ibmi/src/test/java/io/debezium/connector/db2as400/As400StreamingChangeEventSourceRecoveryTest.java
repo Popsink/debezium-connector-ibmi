@@ -19,10 +19,15 @@ import java.io.IOException;
 import java.math.BigInteger;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 
 import com.ibm.as400.access.AS400SecurityException;
 
@@ -42,6 +47,11 @@ import io.debezium.pipeline.source.spi.ChangeEventSource.ChangeEventSourceContex
 import io.debezium.relational.TableId;
 import io.debezium.util.Clock;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+
 /**
  * Verifies that {@link As400StreamingChangeEventSource} applies the configured
  * {@link UnavailablePositionRecovery} strategy when the receiver it is streaming from is pruned
@@ -55,6 +65,25 @@ class As400StreamingChangeEventSourceRecoveryTest {
     private final As400RpcConnection dataConnection = mock(As400RpcConnection.class);
     private final As400JdbcConnection jdbcConnection = mock(As400JdbcConnection.class);
     private final As400OffsetContext offsetContext = mock(As400OffsetContext.class);
+
+    private final ListAppender<ILoggingEvent> logs = new ListAppender<>();
+    private Logger logger;
+
+    @BeforeEach
+    void captureLog() {
+        logger = (Logger) LoggerFactory.getLogger(As400StreamingChangeEventSource.class);
+        logs.start();
+        logger.addAppender(logs);
+    }
+
+    @AfterEach
+    void releaseLog() {
+        logger.detachAppender(logs);
+    }
+
+    private List<String> warnings() {
+        return logs.list.stream().filter(e -> e.getLevel() == Level.WARN).map(ILoggingEvent::getFormattedMessage).toList();
+    }
 
     /**
      * Runs the streaming loop for a bounded number of iterations, never pausing for a snapshot.
@@ -334,5 +363,78 @@ class As400StreamingChangeEventSourceRecoveryTest {
                 .hasMessageContaining("User profile is disabled.");
 
         verify(dataConnection, times(1)).getJournalEntries(any(), any(), any(), any());
+    }
+
+    /** The chain the recovery is measured against: receivers RCV001-RCV003 holding 101..3 700, one hour of retention. */
+    private Optional<RecoveryCost> costOf(long lostOffset) {
+        return Optional.of(new RecoveryCost(new JournalProcessedPosition(BigInteger.valueOf(lostOffset),
+                new JournalReceiver("RECV008", "RCV_LIB"), Instant.EPOCH, true),
+                ReceiverChain.of(ReceiverChainTest.chain(), ReceiverChainTest.NOW), Optional.empty()));
+    }
+
+    /**
+     * Before any strategy is applied the warning states the distance, the retention window and the catch-up
+     * projection, so that the duplicates-or-hole verdict needs no hand arithmetic (issue #87).
+     */
+    @Test
+    void theRecoveryCostIsLoggedBeforeTheStrategyIsApplied() throws Exception {
+        final As400StreamingChangeEventSource source = source(UnavailablePositionRecovery.FAIL);
+        when(dataConnection.recoveryCost(any())).thenReturn(costOf(60));
+        when(dataConnection.getJournalEntries(any(), any(), any(), any()))
+                .thenThrow(new LostJournalException("CPF7053 break in receivers"));
+
+        assertThatThrownBy(() -> execute(source, 5)).isInstanceOf(OffsetNoLongerAvailableException.class);
+
+        assertThat(warnings()).anySatisfy(w -> assertThat(w).contains("recovering with 'fail'", "earliest re-reads 3600 entries",
+                "latest skips 3600 retained entries", "retention=60.0min", "catch-up not projected"));
+    }
+
+    @Test
+    void earliestNamesTheEntriesThatAreReallyGone() throws Exception {
+        final As400StreamingChangeEventSource source = source(UnavailablePositionRecovery.EARLIEST);
+        when(dataConnection.recoveryCost(any())).thenReturn(costOf(60));
+        when(dataConnection.getJournalEntries(any(), any(), any(), any()))
+                .thenThrow(new LostJournalException("CPF7053 break in receivers"))
+                .thenReturn(RetrievalState.Success);
+
+        execute(source, 2);
+
+        assertThat(warnings()).anySatisfy(w -> assertThat(w).startsWith("DATA GAP")
+                .contains("40 entries between the lost position and the earliest available receiver are unrecoverable"));
+    }
+
+    /**
+     * The receiver the position named has been pruned, but the oldest retained one starts with the very next
+     * entry: the reset re-reads, it loses nothing, and the warning no longer claims a loss (issue #87).
+     */
+    @Test
+    void earliestClaimsNoLossWhenTheChainStartsRightAfterTheLostPosition() throws Exception {
+        final As400StreamingChangeEventSource source = source(UnavailablePositionRecovery.EARLIEST);
+        when(dataConnection.recoveryCost(any())).thenReturn(costOf(100));
+        when(dataConnection.getJournalEntries(any(), any(), any(), any()))
+                .thenThrow(new LostJournalException("CPF7053 break in receivers"))
+                .thenReturn(RetrievalState.Success);
+
+        execute(source, 2);
+
+        verify(offsetContext).setPosition(new JournalProcessedPosition());
+        assertThat(warnings()).noneSatisfy(w -> assertThat(w).contains("unrecoverable"));
+        assertThat(warnings()).anySatisfy(w -> assertThat(w).startsWith("DATA GAP").contains("no entry is missing"));
+    }
+
+    /** An unreadable chain is no evidence of loss either. */
+    @Test
+    void earliestClaimsNoLossItCouldNotMeasure() throws Exception {
+        final As400StreamingChangeEventSource source = source(UnavailablePositionRecovery.EARLIEST);
+        when(dataConnection.recoveryCost(any())).thenReturn(Optional.empty());
+        when(dataConnection.getJournalEntries(any(), any(), any(), any()))
+                .thenThrow(new LostJournalException("CPF7053 break in receivers"))
+                .thenReturn(RetrievalState.Success);
+
+        execute(source, 2);
+
+        verify(offsetContext).setPosition(new JournalProcessedPosition());
+        assertThat(warnings()).noneSatisfy(w -> assertThat(w).contains("unrecoverable"));
+        assertThat(warnings()).anySatisfy(w -> assertThat(w).startsWith("DATA GAP").contains("could not be measured"));
     }
 }

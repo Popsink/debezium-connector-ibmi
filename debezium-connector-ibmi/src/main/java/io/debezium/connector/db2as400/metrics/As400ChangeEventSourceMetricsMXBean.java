@@ -19,4 +19,19 @@ public interface As400ChangeEventSourceMetricsMXBean extends StreamingChangeEven
      * full buffer - see {@code CatchUpTrend}. Zero while the connector is keeping up or gaining ground.
      */
     int getJournalBehindGrowthSamples();
+
+    /**
+     * Journal entries written per second between the last two diagnostics samples (issue #87). Keeps its last
+     * measured value through a sample that measures nothing, such as one across an offset reset.
+     */
+    long getJournalProductionRate();
+
+    /** Journal entries the connector advanced through per second between the last two diagnostics samples. */
+    long getJournalReadRate();
+
+    /**
+     * {@link #getJournalReadRate()} minus {@link #getJournalProductionRate()}: positive while the lag
+     * ({@link #getJournalBehind()}) shrinks, negative while it grows.
+     */
+    long getJournalClosingRate();
 }
