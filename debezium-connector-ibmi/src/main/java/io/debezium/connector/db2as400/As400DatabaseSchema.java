@@ -34,12 +34,21 @@ public class As400DatabaseSchema extends RelationalDatabaseSchema implements Sch
     private final As400JdbcConnection jdbcConnection;
     private final SchemaInfoConversion schemaInfoConversion;
     private final JdbcFileDecoder fileDecoder;
+    private final SanitisedValues sanitisedValues;
 
     public As400DatabaseSchema(As400ConnectorConfig config, As400JdbcConnection jdbcConnection,
                                TopicNamingStrategy<TableId> topicSelector, SchemaNameAdjuster schemaNameAdjuster, CustomConverterRegistry customConverterRegistry,
                                CdcSourceTaskContext<As400ConnectorConfig> taskContext) {
+        this(config, jdbcConnection, topicSelector, schemaNameAdjuster, customConverterRegistry, taskContext,
+                new As400ValueConverters(config.getDecimalMode(), config));
+    }
+
+    private As400DatabaseSchema(As400ConnectorConfig config, As400JdbcConnection jdbcConnection,
+                                TopicNamingStrategy<TableId> topicSelector, SchemaNameAdjuster schemaNameAdjuster,
+                                CustomConverterRegistry customConverterRegistry, CdcSourceTaskContext<As400ConnectorConfig> taskContext,
+                                As400ValueConverters valueConverters) {
         super(config, topicSelector, config.getTableFilters().dataCollectionFilter(), config.getColumnFilter(),
-                new TableSchemaBuilder(new As400ValueConverters(config.getDecimalMode(), config),
+                new TableSchemaBuilder(valueConverters,
                         new As400DefaultValueConverter(), schemaNameAdjuster,
                         customConverterRegistry, config.getSourceInfoStructMaker().schema(),
                         config.getFieldNamer(), false, config.getEventConvertingFailureHandlingMode()),
@@ -47,6 +56,7 @@ public class As400DatabaseSchema extends RelationalDatabaseSchema implements Sch
 
         this.config = config;
         this.jdbcConnection = jdbcConnection;
+        this.sanitisedValues = valueConverters.sanitisedValues();
         // columns carry their own CCSID in qsys2.syscolumns; where they don't, fall back to the CCSID
         // of the remote system rather than one guessed from this process's locale
         fileDecoder = new JdbcFileDecoder(jdbcConnection, jdbcConnection.getRealDatabaseName(), this,
@@ -58,6 +68,11 @@ public class As400DatabaseSchema extends RelationalDatabaseSchema implements Sch
         fileDecoder.setRequireUniqueDdsKey(config.isUniqueDdsKeyRequired());
 
         schemaInfoConversion = new SchemaInfoConversion(fileDecoder);
+    }
+
+    /** The text values whose control characters the converters replaced, snapshot and streaming alike. */
+    public SanitisedValues getSanitisedValues() {
+        return sanitisedValues;
     }
 
     public JdbcFileDecoder getFileDecoder() {

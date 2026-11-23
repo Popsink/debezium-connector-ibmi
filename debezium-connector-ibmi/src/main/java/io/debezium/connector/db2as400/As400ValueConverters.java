@@ -23,6 +23,7 @@ import io.debezium.config.CommonConnectorConfig.BinaryHandlingMode;
 import io.debezium.connector.db2as400.conversion.UntaggedText;
 import io.debezium.jdbc.JdbcValueConverters;
 import io.debezium.relational.Column;
+import io.debezium.util.Clock;
 
 /**
  * Conversion of DB2 specific datatypes.
@@ -31,6 +32,7 @@ import io.debezium.relational.Column;
 public class As400ValueConverters extends JdbcValueConverters {
     private static final Logger log = LoggerFactory.getLogger(As400ValueConverters.class);
     private final As400ConnectorConfig config;
+    private final SanitisedValues sanitisedValues;
     private static final byte[] EMPTY_BYTES = new byte[0];
 
     /**
@@ -40,8 +42,25 @@ public class As400ValueConverters extends JdbcValueConverters {
      * converts to null and a NOT NULL column drops the whole event (Popsink/data-plane#4904).
      */
     public As400ValueConverters(DecimalMode decimalMode, As400ConnectorConfig config) {
+        this(decimalMode, config, new SanitisedValues(Clock.system()));
+    }
+
+    As400ValueConverters(DecimalMode decimalMode, As400ConnectorConfig config, SanitisedValues sanitisedValues) {
         super(decimalMode, config.getTemporalPrecisionMode(), ZoneOffset.UTC, null, null, null);
         this.config = config;
+        this.sanitisedValues = sanitisedValues;
+    }
+
+    /** The values whose control characters this converter replaced. */
+    public SanitisedValues sanitisedValues() {
+        return sanitisedValues;
+    }
+
+    private static String columnName(Column column, Field fieldDefn) {
+        if (column != null) {
+            return column.name();
+        }
+        return (fieldDefn == null) ? "<unknown>" : fieldDefn.name();
     }
 
     @Override
@@ -69,9 +88,8 @@ public class As400ValueConverters extends JdbcValueConverters {
             String str = data.toString();
             Pair fixed = removeBadCharacters(str);
             if (fixed.modified) {
-                String cname = (column == null) ? "" : String.format(" column name %s", column.name());
-                String fname = (fieldDefn == null) ? "" : String.format(" fieldDefn name %s", fieldDefn.name());
-                log.warn("removed binary data from{}{}", cname, fname);
+                // nothing is removed: the characters are replaced in place and the value is delivered (#58)
+                sanitisedValues.record(columnName(column, fieldDefn), fixed.replaced);
             }
             return super.convertString(column, fieldDefn, config.getCharSequenceTrimMode().strip(fixed.value));
         }
@@ -132,10 +150,10 @@ public class As400ValueConverters extends JdbcValueConverters {
 
     public static Pair removeBadCharacters(String rawString) {
         if (rawString == null) {
-            return new Pair(false, rawString);
+            return new Pair(0, rawString);
         }
         StringBuilder newString = new StringBuilder(rawString.length());
-        boolean modified = false;
+        int replaced = 0;
         for (int offset = 0; offset < rawString.length();) {
             int codePoint = rawString.codePointAt(offset);
             offset += Character.charCount(codePoint);
@@ -148,23 +166,29 @@ public class As400ValueConverters extends JdbcValueConverters {
                 case Character.SURROGATE: // \p{Cs}
                 case Character.UNASSIGNED: // \p{Cn}
                     newString.append('?');
-                    modified = true;
+                    replaced++;
                     break;
                 default:
                     newString.append(Character.toChars(codePoint));
                     break;
             }
         }
-        return new Pair(modified, newString.toString());
+        return new Pair(replaced, newString.toString());
     }
 
     public static class Pair {
         boolean modified;
+        /** How many code points were replaced with {@code '?'}. */
+        int replaced;
         String value;
 
         public Pair(boolean modified, String value) {
-            super();
-            this.modified = modified;
+            this(modified ? 1 : 0, value);
+        }
+
+        Pair(int replaced, String value) {
+            this.modified = replaced > 0;
+            this.replaced = replaced;
             this.value = value;
         }
 
