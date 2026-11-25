@@ -100,7 +100,7 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
         ccsidCache = new CcsidCache(con, fromCcsid, toCcsid);
         octetLengthCache = new BytesPerChar(con);
         dateTimeFormatCache = new DateTimeFormatCache(con);
-        untaggedColumns = new UntaggedColumns(con, untaggedDecisions, textFactory);
+        untaggedColumns = new UntaggedColumns(con, untaggedDecisions, textFactory, fromCcsid, toCcsid);
     }
 
     public UntaggedColumns untaggedColumns() {

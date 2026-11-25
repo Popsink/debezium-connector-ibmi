@@ -65,4 +65,24 @@ class JdbcFileDecoderUntaggedTest {
         assertEquals(-1, structure.get(1).getCcsid());
         assertEquals(16, format.getAs400Structure().getByteLength(), "both stay 8 bytes wide in the record");
     }
+
+    /** The decoder hands {@code from.ccsid=65535}, {@code to.ccsid} to the untagged columns (#6401). */
+    @Test
+    void aForcedCcsidTypesAnUntaggedTextColumnInIt() throws SQLException {
+        final Connection connection = mock(Connection.class, RETURNS_DEEP_STUBS);
+        final DatabaseMetaData metadata = mock(DatabaseMetaData.class, RETURNS_DEEP_STUBS);
+        when(connection.getMetaData()).thenReturn(metadata);
+        final ResultSet columns = columns();
+        when(metadata.getColumns(any(), eq("LIB"), eq("T"), any())).thenReturn(columns);
+
+        final UntaggedDecisions decisions = new UntaggedDecisions();
+        decisions.load("LIB.T.NAME=273;LIB.T.PWD=binary");
+        final JdbcFileDecoder decoder = new JdbcFileDecoder(() -> connection, "DB", new SchemaCacheHash(),
+                As400TextFactory.forCcsid(273), 65535, 297, decisions);
+
+        final List<Structure> structure = decoder.getRecordFormat("T", "LIB").orElseThrow().getStructure();
+
+        assertEquals(297, structure.get(0).getCcsid());
+        assertEquals(Types.BINARY, structure.get(1).getJdcbType());
+    }
 }

@@ -55,6 +55,12 @@ class UntaggedColumnsTest {
         return new UntaggedColumns(() -> connection, decisions, As400TextFactory.forCcsid(systemCcsid));
     }
 
+    /** A source configured {@code from.ccsid=65535}, {@code to.ccsid=toCcsid} (Popsink/data-plane#6401). */
+    private UntaggedColumns forced(int systemCcsid, int toCcsid) {
+        return new UntaggedColumns(() -> connection, decisions, As400TextFactory.forCcsid(systemCcsid),
+                As400TextFactory.NO_CCSID, toCcsid);
+    }
+
     /** The catalogue lists {@code untagged}; the sample returns {@code rows}, one byte[] per column. */
     private PreparedStatement table(List<String> untagged, List<byte[][]> rows) throws SQLException {
         final PreparedStatement catalogue = mock(PreparedStatement.class);
@@ -193,6 +199,56 @@ class UntaggedColumnsTest {
 
         assertTrue(columns.textCcsid("LIB", "T", "C").isEmpty());
         assertEquals(OptionalInt.of(1388), columns.textCcsid("LIB", "T", "D"));
+        verify(connection, never()).prepareStatement(anyString());
+    }
+
+    @Test
+    void aForcedCcsidReadsUntaggedTextInItselfNotTheSystemSuperset() throws SQLException {
+        table(List.of("TXT"), List.<byte[][]> of(new byte[][]{ new AS400Text(14, 297).toBytes("Grüße aus Köln") }));
+
+        assertEquals(OptionalInt.of(297), forced(935, 297).textCcsid("LIB", "T", "TXT"));
+        assertEquals("LIB.T.TXT=297", decisions.serialized());
+    }
+
+    /** The guard runs in the forced CCSID: mixed CJK, text in 935's superset, is control bytes in 297. */
+    @Test
+    void theBinaryGuardAppliesInTheForcedCcsid() throws SQLException {
+        final byte[] mixed = new AS400Text(6, 1388).toBytes("中文");
+        assertTrue(UntaggedCcsid.readsAsText((String) new AS400Text(6, 1388).toObject(mixed)));
+        table(List.of("C"), List.<byte[][]> of(new byte[][]{ mixed }));
+
+        assertTrue(forced(935, 297).textCcsid("LIB", "T", "C").isEmpty());
+    }
+
+    /** No system CCSID to take a superset of: the forced one still names a code page. */
+    @Test
+    void aForcedCcsidReadsUntaggedTextOnAHostOfUnknownCcsid() throws SQLException {
+        table(List.of("C"), List.<byte[][]> of(new byte[][]{ ebcdic("ABC") }));
+
+        assertEquals(OptionalInt.of(297), forced(As400TextFactory.NO_CCSID, 297).textCcsid("LIB", "T", "C"));
+    }
+
+    /** {@code from.ccsid=65535} without a {@code to.ccsid} forces nothing: the superset applies. */
+    @Test
+    void fromCcsid65535WithoutAToCcsidKeepsTheSuperset() throws SQLException {
+        table(List.of("C"), List.<byte[][]> of(new byte[][]{ ebcdic("ABC") }));
+
+        assertEquals(OptionalInt.of(1388), forced(935, -1).textCcsid("LIB", "T", "C"));
+    }
+
+    /**
+     * A text decision persisted by 3.6.3.Final-ppsk-2026.11.06 for a forced source was taken in the system
+     * superset: the forced CCSID wins, without a sample, and the offset carries it from then on. A binary one
+     * stays binary, so no column flips type.
+     */
+    @Test
+    void aForcedCcsidOverridesAPersistedTextDecisionAndKeepsABinaryOne() throws SQLException {
+        decisions.load("LIB.T.C=binary;LIB.T.D=273");
+        final UntaggedColumns columns = forced(273, 297);
+
+        assertEquals(OptionalInt.of(297), columns.textCcsid("LIB", "T", "D"));
+        assertTrue(columns.textCcsid("LIB", "T", "C").isEmpty());
+        assertEquals("LIB.T.C=binary;LIB.T.D=297", decisions.serialized());
         verify(connection, never()).prepareStatement(anyString());
     }
 }
