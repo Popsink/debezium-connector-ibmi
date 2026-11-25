@@ -28,7 +28,9 @@ import io.debezium.ibmi.db2.journal.data.types.UntaggedCcsid;
 /**
  * Decides whether an untagged (CCSID 65535) {@code CHAR}/{@code VARCHAR} column - which jt400 reports
  * as {@code FOR BIT DATA} - is read as text in the system CCSID's superset, or kept binary
- * (Popsink/data-plane#5831).
+ * (Popsink/data-plane#5831). A source forcing them ({@code from.ccsid=65535}, {@code to.ccsid=N}) reads
+ * them in N instead, the superset ignored and the binary guard applied in N (Popsink/data-plane#6401): it
+ * also re-points a persisted text decision at N, while a persisted binary one stays binary.
  *
  * <p>
  * A decision comes from {@link UntaggedDecisions} when there is one. Otherwise every undecided untagged
@@ -41,7 +43,7 @@ import io.debezium.ibmi.db2.journal.data.types.UntaggedCcsid;
 public class UntaggedColumns {
     private static final Logger log = LoggerFactory.getLogger(UntaggedColumns.class);
 
-    /** Read before {@link CcsidCache} applies {@code from.ccsid}, which never targets 65535 anyway. */
+    /** The catalogue's own CCSID: a forced {@code from.ccsid=65535} is applied by {@link #forcedCcsid}. */
     static final String UNTAGGED_COLUMNS = "select column_name from qsys2.syscolumns where table_schema=? "
             + "and (table_name=? or system_table_name=?) and ccsid=65535 and data_type in ('CHAR','VARCHAR')";
     static final int SAMPLE_ROWS = 1000;
@@ -50,12 +52,28 @@ public class UntaggedColumns {
     private final Connect<Connection, SQLException> jdbcConnect;
     private final UntaggedDecisions decisions;
     private final int ccsid;
+    /** {@code to.ccsid} when {@code from.ccsid} is 65535, else {@link UntaggedDecisions#HEX}. */
+    private final int forcedCcsid;
 
     public UntaggedColumns(Connect<Connection, SQLException> jdbcConnect, UntaggedDecisions decisions,
                            As400TextFactory textFactory) {
+        this(jdbcConnect, decisions, textFactory, -1, -1);
+    }
+
+    public UntaggedColumns(Connect<Connection, SQLException> jdbcConnect, UntaggedDecisions decisions,
+                           As400TextFactory textFactory, int fromCcsid, int toCcsid) {
         this.jdbcConnect = jdbcConnect;
         this.decisions = decisions;
-        this.ccsid = UntaggedCcsid.superset(textFactory.systemCcsid());
+        this.forcedCcsid = forcedCcsid(fromCcsid, toCcsid);
+        this.ccsid = (forcedCcsid != UntaggedDecisions.HEX) ? forcedCcsid
+                : UntaggedCcsid.superset(textFactory.systemCcsid());
+    }
+
+    /** @return {@code toCcsid} when the source forces untagged columns, else {@link UntaggedDecisions#HEX} */
+    static int forcedCcsid(int fromCcsid, int toCcsid) {
+        return (fromCcsid == As400TextFactory.NO_CCSID && toCcsid > 0 && toCcsid != As400TextFactory.NO_CCSID)
+                ? toCcsid
+                : UntaggedDecisions.HEX;
     }
 
     public UntaggedDecisions decisions() {
@@ -69,6 +87,15 @@ public class UntaggedColumns {
         if (decision.isEmpty()) {
             decide(schema, table);
             decision = decisions.get(key);
+        }
+        else if (forcedCcsid != UntaggedDecisions.HEX && decision.getAsInt() != UntaggedDecisions.HEX
+                && decision.getAsInt() != forcedCcsid) {
+            // a text decision persisted before to.ccsid applied here (3.6.3.Final-ppsk-2026.11.06) chose the
+            // system CCSID's superset: the forced CCSID wins, the column stays a string
+            log.warn("untagged (ccsid 65535) column {} was read as text in ccsid {}, it now reads in the forced "
+                    + "to.ccsid {}", key, decision.getAsInt(), forcedCcsid);
+            decisions.replace(key, forcedCcsid);
+            decision = OptionalInt.of(forcedCcsid);
         }
         return (decision.isEmpty() || decision.getAsInt() == UntaggedDecisions.HEX) ? OptionalInt.empty() : decision;
     }

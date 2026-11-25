@@ -435,6 +435,11 @@ Unusually we have the incorrect CCSID on all our tables and the data is forced i
 
 This issue should really be corrected and the data translated but with thousands of tables and many clients all configured incorrectly this is a huge job with significant risk. Instead we have an additional pair of settings from.ccsid which is the ccsid on the table and to.ccsid which will use this ccsid instead - this is for the entire system and all tables.
 
+`from.ccsid=65535` with a `to.ccsid` forces the untagged (`FOR BIT DATA`) `CHAR`/`VARCHAR` columns too:
+they are read in `to.ccsid` as given, never the system CCSID's superset, and a column whose sample does
+not read as text in it stays binary. A text decision an earlier version persisted in the offset is
+re-pointed at `to.ccsid`; a binary one stays binary.
+
 
 ## The list of connectors
 

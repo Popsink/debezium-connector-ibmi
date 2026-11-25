@@ -57,6 +57,13 @@ public class UntaggedDecisions {
         }
     }
 
+    /** Overrides a decision the column already has, unlike {@link #putIfAbsent}; a missing one stays missing. */
+    public void replace(String key, int ccsidOrHex) {
+        if (decisions.replace(key, ccsidOrHex) != null) {
+            reserialize();
+        }
+    }
+
     /** Reads what {@link #serialized()} wrote; a decision already held is kept. */
     public void load(String persisted) {
         if (persisted == null || persisted.isBlank()) {
