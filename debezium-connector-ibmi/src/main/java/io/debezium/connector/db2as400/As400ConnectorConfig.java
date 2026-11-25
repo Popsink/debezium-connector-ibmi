@@ -308,7 +308,9 @@ public class As400ConnectorConfig extends RelationalDatabaseConnectorConfig {
             .withImportance(Importance.MEDIUM)
             .withDescription("What to do with a table in 'table.include.list' that exists but has no journal, "
                     + "either because it was never journaled or because it is an SQL view. 'none' (default) fails "
-                    + "startup; 'all' logs it at ERROR level and captures the remaining tables. A table that does "
+                    + "startup; 'all' logs it at ERROR level and captures the remaining tables. The same applies to "
+                    + "a physical file with no member, which fails the snapshot with SQL0204 unless 'all' drops it "
+                    + "from the snapshot. A table that does "
                     + "not exist is always dropped, as Debezium ignores include-list entries with no matching table. "
                     + "Tables spanning more than one journal, or none of them being capturable, always fails.");
 

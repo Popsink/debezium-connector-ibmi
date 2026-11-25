@@ -88,4 +88,26 @@ public class As400SnapshotChangeEventSourceMemberlessTest {
                 .hasMessageContaining("LIB1.T1")
                 .hasMessageContaining("not authorized");
     }
+
+    @Test
+    void default_mode_memberless_failure_names_the_option_that_skips_it() throws Exception {
+        doThrow(new SQLException("[SQL0204] *FIRST in *N type *MEM not found.", "42704", -204))
+                .when(connection).queryAndMap(any(String.class), any());
+
+        assertThatThrownBy(() -> source(null).rowCountForTableChunked(EMPTY))
+                .isInstanceOf(SQLException.class)
+                .hasMessageContaining("LIB1.NOMEMBER")
+                .hasMessageContaining("errors.tolerance=all");
+    }
+
+    @Test
+    void tolerant_mode_memberless_failure_does_not_suggest_the_option_already_set() throws Exception {
+        doThrow(new SQLException("[SQL0204] *FIRST in *N type *MEM not found.", "42704", -204))
+                .when(connection).queryAndMap(any(String.class), any());
+
+        assertThatThrownBy(() -> source("all").rowCountForTableChunked(EMPTY))
+                .isInstanceOf(SQLException.class)
+                .hasMessageContaining("LIB1.NOMEMBER")
+                .hasMessageNotContaining("errors.tolerance");
+    }
 }
