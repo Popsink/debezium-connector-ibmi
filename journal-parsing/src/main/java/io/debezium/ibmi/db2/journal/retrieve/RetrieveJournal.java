@@ -17,7 +17,6 @@ import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
 import java.util.Optional;
-import java.util.TimeZone;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicReference;
@@ -71,6 +70,7 @@ public class RetrieveJournal {
     private static final int MAX_INVALID_RANGES = 5;
     private final FirstHeaderDecoder firstHeaderDecoder;
     private final EntryHeaderDecoder entryHeaderDecoder;
+    private final SystemTimeZone systemTimeZone;
     private final SimpleDateFormat dateFormatter = new SimpleDateFormat("yyMMdd-hhmm");
     private final ReceiverPagination journalReceivers;
     private final ParameterListBuilder builder;
@@ -110,12 +110,19 @@ public class RetrieveJournal {
 
     /** @param clockMs stands in for the wall clock in tests */
     RetrieveJournal(RetrieveConfig config, JournalInfoRetrieval journalRetrieval, BlockFetcher fetcher, LongSupplier clockMs) {
+        this(config, journalRetrieval, fetcher, clockMs, SystemTimeZone.QUTCOFFSET);
+    }
+
+    /** @param offsetReader stands in for the {@code QUTCOFFSET} read in tests */
+    RetrieveJournal(RetrieveConfig config, JournalInfoRetrieval journalRetrieval, BlockFetcher fetcher, LongSupplier clockMs,
+                    SystemTimeZone.OffsetReader offsetReader) {
         this.config = config;
         this.journalInfoRetrieval = journalRetrieval;
         this.clockMs = clockMs;
         this.fetcher = fetcher == null ? this::fetch : fetcher;
         firstHeaderDecoder = new FirstHeaderDecoder(config.textFactory());
-        entryHeaderDecoder = new EntryHeaderDecoder(config.textFactory(), systemTimeZone(config));
+        systemTimeZone = SystemTimeZone.resolve(config.as400(), clockMs, offsetReader);
+        entryHeaderDecoder = new EntryHeaderDecoder(config.textFactory(), systemTimeZone);
         builder = new ParameterListBuilder(config.textFactory());
         pointerHandles = new PointerHandles(config.pointerHandleThreshold());
         journalReceivers = new ReceiverPagination(journalRetrieval, config.maxServerSideEntries(), config.journalInfo());
@@ -123,18 +130,6 @@ public class RetrieveJournal {
         journalRetrieval.filterHeadProbe(config.filtering() ? config.includeFiles() : List.of());
 
         builder.withJournal(config.journalInfo().journalName(), config.journalInfo().journalLibrary());
-    }
-
-    // the *DTS journal entry timestamp is decoded assuming GMT even though the IBM i TOD clock is set to the
-    // system's local time; the correction needs the real system time zone, falling back to no correction if unreachable
-    private static TimeZone systemTimeZone(RetrieveConfig config) {
-        try {
-            return config.as400().connection().getTimeZone();
-        }
-        catch (final Exception e) {
-            log.error("failed to fetch AS400 system time zone, journal entry timestamps may be off by a fixed offset", e);
-            return TimeZone.getTimeZone("GMT");
-        }
     }
 
     /**
@@ -431,6 +426,8 @@ public class RetrieveJournal {
         this.moreData = null;
         this.outputData = block.outputData();
         this.header = block.header();
+        // before the next prefetch is armed, so the read never shares the connection with our own call
+        systemTimeZone.refreshIfDue(config.as400());
         // handles belong to this job; if it is not the one that allocated the outstanding ones they
         // died with their own job and the budget starts again
         pointerHandles.observeJob(block.job());

@@ -10,7 +10,6 @@ import java.lang.reflect.Method;
 import java.math.BigInteger;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.TimeZone;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -27,17 +26,18 @@ import com.ibm.as400.access.FieldDescription;
 import com.ibm.as400.access.TimestampFieldDescription;
 
 import io.debezium.ibmi.db2.journal.data.types.As400TextFactory;
+import io.debezium.ibmi.db2.journal.retrieve.SystemTimeZone;
 import io.debezium.ibmi.db2.journal.retrieve.XaTransactionDecoder;
 
 public class EntryHeaderDecoder {
     private final AS400Structure structure;
     private final XaTransactionDecoder txDecoder;
     private final ReceiverNameDecoder nameDecoder;
-    private final TimeZone systemTimeZone;
+    private final SystemTimeZone systemTimeZone;
     private static String[] EMPTY = { "", "" };
     private static final Logger log = LoggerFactory.getLogger(EntryHeaderDecoder.class);
 
-    public EntryHeaderDecoder(As400TextFactory textFactory, TimeZone systemTimeZone) {
+    public EntryHeaderDecoder(As400TextFactory textFactory, SystemTimeZone systemTimeZone) {
         txDecoder = new XaTransactionDecoder(textFactory);
         nameDecoder = new ReceiverNameDecoder(textFactory);
         this.systemTimeZone = systemTimeZone;
@@ -151,8 +151,7 @@ public class EntryHeaderDecoder {
         if (timestamp == null) {
             return Instant.ofEpochSecond(0);
         }
-        final Instant raw = timestamp.toInstant();
-        return raw.minusMillis(systemTimeZone.getOffset(raw.toEpochMilli()));
+        return systemTimeZone.toUtc(timestamp.toInstant());
     }
 
 }
