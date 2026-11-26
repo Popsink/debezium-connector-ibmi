@@ -165,7 +165,11 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
                         entryHeader.getLibrary(), entryHeader.getFile());
                 return EMPTY;
             }
-        }).orElse(EMPTY);
+        }).orElseThrow(() -> new IllegalStateException(String.format(
+                // thrown, not an empty row: the streaming loop then skips the entry with its row image, which
+                // is counted and dead-lettered, where an empty row was delivered as a record with no column
+                "No record format for %s.%s: the file no longer exists or cannot be read, entry not decoded",
+                entryHeader.getLibrary(), entryHeader.getFile())));
     }
 
     /**
@@ -532,6 +536,14 @@ public class JdbcFileDecoder extends JournalFileEntryDecoder {
 
                     as400structure.add(dataType);
                     octetLengthCache.add(schema, longTableName, name, length, octectLength);
+                }
+                if (as400structure.isEmpty()) {
+                    // the file is gone (dropped after its entries were journalled) or unreadable: a format
+                    // with no column, cached and forwarded, made every later entry an empty record
+                    // (Popsink/data-plane#6408)
+                    log.warn("No column found for {}.{}: the file no longer exists or cannot be read, so its "
+                            + "journal entries cannot be decoded", schema, longTableName);
+                    return Optional.empty();
                 }
                 final AS400Structure entryDetailStructure = new AS400Structure(
                         as400structure.toArray(new AS400DataType[as400structure.size()]));
